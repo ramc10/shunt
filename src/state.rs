@@ -29,6 +29,9 @@ pub struct AccountState {
     /// Permanently disabled (auth failure).
     #[serde(default)]
     pub disabled: bool,
+    /// OAuth credentials are expired and need re-authorization via `shunt add-account`.
+    #[serde(default)]
+    pub auth_failed: bool,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone)]
@@ -169,6 +172,16 @@ impl StateStore {
         {
             let mut data = self.inner.lock().unwrap();
             data.accounts.entry(name.to_owned()).or_default().disabled = true;
+        }
+        self.persist();
+    }
+
+    pub fn set_auth_failed(&self, name: &str) {
+        {
+            let mut data = self.inner.lock().unwrap();
+            let acc = data.accounts.entry(name.to_owned()).or_default();
+            acc.auth_failed = true;
+            acc.disabled = true; // also disable so it's skipped in routing
         }
         self.persist();
     }

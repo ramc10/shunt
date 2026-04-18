@@ -69,7 +69,9 @@ async fn status_handler(State(s): State<AppState>) -> impl IntoResponse {
 
     let accounts: Vec<_> = s.config.accounts.iter().map(|a| {
         let st = account_states.get(&a.name);
-        let avail_status = if st.map(|s| s.disabled).unwrap_or(false) {
+        let avail_status = if st.map(|s| s.auth_failed).unwrap_or(false) {
+            "reauth_required"
+        } else if st.map(|s| s.disabled).unwrap_or(false) {
             "disabled"
         } else if s.state.is_available(&a.name) {
             "available"
@@ -328,6 +330,93 @@ fn capture_rate_limit_headers(headers: &axum::http::HeaderMap, state: &StateStor
             representative_claim,
             updated_ms: now_ms(),
         });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rate limit prefetch
+// ---------------------------------------------------------------------------
+
+/// For any account with no rate-limit data yet, make a cheap count_tokens
+/// call directly to the upstream API so we populate metrics without waiting
+/// for a real user request. Runs as a background task after startup.
+pub async fn prefetch_rate_limits(config: Arc<Config>, state: StateStore) {
+    let upstream = &config.server.upstream_url;
+    let url = format!("{upstream}/v1/messages");
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .unwrap_or_default();
+
+    // Minimal 1-token message — cheapest way to get the unified rate limit headers
+    let body = json!({
+        "model": "claude-haiku-4-5-20251001",
+        "max_tokens": 1,
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+
+    for account in &config.accounts {
+        // Skip if we already have data for this account
+        let rl = state.rate_limit_snapshot();
+        if let Some(r) = rl.get(&account.name) {
+            if r.utilization_5h.is_some() || r.utilization_7d.is_some() {
+                continue;
+            }
+        }
+
+        let creds = account.credential.clone();
+        let resp = client
+            .post(&url)
+            .header("authorization", format!("Bearer {}", creds.access_token))
+            .header("anthropic-version", "2023-06-01")
+            .header("anthropic-dangerous-direct-browser-access", "true")
+            .json(&body)
+            .send()
+            .await;
+
+        let r = match resp {
+            Ok(r) => r,
+            Err(e) => { tracing::warn!(account = %account.name, "prefetch request failed: {e}"); continue; }
+        };
+
+        if r.status() == reqwest::StatusCode::UNAUTHORIZED {
+            // Token expired — try to refresh and retry once
+            tracing::info!(account = %account.name, "prefetch: token expired, refreshing");
+            let fresh = match crate::oauth::refresh_token(&creds).await {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::warn!(account = %account.name, "token refresh failed: {e}");
+                    state.set_auth_failed(&account.name);
+                    continue;
+                }
+            };
+            // Persist updated token
+            let mut store = crate::config::CredentialsStore::load();
+            store.accounts.insert(account.name.clone(), fresh.clone());
+            store.save().ok();
+
+            let retry = client
+                .post(&url)
+                .header("authorization", format!("Bearer {}", fresh.access_token))
+                .header("anthropic-version", "2023-06-01")
+                .header("anthropic-dangerous-direct-browser-access", "true")
+                .json(&body)
+                .send()
+                .await;
+            match retry {
+                Ok(r2) if r2.status() == reqwest::StatusCode::UNAUTHORIZED => {
+                    tracing::error!(account = %account.name, "401 after refresh — credentials need re-authorization");
+                    state.set_auth_failed(&account.name);
+                }
+                Ok(r2) => {
+                    capture_rate_limit_headers(r2.headers(), &state, &account.name);
+                }
+                Err(e) => tracing::warn!(account = %account.name, "prefetch retry failed: {e}"),
+            }
+        } else {
+            tracing::info!(account = %account.name, status = %r.status(), "prefetch response");
+            capture_rate_limit_headers(r.headers(), &state, &account.name);
+        }
     }
 }
 

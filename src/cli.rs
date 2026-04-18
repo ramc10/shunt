@@ -372,9 +372,16 @@ async fn cmd_start(
     );
     println!();
 
-    let app = crate::proxy::create_app(config)?;
+    // Share one StateStore between the proxy and the prefetch task
+    use std::sync::Arc;
+    let state = crate::state::StateStore::load(&crate::config::state_path());
+    let app = crate::proxy::create_app_with_state(config.clone(), state.clone())?;
     let listener = tokio::net::TcpListener::bind(format!("{}:{}", host, port)).await?;
     write_pid();
+
+    // Prefetch rate-limit data for accounts with no metrics yet (background)
+    tokio::spawn(crate::proxy::prefetch_rate_limits(Arc::new(config), state));
+
     axum::serve(listener, app).await?;
 
     Ok(())
@@ -449,10 +456,11 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
             {
                 let status = live_acc["status"].as_str().unwrap_or("unknown");
                 let (icon, col): (&str, fn(&str) -> String) = match status {
-                    "available" => (CHECK, green),
-                    "cooling"   => ("↻",   yellow),
-                    "disabled"  => (CROSS, red),
-                    _           => (EMPTY, dim),
+                    "available"       => (CHECK, green),
+                    "cooling"         => ("↻",   yellow),
+                    "disabled"        => (CROSS, red),
+                    "reauth_required" => (CROSS, red),
+                    _                 => (EMPTY, dim),
                 };
 
                 let tokens = live_acc["tokens_used"]["total"].as_u64()
@@ -585,7 +593,13 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
                 println!("{}  {}  {}", indent, dim("Extra usage"), ov_display);
             }
         } else if live_acc.is_some() {
-            println!("        {}", dim("No rate-limit data — make a request first"));
+            let status = live_acc.unwrap()["status"].as_str().unwrap_or("");
+            if status == "reauth_required" {
+                println!("        {} Session expired — run {} to re-authorize",
+                    red(CROSS), cyan(&format!("shunt add-account {}", acc.name)));
+            } else {
+                println!("        {}", dim("No rate-limit data — make a request first"));
+            }
         }
 
         println!();
