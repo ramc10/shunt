@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use axum::extract::{Request, State};
@@ -8,10 +8,12 @@ use axum::routing::{get, post};
 use axum::Router;
 use bytes::Bytes;
 use serde_json::json;
+use tokio::sync::RwLock;
 use tracing::{error, warn};
 
-use crate::config::{state_path, Config};
+use crate::config::{state_path, Config, CredentialsStore};
 use crate::forwarder::Forwarder;
+use crate::oauth::{refresh_token, OAuthCredential};
 use crate::quota;
 use crate::router;
 use crate::state::{RateLimitInfo, StateStore};
@@ -21,6 +23,8 @@ struct AppState {
     config: Arc<Config>,
     forwarder: Arc<Forwarder>,
     state: StateStore,
+    /// Live credentials — can be refreshed at runtime without restarting.
+    credentials: Arc<RwLock<HashMap<String, OAuthCredential>>>,
 }
 
 pub fn create_app(config: Config) -> anyhow::Result<Router> {
@@ -30,10 +34,17 @@ pub fn create_app(config: Config) -> anyhow::Result<Router> {
 pub fn create_app_with_state(config: Config, state: StateStore) -> anyhow::Result<Router> {
     let forwarder = Forwarder::new(&config.server.upstream_url)?;
 
+    let credentials = Arc::new(RwLock::new(
+        config.accounts.iter()
+            .map(|a| (a.name.clone(), a.credential.clone()))
+            .collect::<HashMap<_, _>>(),
+    ));
+
     let app_state = AppState {
         config: Arc::new(config),
         forwarder: Arc::new(forwarder),
         state,
+        credentials,
     };
 
     let app = Router::new()
@@ -125,6 +136,8 @@ async fn proxy_handler(
     let fp_ref = fp.as_deref();
 
     let mut tried: HashSet<String> = HashSet::new();
+    // Track accounts we've already attempted a token refresh for this request.
+    let mut refreshed: HashSet<String> = HashSet::new();
 
     loop {
         let account = match router::pick_account(&s.config.accounts, &s.state, fp_ref, &tried) {
@@ -134,8 +147,16 @@ async fn proxy_handler(
 
         let account_name = account.name.clone();
 
+        // Use the live (possibly refreshed) token rather than the one baked into config.
+        let token = {
+            let creds = s.credentials.read().await;
+            creds.get(&account_name)
+                .map(|c| c.access_token.clone())
+                .unwrap_or_else(|| account.credential.access_token.clone())
+        };
+
         let response = s.forwarder
-            .forward(&method, &path, body_bytes.clone(), &headers, account)
+            .forward(&method, &path, body_bytes.clone(), &headers, account, &token)
             .await
             .map_err(|e| {
                 error!("Forward error: {:#}", e);
@@ -156,9 +177,53 @@ async fn proxy_handler(
                 s.state.set_cooldown(&account_name, 30_000);
                 tried.insert(account_name);
             }
-            401 | 403 => {
-                error!(account = %account_name, "auth error — disabling account permanently");
-                s.state.disable_account(&account_name);
+            401 => {
+                if !refreshed.contains(&account_name) {
+                    // Access token invalidated (e.g. user logged out) — try refresh.
+                    let cred = {
+                        let creds = s.credentials.read().await;
+                        creds.get(&account_name).cloned()
+                            .unwrap_or_else(|| account.credential.clone())
+                    };
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        refresh_token(&cred),
+                    ).await {
+                        Ok(Ok(fresh)) => {
+                            warn!(account = %account_name, "401 — token refreshed, retrying");
+                            {
+                                let mut creds = s.credentials.write().await;
+                                creds.insert(account_name.clone(), fresh.clone());
+                            }
+                            // Persist to disk so the refreshed token survives a restart.
+                            let name = account_name.clone();
+                            let fresh = fresh.clone();
+                            tokio::task::spawn_blocking(move || {
+                                let mut store = CredentialsStore::load();
+                                store.accounts.insert(name, fresh);
+                                store.save().ok();
+                            });
+                            // Mark as refreshed but don't add to tried — retry this account.
+                            refreshed.insert(account_name);
+                        }
+                        _ => {
+                            // Refresh failed/timed out — cool down, don't permanently disable.
+                            error!(account = %account_name, "401 — token refresh failed, cooling 5min");
+                            s.state.set_cooldown(&account_name, 5 * 60_000);
+                            tried.insert(account_name);
+                        }
+                    }
+                } else {
+                    // Already refreshed once and still 401 — cool down this account.
+                    error!(account = %account_name, "401 after refresh — cooling 5min");
+                    s.state.set_cooldown(&account_name, 5 * 60_000);
+                    tried.insert(account_name);
+                }
+            }
+            403 => {
+                // Forbidden — subscription lapsed or org restriction; refreshing won't help.
+                error!(account = %account_name, "403 forbidden — cooling 30min");
+                s.state.set_cooldown(&account_name, 30 * 60_000);
                 tried.insert(account_name);
             }
             _ => {

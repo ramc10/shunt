@@ -55,7 +55,7 @@ impl Forwarder {
     /// Forward a request to the upstream using the given account's OAuth credential.
     ///
     /// - Strips `Authorization` and `x-api-key` from the client request.
-    /// - Injects `Authorization: Bearer <account.access_token>`.
+    /// - Injects `Authorization: Bearer <token>` (live token, may differ from account.credential).
     /// - Keeps the upstream TCP connection alive for streaming responses.
     pub async fn forward(
         &self,
@@ -64,6 +64,7 @@ impl Forwarder {
         body: Bytes,
         client_headers: &HeaderMap,
         account: &AccountConfig,
+        token: &str,
     ) -> Result<Response<Body>> {
         let request_id = &Uuid::new_v4().to_string()[..8];
         let url = format!("{}{}", self.base_url, path);
@@ -83,14 +84,11 @@ impl Forwarder {
             }
         }
 
-        // Inject account's OAuth Bearer token
+        // Inject the live OAuth Bearer token
         upstream_headers.insert(
             reqwest::header::HeaderName::from_static("authorization"),
-            reqwest::header::HeaderValue::from_str(&format!(
-                "Bearer {}",
-                account.credential.access_token
-            ))
-            .context("invalid access token value")?,
+            reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+                .context("invalid access token value")?,
         );
 
         // Required by Anthropic when authenticating with OAuth tokens

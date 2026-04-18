@@ -2,7 +2,7 @@ fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let is_start = args.iter().any(|a| a == "start");
     let is_foreground = args.iter().any(|a| a == "--foreground");
-    let is_daemon = args.iter().any(|a| a == "--_daemon");
+    let is_daemon = args.iter().any(|a| a == "--daemon");
 
     if is_start && !is_daemon {
         // Kill any existing instance BEFORE doing anything else.
@@ -29,10 +29,28 @@ fn preflight_kill() {
     let Ok(old_pid) = content.trim().parse::<u32>() else { return };
     if old_pid == std::process::id() { return; }
 
+    // Safety check: verify the PID actually belongs to a shunt process before
+    // killing it. If the daemon died and the OS recycled its PID to something
+    // else (e.g. the user's shell), we must not kill it.
+    if !pid_is_shunt(old_pid) { return; }
+
     // SIGKILL via libc — no subprocess, instant, cannot hang
     unsafe { libc::kill(old_pid as i32, libc::SIGKILL) };
     // Give the OS 400ms to reclaim the port
     std::thread::sleep(std::time::Duration::from_millis(400));
+}
+
+/// Returns true if the given PID is a shunt process.
+/// Uses `ps` to check the command name — cross-platform enough for macOS/Linux.
+fn pid_is_shunt(pid: u32) -> bool {
+    let Ok(out) = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "comm="])
+        .output()
+    else {
+        return false;
+    };
+    let comm = String::from_utf8_lossy(&out.stdout);
+    comm.trim().contains("shunt")
 }
 
 /// Re-exec self with --_daemon flag so the child runs the server.
@@ -69,8 +87,8 @@ fn spawn_daemon() {
     let mut child_args: Vec<String> = std::env::args()
         .skip(1) // skip argv[0]
         .collect();
-    if !child_args.iter().any(|a| a == "--_daemon") {
-        child_args.push("--_daemon".into());
+    if !child_args.iter().any(|a| a == "--daemon") {
+        child_args.push("--daemon".into());
     }
 
     use std::os::unix::process::CommandExt;
