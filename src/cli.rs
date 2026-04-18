@@ -285,42 +285,27 @@ async fn cmd_remove_account(config_override: Option<PathBuf>, name: Option<Strin
 /// Remove a `[[accounts]]` TOML block with the given name from config text.
 fn remove_account_block(config: &str, name: &str) -> String {
     let marker = format!("name = \"{name}\"");
-    let mut out = Vec::new();
-    let mut skip = false;
 
+    // Split config into sections: preamble + one section per [[accounts]] block.
+    // Each section starts at the [[accounts]] line (except the first which is the preamble).
+    let mut sections: Vec<String> = Vec::new();
+    let mut current = String::new();
     for line in config.lines() {
         if line.trim() == "[[accounts]]" {
-            // Peek ahead handled by toggling skip on marker match
-            skip = false;
-            out.push(("[[accounts]]", true)); // tentative — may be removed
-        } else if skip {
-            // Inside the block we're removing — drop lines until next block
-            if line.trim().starts_with("[[") {
-                skip = false;
-                out.push((line, false));
-            }
-            // else: drop the line
-        } else if line.contains(&marker) {
-            // This is the block we want to remove — retroactively drop its header
-            skip = true;
-            if let Some(last) = out.last_mut() {
-                if last.0 == "[[accounts]]" {
-                    last.1 = false; // mark header for removal
-                }
-            }
+            sections.push(std::mem::take(&mut current));
+            current = format!("[[accounts]]\n");
         } else {
-            out.push((line, false));
+            current.push_str(line);
+            current.push('\n');
         }
     }
+    sections.push(current);
 
-    let mut result = out
-        .into_iter()
-        .filter(|(_, pending)| !pending)
-        .map(|(l, _)| l)
-        .collect::<Vec<_>>()
-        .join("\n");
+    // Drop the section that contains the marker, keep the rest.
+    let mut result: String = sections.into_iter()
+        .filter(|s| !s.contains(&marker))
+        .collect();
 
-    // Normalise trailing newline
     if !result.ends_with('\n') {
         result.push('\n');
     }
