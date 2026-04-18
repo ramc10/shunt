@@ -204,12 +204,19 @@ impl StateStore {
     }
 
     /// 5-hour utilization 0.0–1.0 from the last upstream response headers.
-    /// Returns 0.0 for fresh accounts (never used) so they are picked first.
+    /// Returns 0.0 for fresh accounts or when the reset window has already passed.
     pub fn utilization_5h(&self, name: &str) -> f64 {
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         let data = self.inner.lock().unwrap();
-        data.rate_limits.get(name)
-            .and_then(|r| r.utilization_5h)
-            .unwrap_or(0.0)
+        let Some(rl) = data.rate_limits.get(name) else { return 0.0 };
+        // If the reset time is in the past, the window has rolled over — treat as fresh
+        if rl.reset_5h.map(|t| t <= now_secs).unwrap_or(false) {
+            return 0.0;
+        }
+        rl.utilization_5h.unwrap_or(0.0)
     }
 
     /// Record token usage from a completed request.

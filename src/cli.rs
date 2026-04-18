@@ -495,33 +495,57 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
             let indent = "        ";
 
             // 5-hour window
-            if let Some(util) = util_5h {
-                let pct = (util * 100.0) as u64;
-                let remaining_pct = 100u64.saturating_sub(pct);
-                let bar = util_bar(util, 18);
-                let reset_str = reset_5h
-                    .and_then(|t| secs_until(t))
-                    .map(|s| format!("  resets in {}", term::fmt_duration_ms(s * 1000)))
-                    .unwrap_or_default();
-                let status_col = if status_5h == "exhausted" { red("exhausted") } else { green("ok") };
-                println!("{}  {}  {}  {}% remaining  {}{}",
-                    indent, dim("5h window "), bar, cyan(&remaining_pct.to_string()),
-                    status_col, dim(&reset_str));
+            let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs()).unwrap_or(0);
+            let window_5h_reset = reset_5h.and_then(|t| secs_until(t)); // None = already reset
+            if util_5h.is_some() || reset_5h.is_some() {
+                if reset_5h.map(|t| t <= now_secs).unwrap_or(false) {
+                    // Window has rolled over — data is stale, show as fresh
+                    let reset_str = reset_5h
+                        .map(|t| {
+                            let ago = now_secs.saturating_sub(t);
+                            format!("  reset {} ago", term::fmt_duration_ms(ago * 1000))
+                        })
+                        .unwrap_or_default();
+                    println!("{}  {}  {}  {}",
+                        indent, dim("5h window "), green("fresh — window rolled over"), dim(&reset_str));
+                } else if let Some(util) = util_5h {
+                    let pct = (util * 100.0) as u64;
+                    let remaining_pct = 100u64.saturating_sub(pct);
+                    let bar = util_bar(util, 18);
+                    let reset_str = window_5h_reset
+                        .map(|s| format!("  resets in {}", term::fmt_duration_ms(s * 1000)))
+                        .unwrap_or_default();
+                    let status_col = if status_5h == "exhausted" { red("exhausted") } else { green("ok") };
+                    println!("{}  {}  {}  {}% remaining  {}{}",
+                        indent, dim("5h window "), bar, cyan(&remaining_pct.to_string()),
+                        status_col, dim(&reset_str));
+                }
             }
 
             // 7-day window
-            if let Some(util) = util_7d {
-                let pct = (util * 100.0) as u64;
-                let remaining_pct = 100u64.saturating_sub(pct);
-                let bar = util_bar(util, 18);
-                let reset_str = reset_7d
-                    .and_then(|t| secs_until(t))
-                    .map(|s| format!("  resets in {}", term::fmt_duration_ms(s * 1000)))
-                    .unwrap_or_default();
-                let status_col = if status_7d == "exhausted" { red("exhausted") } else { green("ok") };
-                println!("{}  {}  {}  {}% remaining  {}{}",
-                    indent, dim("7d window "), bar, cyan(&remaining_pct.to_string()),
-                    status_col, dim(&reset_str));
+            let window_7d_reset = reset_7d.and_then(|t| secs_until(t));
+            if util_7d.is_some() || reset_7d.is_some() {
+                if reset_7d.map(|t| t <= now_secs).unwrap_or(false) {
+                    let reset_str = reset_7d
+                        .map(|t| {
+                            let ago = now_secs.saturating_sub(t);
+                            format!("  reset {} ago", term::fmt_duration_ms(ago * 1000))
+                        })
+                        .unwrap_or_default();
+                    println!("{}  {}  {}  {}",
+                        indent, dim("7d window "), green("fresh — window rolled over"), dim(&reset_str));
+                } else if let Some(util) = util_7d {
+                    let pct = (util * 100.0) as u64;
+                    let remaining_pct = 100u64.saturating_sub(pct);
+                    let bar = util_bar(util, 18);
+                    let reset_str = window_7d_reset
+                        .map(|s| format!("  resets in {}", term::fmt_duration_ms(s * 1000)))
+                        .unwrap_or_default();
+                    let status_col = if status_7d == "exhausted" { red("exhausted") } else { green("ok") };
+                    println!("{}  {}  {}  {}% remaining  {}{}",
+                        indent, dim("7d window "), bar, cyan(&remaining_pct.to_string()),
+                        status_col, dim(&reset_str));
+                }
             }
 
             // Extra usage (overage)
