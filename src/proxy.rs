@@ -102,8 +102,6 @@ async fn status_handler(State(s): State<AppState>) -> impl IntoResponse {
             "utilization_7d": r.utilization_7d,
             "reset_7d": r.reset_7d,
             "status_7d": r.status_7d,
-            "overage_status": r.overage_status,
-            "overage_disabled_reason": r.overage_disabled_reason,
             "representative_claim": r.representative_claim,
             "updated_ms": r.updated_ms,
         }));

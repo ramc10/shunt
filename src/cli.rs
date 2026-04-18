@@ -574,8 +574,6 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
             let util_7d  = rl.get("utilization_7d").and_then(|v| v.as_f64());
             let reset_7d = rl.get("reset_7d").and_then(|v| v.as_u64());
             let status_7d = rl.get("status_7d").and_then(|v| v.as_str()).unwrap_or("allowed");
-            let overage  = rl.get("overage_status").and_then(|v| v.as_str());
-            let overage_reason = rl.get("overage_disabled_reason").and_then(|v| v.as_str());
 
             let indent = "        ";
 
@@ -633,16 +631,6 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
                 }
             }
 
-            // Extra usage (overage)
-            if let Some(ov) = overage {
-                let ov_display = if ov == "allowed" {
-                    green("available")
-                } else {
-                    let reason = overage_reason.unwrap_or("disabled");
-                    red(&format!("unavailable  {}", dim(&format!("({reason})"))))
-                };
-                println!("{}  {}  {}", indent, dim("Extra usage"), ov_display);
-            }
         } else if acc.credential.is_none() {
             println!("        {} No credential — run {} to authorize",
                 red(CROSS), cyan(&format!("shunt add-account {}", acc.name)));
