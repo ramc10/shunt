@@ -53,8 +53,8 @@ enum Command {
     RemoveAccount {
         #[arg(long)]
         config: Option<PathBuf>,
-        /// Name of the account to remove
-        name: String,
+        /// Name of the account to remove (omit to pick interactively)
+        name: Option<String>,
     },
     /// Pin routing to a specific account, or restore automatic routing
     ///
@@ -218,11 +218,35 @@ async fn cmd_add_account(config_override: Option<PathBuf>, name: String) -> Resu
 // remove-account
 // ---------------------------------------------------------------------------
 
-async fn cmd_remove_account(config_override: Option<PathBuf>, name: String) -> Result<()> {
-    let config_p = config_override.unwrap_or_else(config_path);
+async fn cmd_remove_account(config_override: Option<PathBuf>, name: Option<String>) -> Result<()> {
+    let config_p = config_override.clone().unwrap_or_else(config_path);
     if !config_p.exists() {
         bail!("No config found. Run `shunt setup` first.");
     }
+
+    // Resolve name — pick interactively if not given
+    let name = if let Some(n) = name {
+        n
+    } else {
+        let config = crate::config::load_config(config_override.as_deref())?;
+        let removable: Vec<_> = config.accounts.iter()
+            .filter(|a| a.name != "main")
+            .collect();
+        if removable.is_empty() {
+            bail!("No removable accounts (cannot remove 'main').");
+        }
+        let items: Vec<term::SelectItem> = removable.iter().map(|a| {
+            let email = a.credential.email.as_deref().unwrap_or("");
+            term::SelectItem {
+                label: format!("{}  {}", bold(&pad(&a.name, 12)), dim(&pad(email, 32))),
+                value: a.name.clone(),
+            }
+        }).collect();
+        match term::select("Remove account:", &items, 0) {
+            Some(v) => v,
+            None => return Ok(()),
+        }
+    };
 
     if name == "main" {
         bail!("Cannot remove the 'main' account. Use `shunt setup` to reconfigure.");
@@ -613,12 +637,10 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 async fn cmd_use(config_override: Option<PathBuf>, account: Option<String>) -> Result<()> {
-    use std::io::{self, Write};
-
     let config = crate::config::load_config(config_override.as_deref())?;
     let use_url = format!("http://{}:{}/use", config.server.host, config.server.port);
 
-    // Fetch live state so we can show utilization in the picker
+    // Fetch live state for utilization info
     let live: Option<serde_json::Value> = reqwest::get(
         &format!("http://{}:{}/status", config.server.host, config.server.port)
     ).await.ok().and_then(|r| futures_executor_hack(r));
@@ -627,64 +649,60 @@ async fn cmd_use(config_override: Option<PathBuf>, account: Option<String>) -> R
         .and_then(|v| v["pinned"].as_str())
         .map(|s| s.to_owned());
 
-    // Build the list of choices: accounts + auto
-    struct Choice { label: String, value: String }
-    let mut choices: Vec<Choice> = config.accounts.iter().map(|a| {
-        let util = live.as_ref()
+    // Build menu items
+    let mut items: Vec<term::SelectItem> = config.accounts.iter().map(|a| {
+        let live_acc = live.as_ref()
             .and_then(|v| v["accounts"].as_array())
-            .and_then(|arr| arr.iter().find(|x| x["name"] == a.name))
-            .and_then(|x| x["rate_limit"]["utilization_5h"].as_f64());
+            .and_then(|arr| arr.iter().find(|x| x["name"] == a.name));
 
-        let util_str = match util {
-            Some(u) => {
-                let pct = (u * 100.0) as u64;
-                let remaining = 100u64.saturating_sub(pct);
-                format!("  {}", dim(&format!("{}% remaining", remaining)))
+        let status = live_acc.and_then(|x| x["status"].as_str()).unwrap_or("offline");
+        let util = live_acc.and_then(|x| x["rate_limit"]["utilization_5h"].as_f64());
+        let is_pinned = current_pinned.as_deref() == Some(&a.name);
+
+        let status_str = match status {
+            "reauth_required" => red("session expired"),
+            "disabled"        => red("disabled"),
+            "cooling"         => yellow("cooling"),
+            "available"       => {
+                match util {
+                    Some(u) => {
+                        let rem = 100u64.saturating_sub((u * 100.0) as u64);
+                        green(&format!("{}% remaining", rem))
+                    }
+                    None => dim("fresh").to_string(),
+                }
             }
-            None => format!("  {}", dim("fresh")),
-        };
-
-        let pin_marker = if current_pinned.as_deref() == Some(&a.name) {
-            format!("  {}", yellow("← pinned"))
-        } else {
-            String::new()
+            _ => dim("offline").to_string(),
         };
 
         let email = a.credential.email.as_deref().unwrap_or("");
-        Choice {
-            label: format!("{}  {}  {}{}{}", bold(&pad(&a.name, 12)), dim(&pad(email, 34)), util_str, pin_marker, ""),
+        let pin = if is_pinned { format!("  {}", yellow("▶ active")) } else { String::new() };
+
+        term::SelectItem {
+            label: format!("{}  {}  {}{}", bold(&pad(&a.name, 12)), dim(&pad(email, 32)), status_str, pin),
             value: a.name.clone(),
         }
     }).collect();
 
-    let auto_marker = if current_pinned.is_none() { format!("  {}", yellow("← current")) } else { String::new() };
-    choices.push(Choice {
+    let auto_marker = if current_pinned.is_none() { format!("  {}", yellow("▶ active")) } else { String::new() };
+    items.push(term::SelectItem {
         label: format!("{}  {}{}", bold(&pad("auto", 12)), dim("least-utilization routing"), auto_marker),
         value: "auto".to_owned(),
     });
 
-    // If account name was provided directly, skip the picker
+    // Determine initial cursor position (current pinned account or auto)
+    let initial = current_pinned.as_ref()
+        .and_then(|p| items.iter().position(|it| &it.value == p))
+        .unwrap_or(items.len() - 1);
+
+    // If account name was given directly, skip the picker
     let chosen = if let Some(name) = account {
         name
     } else {
-        // Interactive numbered picker
-        println!();
-        println!("  Select account:");
-        println!();
-        for (i, c) in choices.iter().enumerate() {
-            println!("  {}  {}", dim(&format!("[{}]", i + 1)), c.label);
+        match term::select("Route traffic to:", &items, initial) {
+            Some(v) => v,
+            None => return Ok(()), // cancelled
         }
-        println!();
-        print!("  Choice [1-{}]: ", choices.len());
-        io::stdout().flush()?;
-
-        let mut buf = String::new();
-        io::stdin().read_line(&mut buf)?;
-        let n: usize = buf.trim().parse().unwrap_or(0);
-        if n == 0 || n > choices.len() {
-            anyhow::bail!("Invalid selection.");
-        }
-        choices.remove(n - 1).value
     };
 
     // Validate
@@ -703,12 +721,10 @@ async fn cmd_use(config_override: Option<PathBuf>, account: Option<String>) -> R
 
     match resp {
         Ok(r) if r.status().is_success() => {
-            println!();
             if is_auto {
                 println!("  {} Automatic routing restored", green(CHECK));
             } else {
-                println!("  {} Pinned to {}", green(CHECK), bold(&format!("'{chosen}'")));
-                println!("  {} Run {} to restore automatic routing", dim("·"), cyan("shunt use auto"));
+                println!("  {} Pinned to {}  ·  {}", green(CHECK), bold(&chosen), dim("shunt use auto to restore"));
             }
             println!();
         }
@@ -717,7 +733,7 @@ async fn cmd_use(config_override: Option<PathBuf>, account: Option<String>) -> R
             anyhow::bail!("Proxy returned error: {body}");
         }
         Err(_) => {
-            anyhow::bail!("Proxy is not running. Start it with: shunt start");
+            anyhow::bail!("Proxy is not running — start it with: shunt start");
         }
     }
     Ok(())
