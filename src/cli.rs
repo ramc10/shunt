@@ -59,13 +59,14 @@ enum Command {
     /// Pin routing to a specific account, or restore automatic routing
     ///
     /// Examples:
+    ///   shunt use            — interactive picker
     ///   shunt use work       — force all requests through 'work'
     ///   shunt use auto       — restore automatic least-utilization routing
     Use {
         #[arg(long)]
         config: Option<PathBuf>,
-        /// Account name to pin to, or "auto" to restore automatic routing
-        account: String,
+        /// Account name to pin to, or "auto". Omit to pick interactively.
+        account: Option<String>,
     },
 }
 
@@ -597,30 +598,102 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
 // use (pin account)
 // ---------------------------------------------------------------------------
 
-async fn cmd_use(config_override: Option<PathBuf>, account: String) -> Result<()> {
+async fn cmd_use(config_override: Option<PathBuf>, account: Option<String>) -> Result<()> {
+    use std::io::{self, Write};
+
     let config = crate::config::load_config(config_override.as_deref())?;
     let use_url = format!("http://{}:{}/use", config.server.host, config.server.port);
 
-    // Validate account name before hitting the proxy
-    let is_auto = account == "auto";
-    if !is_auto && !config.accounts.iter().any(|a| a.name == account) {
+    // Fetch live state so we can show utilization in the picker
+    let live: Option<serde_json::Value> = reqwest::get(
+        &format!("http://{}:{}/status", config.server.host, config.server.port)
+    ).await.ok().and_then(|r| futures_executor_hack(r));
+
+    let current_pinned = live.as_ref()
+        .and_then(|v| v["pinned"].as_str())
+        .map(|s| s.to_owned());
+
+    // Build the list of choices: accounts + auto
+    struct Choice { label: String, value: String }
+    let mut choices: Vec<Choice> = config.accounts.iter().map(|a| {
+        let util = live.as_ref()
+            .and_then(|v| v["accounts"].as_array())
+            .and_then(|arr| arr.iter().find(|x| x["name"] == a.name))
+            .and_then(|x| x["rate_limit"]["utilization_5h"].as_f64());
+
+        let util_str = match util {
+            Some(u) => {
+                let pct = (u * 100.0) as u64;
+                let remaining = 100u64.saturating_sub(pct);
+                format!("  {}", dim(&format!("{}% remaining", remaining)))
+            }
+            None => format!("  {}", dim("fresh")),
+        };
+
+        let pin_marker = if current_pinned.as_deref() == Some(&a.name) {
+            format!("  {}", yellow("← pinned"))
+        } else {
+            String::new()
+        };
+
+        let email = a.credential.email.as_deref().unwrap_or("");
+        Choice {
+            label: format!("{}  {}  {}{}{}", bold(&pad(&a.name, 12)), dim(&pad(email, 34)), util_str, pin_marker, ""),
+            value: a.name.clone(),
+        }
+    }).collect();
+
+    let auto_marker = if current_pinned.is_none() { format!("  {}", yellow("← current")) } else { String::new() };
+    choices.push(Choice {
+        label: format!("{}  {}{}", bold(&pad("auto", 12)), dim("least-utilization routing"), auto_marker),
+        value: "auto".to_owned(),
+    });
+
+    // If account name was provided directly, skip the picker
+    let chosen = if let Some(name) = account {
+        name
+    } else {
+        // Interactive numbered picker
+        println!();
+        println!("  Select account:");
+        println!();
+        for (i, c) in choices.iter().enumerate() {
+            println!("  {}  {}", dim(&format!("[{}]", i + 1)), c.label);
+        }
+        println!();
+        print!("  Choice [1-{}]: ", choices.len());
+        io::stdout().flush()?;
+
+        let mut buf = String::new();
+        io::stdin().read_line(&mut buf)?;
+        let n: usize = buf.trim().parse().unwrap_or(0);
+        if n == 0 || n > choices.len() {
+            anyhow::bail!("Invalid selection.");
+        }
+        choices.remove(n - 1).value
+    };
+
+    // Validate
+    let is_auto = chosen == "auto";
+    if !is_auto && !config.accounts.iter().any(|a| a.name == chosen) {
         let names: Vec<_> = config.accounts.iter().map(|a| a.name.as_str()).collect();
-        anyhow::bail!("Unknown account '{}'. Available: {}", account, names.join(", "));
+        anyhow::bail!("Unknown account '{}'. Available: {}", chosen, names.join(", "));
     }
 
     let client = reqwest::Client::new();
     let resp = client
         .post(&use_url)
-        .json(&serde_json::json!({ "account": account }))
+        .json(&serde_json::json!({ "account": chosen }))
         .send()
         .await;
 
     match resp {
         Ok(r) if r.status().is_success() => {
+            println!();
             if is_auto {
-                println!("  {} Routing restored to automatic (least-utilization)", green(CHECK));
+                println!("  {} Automatic routing restored", green(CHECK));
             } else {
-                println!("  {} Pinned to account {}", green(CHECK), bold(&format!("'{account}'")));
+                println!("  {} Pinned to {}", green(CHECK), bold(&format!("'{chosen}'")));
                 println!("  {} Run {} to restore automatic routing", dim("·"), cyan("shunt use auto"));
             }
             println!();
