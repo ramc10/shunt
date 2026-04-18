@@ -84,6 +84,18 @@ pub fn pick_account<'a>(
     fp: Option<&str>,
     tried: &HashSet<String>,
 ) -> Option<&'a AccountConfig> {
+    // Pinned account overrides everything — user explicitly chose this one
+    if let Some(pinned) = state.get_pinned() {
+        if !tried.contains(&pinned) {
+            if let Some(acc) = accounts.iter().find(|a| a.name == pinned) {
+                if state.is_available(&acc.name) {
+                    return Some(acc);
+                }
+            }
+        }
+        // Pinned account is unavailable or already tried — fall through to normal routing
+    }
+
     // Try sticky account first
     if let Some(fp) = fp {
         if let Some(sticky_name) = state.get_sticky(fp) {

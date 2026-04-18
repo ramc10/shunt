@@ -92,6 +92,9 @@ struct StateData {
     quota: HashMap<String, QuotaWindow>,
     #[serde(default)]
     rate_limits: HashMap<String, RateLimitInfo>,
+    /// If set, all requests are forced to this account (overrides routing).
+    #[serde(default)]
+    pinned_account: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -259,6 +262,22 @@ impl StateStore {
 
     pub fn rate_limit_snapshot(&self) -> HashMap<String, RateLimitInfo> {
         self.inner.lock().unwrap().rate_limits.clone()
+    }
+
+    // -----------------------------------------------------------------------
+    // Account pinning
+    // -----------------------------------------------------------------------
+
+    pub fn get_pinned(&self) -> Option<String> {
+        self.inner.lock().unwrap().pinned_account.clone()
+    }
+
+    pub fn set_pinned(&self, name: Option<String>) {
+        {
+            let mut data = self.inner.lock().unwrap();
+            data.pinned_account = name;
+        }
+        self.persist();
     }
 
     // -----------------------------------------------------------------------

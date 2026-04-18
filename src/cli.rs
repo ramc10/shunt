@@ -56,6 +56,17 @@ enum Command {
         /// Name of the account to remove
         name: String,
     },
+    /// Pin routing to a specific account, or restore automatic routing
+    ///
+    /// Examples:
+    ///   shunt use work       — force all requests through 'work'
+    ///   shunt use auto       — restore automatic least-utilization routing
+    Use {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Account name to pin to, or "auto" to restore automatic routing
+        account: String,
+    },
 }
 
 pub async fn run() -> Result<()> {
@@ -66,6 +77,7 @@ pub async fn run() -> Result<()> {
         Command::Status { config } => cmd_status(config).await,
         Command::AddAccount { config, name } => cmd_add_account(config, name).await,
         Command::RemoveAccount { config, name } => cmd_remove_account(config, name).await,
+        Command::Use { config, account } => cmd_use(config, account).await,
     }
 }
 
@@ -414,6 +426,16 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
         String::new(),
     ]);
 
+    // ── Pinned account notice ─────────────────────────────────────────
+    if let Some(pinned) = live.as_ref().and_then(|v| v["pinned"].as_str()) {
+        println!("  {} Pinned to {}  ·  {}",
+            yellow("◆"),
+            bold(pinned),
+            dim(&format!("run 'shunt use auto' to restore automatic routing")),
+        );
+        println!();
+    }
+
     // ── Accounts ─────────────────────────────────────────────────────
     term::section("ACCOUNTS");
     println!();
@@ -568,6 +590,49 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
         println!();
     }
 
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// use (pin account)
+// ---------------------------------------------------------------------------
+
+async fn cmd_use(config_override: Option<PathBuf>, account: String) -> Result<()> {
+    let config = crate::config::load_config(config_override.as_deref())?;
+    let use_url = format!("http://{}:{}/use", config.server.host, config.server.port);
+
+    // Validate account name before hitting the proxy
+    let is_auto = account == "auto";
+    if !is_auto && !config.accounts.iter().any(|a| a.name == account) {
+        let names: Vec<_> = config.accounts.iter().map(|a| a.name.as_str()).collect();
+        anyhow::bail!("Unknown account '{}'. Available: {}", account, names.join(", "));
+    }
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&use_url)
+        .json(&serde_json::json!({ "account": account }))
+        .send()
+        .await;
+
+    match resp {
+        Ok(r) if r.status().is_success() => {
+            if is_auto {
+                println!("  {} Routing restored to automatic (least-utilization)", green(CHECK));
+            } else {
+                println!("  {} Pinned to account {}", green(CHECK), bold(&format!("'{account}'")));
+                println!("  {} Run {} to restore automatic routing", dim("·"), cyan("shunt use auto"));
+            }
+            println!();
+        }
+        Ok(r) => {
+            let body = r.text().await.unwrap_or_default();
+            anyhow::bail!("Proxy returned error: {body}");
+        }
+        Err(_) => {
+            anyhow::bail!("Proxy is not running. Start it with: shunt start");
+        }
+    }
     Ok(())
 }
 

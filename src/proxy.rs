@@ -50,6 +50,7 @@ pub fn create_app_with_state(config: Config, state: StateStore) -> anyhow::Resul
     let app = Router::new()
         .route("/health", get(health))
         .route("/status", get(status_handler))
+        .route("/use", post(use_handler))
         .route("/v1/messages", post(proxy_handler))
         .route("/v1/messages/count_tokens", post(proxy_handler))
         .with_state(app_state);
@@ -112,7 +113,29 @@ async fn status_handler(State(s): State<AppState>) -> impl IntoResponse {
     axum::Json(json!({
         "version": env!("CARGO_PKG_VERSION"),
         "accounts": accounts,
+        "pinned": s.state.get_pinned(),
     }))
+}
+
+async fn use_handler(
+    State(s): State<AppState>,
+    axum::Json(body): axum::Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let account = body["account"].as_str().map(|s| s.to_owned());
+    // Validate the account name exists (unless clearing to auto)
+    if let Some(ref name) = account {
+        if name != "auto" && !s.config.accounts.iter().any(|a| &a.name == name) {
+            return axum::Json(json!({
+                "error": format!("unknown account '{name}'")
+            }));
+        }
+        let pinned = if name == "auto" { None } else { Some(name.clone()) };
+        s.state.set_pinned(pinned);
+        axum::Json(json!({ "pinned": name }))
+    } else {
+        s.state.set_pinned(None);
+        axum::Json(json!({ "pinned": null }))
+    }
 }
 
 fn now_ms() -> u64 {
