@@ -142,7 +142,9 @@ pub struct ServerConfig {
 pub struct AccountConfig {
     pub name: String,
     pub plan_type: String,
-    pub credential: OAuthCredential,
+    /// `None` when the account is in config but has no credential yet.
+    /// These accounts are shown in status but skipped during proxying.
+    pub credential: Option<OAuthCredential>,
 }
 
 #[derive(Debug, Clone)]
@@ -206,17 +208,10 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
             store.accounts.get(&a.name).cloned()
         };
 
-        let credential = cred.with_context(|| {
-            format!(
-                "Account '{}': no OAuth credential found. Run `shunt setup` to configure it.",
-                a.name
-            )
-        })?;
-
         accounts.push(AccountConfig {
             name: a.name.clone(),
             plan_type: a.plan_type.clone(),
-            credential,
+            credential: cred,
         });
     }
 

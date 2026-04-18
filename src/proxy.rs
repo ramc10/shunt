@@ -34,9 +34,15 @@ pub fn create_app(config: Config) -> anyhow::Result<Router> {
 pub fn create_app_with_state(config: Config, state: StateStore) -> anyhow::Result<Router> {
     let forwarder = Forwarder::new(&config.server.upstream_url)?;
 
+    // Accounts with no credential are shown in status but skipped during routing.
+    // Mark them disabled immediately so the router ignores them.
+    for a in config.accounts.iter().filter(|a| a.credential.is_none()) {
+        state.set_auth_failed(&a.name);
+    }
+
     let credentials = Arc::new(RwLock::new(
         config.accounts.iter()
-            .map(|a| (a.name.clone(), a.credential.clone()))
+            .filter_map(|a| a.credential.as_ref().map(|c| (a.name.clone(), c.clone())))
             .collect::<HashMap<_, _>>(),
     ));
 
@@ -177,7 +183,8 @@ async fn proxy_handler(
             let creds = s.credentials.read().await;
             creds.get(&account_name)
                 .map(|c| c.access_token.clone())
-                .unwrap_or_else(|| account.credential.access_token.clone())
+                .or_else(|| account.credential.as_ref().map(|c| c.access_token.clone()))
+                .unwrap_or_default()
         };
 
         let response = s.forwarder
@@ -208,7 +215,11 @@ async fn proxy_handler(
                     let cred = {
                         let creds = s.credentials.read().await;
                         creds.get(&account_name).cloned()
-                            .unwrap_or_else(|| account.credential.clone())
+                            .or_else(|| account.credential.clone())
+                    };
+                    let Some(cred) = cred else {
+                        tried.insert(account_name);
+                        continue;
                     };
                     match tokio::time::timeout(
                         std::time::Duration::from_secs(10),
@@ -364,7 +375,10 @@ pub async fn prefetch_rate_limits(config: Arc<Config>, state: StateStore) {
             }
         }
 
-        let creds = account.credential.clone();
+        let creds = match account.credential.clone() {
+            Some(c) => c,
+            None => continue, // no credential — skip prefetch
+        };
         let resp = client
             .post(&url)
             .header("authorization", format!("Bearer {}", creds.access_token))

@@ -45,9 +45,8 @@ enum Command {
     AddAccount {
         #[arg(long)]
         config: Option<PathBuf>,
-        /// Name for this account (e.g. "secondary", "work")
-        #[arg(default_value = "secondary")]
-        name: String,
+        /// Name for this account (e.g. "secondary", "work"). Omit to auto-detect.
+        name: Option<String>,
     },
     /// Remove an account from the pool
     RemoveAccount {
@@ -171,16 +170,55 @@ pub async fn cmd_setup(config_override: Option<PathBuf>) -> Result<()> {
 // add-account
 // ---------------------------------------------------------------------------
 
-async fn cmd_add_account(config_override: Option<PathBuf>, name: String) -> Result<()> {
-    let config_p = config_override.unwrap_or_else(config_path);
+async fn cmd_add_account(config_override: Option<PathBuf>, name: Option<String>) -> Result<()> {
+    let config_p = config_override.clone().unwrap_or_else(config_path);
     if !config_p.exists() {
         bail!("No config found. Run `shunt setup` first.");
     }
 
     let existing_config = std::fs::read_to_string(&config_p)?;
-    if existing_config.contains(&format!("name = \"{name}\"")) {
-        bail!("Account '{name}' already exists. Choose a different name.");
-    }
+    let store = CredentialsStore::load();
+
+    // Resolve name: if not given, find accounts missing credentials or let user pick
+    let (name, already_in_config) = if let Some(n) = name {
+        let in_config = existing_config.contains(&format!("name = \"{n}\""));
+        let has_cred  = store.accounts.contains_key(&n);
+        if in_config && has_cred {
+            bail!("Account '{}' already exists with a valid credential.\nTo add a new account use: shunt add-account <name>", n);
+        }
+        (n, in_config)
+    } else {
+        // Find accounts in config that have no credential yet
+        let config = crate::config::load_config(config_override.as_deref())?;
+        let missing: Vec<_> = config.accounts.iter()
+            .filter(|a| a.credential.is_none())
+            .collect();
+        match missing.len() {
+            0 => {
+                // All accounts are authorised — user wants to add a brand new one
+                println!("  {} All accounts have credentials.", green(CHECK));
+                println!("  {} To add a new account, run: {}", dim("·"),
+                    cyan("shunt add-account <name>"));
+                println!();
+                return Ok(());
+            }
+            1 => {
+                println!("  {} Account '{}' has no credential — authorizing now",
+                    yellow("↻"), missing[0].name);
+                (missing[0].name.clone(), true)
+            }
+            _ => {
+                let items: Vec<term::SelectItem> = missing.iter().map(|a| term::SelectItem {
+                    label: bold(&a.name).to_string(),
+                    value: a.name.clone(),
+                }).collect();
+                match term::select("Authorize account:", &items, 0) {
+                    Some(v) => (v, true),
+                    None => return Ok(()),
+                }
+            }
+        }
+    };
 
     print_splash(&[
         format!("{}  {}", bold_white("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
@@ -197,18 +235,19 @@ async fn cmd_add_account(config_override: Option<PathBuf>, name: String) -> Resu
     }
     cred.email = email;
 
-    let plan = "pro";
-
-    let mut config_text = existing_config;
-    config_text.push_str(&format!("\n[[accounts]]\nname = \"{name}\"\nplan_type = \"{plan}\"\n"));
-    std::fs::write(&config_p, &config_text)?;
+    // Only append to config if not already there
+    if !already_in_config {
+        let mut config_text = existing_config;
+        config_text.push_str(&format!("\n[[accounts]]\nname = \"{name}\"\nplan_type = \"pro\"\n"));
+        std::fs::write(&config_p, &config_text)?;
+    }
 
     let mut store = CredentialsStore::load();
     store.accounts.insert(name.clone(), cred);
     store.save()?;
 
     println!();
-    println!("  {} Account {} added.", green(CHECK), bold(&format!("'{name}'")));
+    println!("  {} Account {} authorized.", green(CHECK), bold(&format!("'{name}'")));
     println!("  {} Restart to apply: {}", dim("·"), cyan("shunt start"));
     println!();
     Ok(())
@@ -236,7 +275,7 @@ async fn cmd_remove_account(config_override: Option<PathBuf>, name: Option<Strin
             bail!("No removable accounts (cannot remove 'main').");
         }
         let items: Vec<term::SelectItem> = removable.iter().map(|a| {
-            let email = a.credential.email.as_deref().unwrap_or("");
+            let email = a.credential.as_ref().and_then(|c| c.email.as_deref()).unwrap_or("");
             term::SelectItem {
                 label: format!("{}  {}", bold(&pad(&a.name, 12)), dim(&pad(email, 32))),
                 value: a.name.clone(),
@@ -346,22 +385,24 @@ async fn cmd_start(
 
     // Refresh any expired tokens (with visible progress + 10-second timeout each)
     for account in &mut config.accounts {
-        if account.credential.needs_refresh() {
-            print!("  {} Refreshing token for '{}'… ", yellow("↻"), account.name);
-            std::io::stdout().flush().ok();
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                refresh_token(&account.credential),
-            ).await {
-                Ok(Ok(fresh)) => {
-                    println!("{}", green("done"));
-                    let mut store = CredentialsStore::load();
-                    store.accounts.insert(account.name.clone(), fresh.clone());
-                    store.save().ok();
-                    account.credential = fresh;
+        if let Some(cred) = &account.credential {
+            if cred.needs_refresh() {
+                print!("  {} Refreshing token for '{}'… ", yellow("↻"), account.name);
+                std::io::stdout().flush().ok();
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    refresh_token(cred),
+                ).await {
+                    Ok(Ok(fresh)) => {
+                        println!("{}", green("done"));
+                        let mut store = CredentialsStore::load();
+                        store.accounts.insert(account.name.clone(), fresh.clone());
+                        store.save().ok();
+                        account.credential = Some(fresh);
+                    }
+                    Ok(Err(e)) => println!("{} ({})", yellow("failed"), dim(&e.to_string())),
+                    Err(_)    => println!("{}", yellow("timed out — using existing token")),
                 }
-                Ok(Err(e)) => println!("{} ({})", yellow("failed"), dim(&e.to_string())),
-                Err(_)    => println!("{}", yellow("timed out — using existing token")),
             }
         }
     }
@@ -414,9 +455,10 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
     let mut store_dirty = false;
     let mut store = CredentialsStore::load();
     for acc in &mut config.accounts {
-        if acc.credential.email.is_none() {
-            if let Some(email) = crate::oauth::fetch_account_email(&acc.credential.access_token).await {
-                acc.credential.email = Some(email.clone());
+        if acc.credential.as_ref().map(|c| c.email.is_none()).unwrap_or(false) {
+            let token = acc.credential.as_ref().map(|c| c.access_token.clone()).unwrap_or_default();
+            if let Some(email) = crate::oauth::fetch_account_email(&token).await {
+                if let Some(c) = acc.credential.as_mut() { c.email = Some(email.clone()); }
                 if let Some(stored) = store.accounts.get_mut(&acc.name) {
                     stored.email = Some(email);
                     store_dirty = true;
@@ -494,10 +536,10 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
                 (yellow("↻"), yellow("needs restart"), dim("fresh").into(), DASH.into())
             } else {
                 // Proxy not running — show local credential state
-                let (icon, col): (&str, fn(&str) -> String) = if acc.credential.needs_refresh() {
-                    (CROSS, yellow)
-                } else {
-                    (EMPTY, dim)
+                let (icon, col): (&str, fn(&str) -> String) = match &acc.credential {
+                    None => (CROSS, red),
+                    Some(c) if c.needs_refresh() => (CROSS, yellow),
+                    _ => (EMPTY, dim),
                 };
                 (col(icon), dim("offline"), dim("fresh").into(), DASH.into())
             };
@@ -507,7 +549,7 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
             "team"               => "Claude Team",
             _                    => "Claude Pro",
         };
-        let email_str = acc.credential.email.as_deref().unwrap_or("");
+        let email_str = acc.credential.as_ref().and_then(|c| c.email.as_deref()).unwrap_or("");
 
         // Row 1: status icon · name · plan · email · status · tokens used · window reset
         println!(
@@ -601,6 +643,9 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
                 };
                 println!("{}  {}  {}", indent, dim("Extra usage"), ov_display);
             }
+        } else if acc.credential.is_none() {
+            println!("        {} No credential — run {} to authorize",
+                red(CROSS), cyan(&format!("shunt add-account {}", acc.name)));
         } else if live_acc.is_some() {
             let status = live_acc.unwrap()["status"].as_str().unwrap_or("");
             if status == "reauth_required" {
@@ -660,7 +705,7 @@ async fn cmd_use(config_override: Option<PathBuf>, account: Option<String>) -> R
             _ => dim("offline").to_string(),
         };
 
-        let email = a.credential.email.as_deref().unwrap_or("");
+        let email = a.credential.as_ref().and_then(|c| c.email.as_deref()).unwrap_or("");
         let pin = if is_pinned { format!("  {}", yellow("▶ active")) } else { String::new() };
 
         term::SelectItem {
