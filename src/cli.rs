@@ -32,6 +32,9 @@ enum Command {
         /// Keep the process in the foreground instead of daemonizing
         #[arg(long)]
         foreground: bool,
+        /// Internal: running as background daemon (do not use directly)
+        #[arg(long, hide = true)]
+        _daemon: bool,
     },
     /// Print current config and proxy status
     Status {

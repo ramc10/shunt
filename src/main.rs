@@ -1,15 +1,19 @@
 fn main() -> anyhow::Result<()> {
-    // Pre-flight: kill any existing shunt process BEFORE starting tokio.
-    // Must be synchronous — no runtime, no async, no hangs possible.
     let args: Vec<String> = std::env::args().collect();
     let is_start = args.iter().any(|a| a == "start");
-    let foreground = args.iter().any(|a| a == "--foreground");
+    let is_foreground = args.iter().any(|a| a == "--foreground");
+    let is_daemon = args.iter().any(|a| a == "--_daemon");
 
-    if is_start {
+    if is_start && !is_daemon {
+        // Kill any existing instance BEFORE doing anything else.
+        // Must be synchronous — no runtime, no async, no hangs possible.
         preflight_kill();
-        if !foreground {
-            // Daemonize: fork, parent prints splash + exits, child runs server.
-            daemonize();
+
+        if !is_foreground {
+            // Daemonize by re-execing self with --_daemon (avoids fork() issues on macOS).
+            // The child runs the server in the background; we print a status line and exit.
+            spawn_daemon();
+            // spawn_daemon() exits — we never reach here unless spawn failed.
         }
     }
 
@@ -31,44 +35,73 @@ fn preflight_kill() {
     std::thread::sleep(std::time::Duration::from_millis(400));
 }
 
-/// Fork: parent prints a brief started message and exits (freeing the terminal).
-/// Child redirects stdio and continues as the background server.
-#[cfg(unix)]
-fn daemonize() {
-    // Load minimal config info for the parent's status line (best-effort)
-    let addr = load_addr();
+/// Re-exec self with --_daemon flag so the child runs the server.
+/// Opens the log file for the child's stdout/stderr, prints a brief status
+/// line to the terminal, then exits so the shell prompt returns.
+fn spawn_daemon() {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Warning: cannot locate executable ({e}), starting in foreground");
+            return; // fall through to foreground
+        }
+    };
 
-    unsafe {
-        let pid = libc::fork();
-        if pid < 0 {
-            // fork failed — continue in foreground
+    let log_path = shunt::config::log_path();
+    if let Some(parent) = log_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let log_file = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("Warning: cannot open log file ({e}), starting in foreground");
             return;
         }
-        if pid > 0 {
-            // Parent: print started message, return terminal to user, exit
+    };
+
+    let addr = load_addr();
+
+    // Collect original args, replace "start" with "start --_daemon"
+    let mut child_args: Vec<String> = std::env::args()
+        .skip(1) // skip argv[0]
+        .collect();
+    if !child_args.iter().any(|a| a == "--_daemon") {
+        child_args.push("--_daemon".into());
+    }
+
+    use std::os::unix::process::CommandExt;
+    let log_file2 = log_file.try_clone().ok();
+
+    let result = std::process::Command::new(&exe)
+        .args(&child_args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(log_file))
+        .stderr(std::process::Stdio::from(log_file2.unwrap_or_else(|| {
+            std::fs::OpenOptions::new()
+                .create(true).append(true).open(&log_path).unwrap()
+        })))
+        // Detach from the current process group so SIGHUP doesn't reach child
+        .process_group(0)
+        .spawn();
+
+    match result {
+        Ok(_child) => {
             println!();
-            println!("  shunt started  ·  {}", addr);
-            println!("  shunt status   for live info");
+            println!("  shunt started  ·  {addr}");
+            println!("  shunt status   to see live info");
             println!();
             std::process::exit(0);
         }
-        // Child: detach from terminal, redirect stdio to /dev/null (logs go to file)
-        libc::setsid();
-        let devnull = libc::open(
-            b"/dev/null\0".as_ptr() as *const libc::c_char,
-            libc::O_RDWR,
-        );
-        if devnull >= 0 {
-            libc::dup2(devnull, 0); // stdin
-            libc::dup2(devnull, 1); // stdout
-            libc::dup2(devnull, 2); // stderr
-            libc::close(devnull);
+        Err(e) => {
+            eprintln!("Warning: could not daemonize ({e}), starting in foreground");
+            // fall through — tokio will start and run normally
         }
     }
 }
-
-#[cfg(not(unix))]
-fn daemonize() {}
 
 fn load_addr() -> String {
     if let Ok(cfg) = shunt::config::load_config(None) {
