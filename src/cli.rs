@@ -376,14 +376,11 @@ async fn cmd_start(
     let n = config.accounts.len();
     let acct_label = if n == 1 { "account".to_string() } else { format!("{n} accounts") };
 
-    // Print splash immediately so the user sees output right away
-    print_splash(&[
-        format!("{}  {}  {}  {}",
-            bold_white("shunt"),
-            dim(&format!("v{}", env!("CARGO_PKG_VERSION"))),
-            dim("·"),
-            dim(&acct_label),
-        ),
+    // Print routing header with account names immediately so the user sees output
+    let account_names: Vec<&str> = config.accounts.iter().map(|a| a.name.as_str()).collect();
+    print_routing_header(&account_names, &[
+        format!("{}  {}", bold_white("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
+        dim(&acct_label).to_string(),
     ]);
 
     // Refresh any expired tokens (with visible progress + 10-second timeout each)
@@ -472,34 +469,26 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
         store.save().ok();
     }
 
-    let (proxy_dot, proxy_label) = if live.is_some() {
-        (green(DOT), format!("{} running  {}", green(DOT), cyan(&proxy_url)))
+    let proxy_line = if live.is_some() {
+        format!("{}  running  {}", green(DOT), cyan(&proxy_url))
     } else {
-        (dim(EMPTY), format!("{} stopped  {}", dim(EMPTY), dim("shunt start to run")))
+        format!("{}  stopped  {}", dim(EMPTY), dim("run shunt start"))
     };
-    let _ = proxy_dot;
 
-    let n = config.accounts.len();
-    let acct_label = if n == 1 { "1 account".to_string() } else { format!("{n} accounts") };
-
-    println!();
-    println!("  {}  {}  {}  {}",
-        bold_white("shunt"),
-        dim(&format!("v{}", env!("CARGO_PKG_VERSION"))),
-        dim("·"),
-        dim(&acct_label),
-    );
-    println!("  {proxy_label}");
-    println!();
+    let account_names: Vec<&str> = config.accounts.iter().map(|a| a.name.as_str()).collect();
+    print_routing_header(&account_names, &[
+        format!("{}  {}", bold_white("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
+        proxy_line,
+    ]);
 
     // Pinned notice
     if let Some(pinned) = live.as_ref().and_then(|v| v["pinned"].as_str()) {
-        println!("  {} Pinned to {}  {}",
-            yellow("◆"), bold(pinned),
-            dim("· shunt use auto to restore"),
-        );
+        println!("  {} Pinned to {}  {}", yellow("◆"), bold(pinned),
+            dim("· shunt use auto to restore"));
         println!();
     }
+
+    let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs()).unwrap_or(0);
 
     for acc in &config.accounts {
         let live_acc = live.as_ref()
@@ -509,68 +498,71 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
         let status = live_acc.and_then(|a| a["status"].as_str()).unwrap_or("offline");
 
         let (status_icon, status_text): (String, String) = match status {
-            "available"       => (green(CHECK),  green("available")),
-            "cooling"         => (yellow("↻"),   yellow("cooling")),
-            "disabled"        => (red(CROSS),    red("disabled")),
-            "reauth_required" => (red(CROSS),    red("session expired")),
-            "needs restart"   => (yellow("↻"),   yellow("needs restart")),
+            "available"       => (green(CHECK), green("available")),
+            "cooling"         => (yellow("↻"),  yellow("cooling")),
+            "disabled"        => (red(CROSS),   red("disabled")),
+            "reauth_required" => (red(CROSS),   red("session expired")),
             _ => match &acc.credential {
-                None        => (red(CROSS),  red("no credential")),
-                Some(c) if c.needs_refresh() => (yellow(CROSS), dim("offline")),
-                _           => (dim(EMPTY),  dim("offline")),
+                None                          => (red(CROSS),   red("no credential")),
+                Some(c) if c.needs_refresh()  => (yellow(CROSS), yellow("token expired")),
+                _                             => (dim(EMPTY),   dim("offline")),
             },
         };
 
+        let plan_label = match acc.plan_type.to_lowercase().as_str() {
+            "max" | "claude_max" => "Claude Max",
+            "team"               => "Claude Team",
+            _                    => "Claude Pro",
+        };
+        let email_str = acc.credential.as_ref().and_then(|c| c.email.as_deref()).unwrap_or("");
         let tokens_str = live_acc
             .and_then(|a| a["tokens_used"]["total"].as_u64())
-            .map(|t| dim(&format!("{} tokens used", term::fmt_tokens(t))))
+            .map(|t| format!("  {}  {}", dim("·"), dim(&format!("{} tokens used", term::fmt_tokens(t)))))
             .unwrap_or_default();
 
-        let email_str = acc.credential.as_ref().and_then(|c| c.email.as_deref()).unwrap_or("");
-        let plan_label = match acc.plan_type.to_lowercase().as_str() {
-            "max" | "claude_max" => "Max",
-            "team"               => "Team",
-            _                    => "Pro",
-        };
+        // ── account name ────────────────────────────────────
+        let fill_len = 52usize.saturating_sub(acc.name.len());
+        println!("  {} {} {}", dim("──"), bold(&acc.name), dim(&"─".repeat(fill_len)));
 
-        // Account header row
-        println!("  {}  {}  {}  {}  {}",
+        // status · plan · email · tokens
+        println!("  {}  {}  {}  {}  {}  {}{}",
             status_icon,
-            bold(&acc.name),
-            dim(plan_label),
-            dim(email_str),
             status_text,
+            dim("·"),
+            dim(plan_label),
+            dim("·"),
+            dim(email_str),
+            tokens_str,
         );
-        if !tokens_str.is_empty() {
-            println!("     {tokens_str}");
-        }
 
         // Rate limit bars
         if let Some(rl) = live_acc.and_then(|a| a["rate_limit"].as_object()) {
-            let util_5h  = rl.get("utilization_5h").and_then(|v| v.as_f64());
-            let reset_5h = rl.get("reset_5h").and_then(|v| v.as_u64());
+            let util_5h   = rl.get("utilization_5h").and_then(|v| v.as_f64());
+            let reset_5h  = rl.get("reset_5h").and_then(|v| v.as_u64());
             let status_5h = rl.get("status_5h").and_then(|v| v.as_str()).unwrap_or("allowed");
-            let util_7d  = rl.get("utilization_7d").and_then(|v| v.as_f64());
-            let reset_7d = rl.get("reset_7d").and_then(|v| v.as_u64());
+            let util_7d   = rl.get("utilization_7d").and_then(|v| v.as_f64());
+            let reset_7d  = rl.get("reset_7d").and_then(|v| v.as_u64());
             let status_7d = rl.get("status_7d").and_then(|v| v.as_str()).unwrap_or("allowed");
-            let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs()).unwrap_or(0);
 
             let print_window = |label: &str, util: Option<f64>, reset: Option<u64>, wstatus: &str| {
                 if reset.map(|t| t <= now_secs).unwrap_or(false) {
-                    let ago = reset.map(|t| {
-                        let s = now_secs.saturating_sub(t);
-                        format!("  reset {} ago", term::fmt_duration_ms(s * 1000))
-                    }).unwrap_or_default();
-                    println!("     {}  {}  {}", dim(label), green("fresh"), dim(&ago));
+                    let ago = reset.map(|t| format!("  reset {} ago",
+                        term::fmt_duration_ms(now_secs.saturating_sub(t) * 1000)
+                    )).unwrap_or_default();
+                    println!("  {}  {}  {}{}",
+                        dim(label), green(&"─".repeat(20)), green("fresh"), dim(&ago));
                 } else if let Some(u) = util {
-                    let remaining = 100u64.saturating_sub((u * 100.0) as u64);
+                    let rem = 100u64.saturating_sub((u * 100.0) as u64);
                     let bar = util_bar(u, 20);
                     let reset_str = reset.and_then(|t| secs_until(t))
                         .map(|s| format!("  resets in {}", term::fmt_duration_ms(s * 1000)))
                         .unwrap_or_default();
-                    let exhausted = wstatus == "exhausted";
-                    let pct_str = if exhausted { red("exhausted") } else { format!("{}%", cyan(&remaining.to_string())) };
-                    println!("     {}  {}  {} remaining{}", dim(label), bar, pct_str, dim(&reset_str));
+                    let pct = if wstatus == "exhausted" {
+                        red("exhausted")
+                    } else {
+                        format!("{}%", bold(&rem.to_string()))
+                    };
+                    println!("  {}  {}  {} remaining{}", dim(label), bar, pct, dim(&reset_str));
                 }
             };
 
@@ -581,13 +573,13 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
                 print_window("7d", util_7d, reset_7d, status_7d);
             }
         } else if acc.credential.is_none() {
-            println!("     {} run {} to authorize",
+            println!("  {} run {} to authorize",
                 dim("·"), cyan(&format!("shunt add-account {}", acc.name)));
         } else if status == "reauth_required" {
-            println!("     {} run {} to re-authorize",
+            println!("  {} run {} to re-authorize",
                 dim("·"), cyan(&format!("shunt add-account {}", acc.name)));
         } else if live.is_some() && live_acc.is_some() {
-            println!("     {}", dim("no rate-limit data yet — make a request first"));
+            println!("  {}", dim("· no rate-limit data yet — make a request first"));
         }
 
         println!();
@@ -716,11 +708,92 @@ fn futures_executor_hack(resp: reqwest::Response) -> Option<serde_json::Value> {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Generic 3-line routing logo for commands that don't have an account list.
 fn print_splash(info: &[String]) {
     println!();
-    for line in info {
-        if !line.is_empty() {
-            println!("  {line}");
+    let logo = ["──┐ ", "──┼─▶", "──┘ "];
+    for (i, l) in logo.iter().enumerate() {
+        let text = info.get(i).map(|s| s.as_str()).unwrap_or("");
+        if text.is_empty() {
+            println!("  {}", dim(l));
+        } else {
+            println!("  {}  {}", dim(l), text);
+        }
+    }
+    for extra in info.iter().skip(3) {
+        if !extra.is_empty() {
+            println!("         {extra}");
+        }
+    }
+    println!();
+}
+
+/// Dynamic routing logo showing actual account names feeding into the proxy.
+///
+/// 2 accounts:          3 accounts:          4+ accounts:
+///   main ─┐              main ─┐              main ─┐
+///         ├──▶  [info]   work ─┼──▶  [info]   +2   ─┼──▶  [info]
+///   work ─┘              sec  ─┘              last ─┘
+fn print_routing_header(account_names: &[&str], info: &[String]) {
+    println!();
+    let n = account_names.len();
+    let name_w = account_names.iter().map(|s| s.len()).max().unwrap_or(4);
+    let info0 = info.get(0).map(|s| s.as_str()).unwrap_or("");
+
+    // extra_indent: how many spaces (after the 2-char outer indent) to align
+    // continuation lines under info0.
+    // Layout: "  " + name_w + "  " + junction + "  " + info0
+    // junction widths: "──▶"=3, "├──▶"=4, "─┼──▶"=5
+    let (extra_indent, lines): (usize, Vec<String>) = match n {
+        0 => {
+            let logo = ["──┐", "──┼──▶", "──┘"];
+            for (i, l) in logo.iter().enumerate() {
+                let line = info.get(i).map(|s| s.as_str()).unwrap_or("");
+                if line.is_empty() { println!("  {}", dim(l)); }
+                else               { println!("  {}  {}", dim(l), line); }
+            }
+            println!();
+            return;
+        }
+        1 => {
+            // "  " + name + "  " + "──▶" + "  " + info0  →  offset = name_w + 2+3+2 = name_w+7
+            (name_w + 7, vec![
+                format!("  {}  {}  {}", bold(account_names[0]), dim("──▶"), info0),
+            ])
+        }
+        2 => {
+            // middle: "  " + name_w spaces + "  " + "├──▶" + "  "  →  offset = name_w+2+4+2 = name_w+8
+            (name_w + 8, vec![
+                format!("  {}  {}", bold(&pad(account_names[0], name_w)), dim("─┐")),
+                format!("  {}  {}  {}", " ".repeat(name_w), dim("├──▶"), info0),
+                format!("  {}  {}", bold(&pad(account_names[1], name_w)), dim("─┘")),
+            ])
+        }
+        3 => {
+            // "  " + name + "  " + "─┼──▶" + "  "  →  offset = name_w+2+5+2 = name_w+9
+            (name_w + 9, vec![
+                format!("  {}  {}", bold(&pad(account_names[0], name_w)), dim("─┐")),
+                format!("  {}  {}  {}", bold(&pad(account_names[1], name_w)), dim("─┼──▶"), info0),
+                format!("  {}  {}", bold(&pad(account_names[2], name_w)), dim("─┘")),
+            ])
+        }
+        _ => {
+            let more = dim(&pad(&format!("+ {} more", n - 2), name_w));
+            (name_w + 9, vec![
+                format!("  {}  {}", bold(&pad(account_names[0], name_w)), dim("─┐")),
+                format!("  {}  {}  {}", more, dim("─┼──▶"), info0),
+                format!("  {}  {}", bold(&pad(account_names[n - 1], name_w)), dim("─┘")),
+            ])
+        }
+    };
+
+    for line in &lines {
+        println!("{line}");
+    }
+    // Extra info lines aligned under info0
+    for extra in info.iter().skip(1) {
+        if !extra.is_empty() {
+            println!("  {}{extra}", " ".repeat(extra_indent));
         }
     }
     println!();
