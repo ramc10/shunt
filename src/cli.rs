@@ -378,9 +378,12 @@ async fn cmd_start(
 
     // Print splash immediately so the user sees output right away
     print_splash(&[
-        format!("{}  {}", bold_white("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
-        format!("{}  ·  {}", bold(&acct_label), cyan(&format!("http://{host}:{port}"))),
-        format!("{}", dim("Proxying Claude API across multiple accounts")),
+        format!("{}  {}  {}  {}",
+            bold_white("shunt"),
+            dim(&format!("v{}", env!("CARGO_PKG_VERSION"))),
+            dim("·"),
+            dim(&acct_label),
+        ),
     ]);
 
     // Refresh any expired tokens (with visible progress + 10-second timeout each)
@@ -411,10 +414,9 @@ async fn cmd_start(
     let _log_guard = crate::logging::setup(&lp, &config.server.log_level)?;
 
     let col = 13usize;
-    println!("  {}  {}", pad("Config", col), dim(&config.config_file.display().to_string()));
-    println!("  {}  {}", pad("Credentials", col), dim(&credentials_path().display().to_string()));
-    println!("  {}  {}", pad("Logs", col), dim(&lp.display().to_string()));
-    println!("  {}  {}", pad("Status", col), cyan(&format!("http://{host}:{port}/status")));
+    println!("  {}  {}", dim(&pad("listening", col)), cyan(&format!("http://{host}:{port}")));
+    println!("  {}  {}", dim(&pad("config", col)), dim(&config.config_file.display().to_string()));
+    println!("  {}  {}", dim(&pad("logs", col)), dim(&lp.display().to_string()));
     println!();
     println!("  {}{}",
         dim("export ANTHROPIC_BASE_URL="),
@@ -470,103 +472,80 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
         store.save().ok();
     }
 
-    let proxy_status = if live.is_some() {
-        format!("{}  ·  {}", green(&format!("{DOT} running")), cyan(&proxy_url))
+    let (proxy_dot, proxy_label) = if live.is_some() {
+        (green(DOT), format!("{} running  {}", green(DOT), cyan(&proxy_url)))
     } else {
-        format!("{}  ·  {}", dim("○ stopped"), dim("run: shunt start"))
+        (dim(EMPTY), format!("{} stopped  {}", dim(EMPTY), dim("shunt start to run")))
     };
+    let _ = proxy_dot;
 
     let n = config.accounts.len();
     let acct_label = if n == 1 { "1 account".to_string() } else { format!("{n} accounts") };
 
-    print_splash(&[
-        format!("{}  {}", bold_white("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
-        format!("{}  ·  {}", bold(&acct_label), proxy_status),
-        String::new(),
-    ]);
+    println!();
+    println!("  {}  {}  {}  {}",
+        bold_white("shunt"),
+        dim(&format!("v{}", env!("CARGO_PKG_VERSION"))),
+        dim("·"),
+        dim(&acct_label),
+    );
+    println!("  {proxy_label}");
+    println!();
 
-    // ── Pinned account notice ─────────────────────────────────────────
+    // Pinned notice
     if let Some(pinned) = live.as_ref().and_then(|v| v["pinned"].as_str()) {
-        println!("  {} Pinned to {}  ·  {}",
-            yellow("◆"),
-            bold(pinned),
-            dim(&format!("run 'shunt use auto' to restore automatic routing")),
+        println!("  {} Pinned to {}  {}",
+            yellow("◆"), bold(pinned),
+            dim("· shunt use auto to restore"),
         );
         println!();
     }
 
-    // ── Accounts ─────────────────────────────────────────────────────
-    term::section("ACCOUNTS");
-    println!();
-
     for acc in &config.accounts {
-        let (status_icon, status_str, tokens_str, window_str) =
-            if let Some(live_acc) = live.as_ref()
-                .and_then(|v| v["accounts"].as_array())
-                .and_then(|arr| arr.iter().find(|a| a["name"] == acc.name))
-            {
-                let status = live_acc["status"].as_str().unwrap_or("unknown");
-                let (icon, col): (&str, fn(&str) -> String) = match status {
-                    "available"       => (CHECK, green),
-                    "cooling"         => ("↻",   yellow),
-                    "disabled"        => (CROSS, red),
-                    "reauth_required" => (CROSS, red),
-                    _                 => (EMPTY, dim),
-                };
-
-                let tokens = live_acc["tokens_used"]["total"].as_u64()
-                    .map(|t| format!("{} tok", term::fmt_tokens(t)))
-                    .unwrap_or_else(|| dim("fresh").into());
-
-                let window = live_acc["window_expires_ms"].as_u64()
-                    .and_then(|exp| {
-                        let now = SystemTime::now()
-                            .duration_since(UNIX_EPOCH).ok()?.as_millis() as u64;
-                        if exp > now {
-                            Some(format!("resets in {}", term::fmt_duration_ms(exp - now)))
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or_else(|| DASH.into());
-
-                (col(icon), col(status), tokens, window)
-            } else if live.is_some() {
-                // Proxy running but account not loaded — config changed, needs restart
-                (yellow("↻"), yellow("needs restart"), dim("fresh").into(), DASH.into())
-            } else {
-                // Proxy not running — show local credential state
-                let (icon, col): (&str, fn(&str) -> String) = match &acc.credential {
-                    None => (CROSS, red),
-                    Some(c) if c.needs_refresh() => (CROSS, yellow),
-                    _ => (EMPTY, dim),
-                };
-                (col(icon), dim("offline"), dim("fresh").into(), DASH.into())
-            };
-
-        let plan_label = match acc.plan_type.to_lowercase().as_str() {
-            "max" | "claude_max" => "Claude Max",
-            "team"               => "Claude Team",
-            _                    => "Claude Pro",
-        };
-        let email_str = acc.credential.as_ref().and_then(|c| c.email.as_deref()).unwrap_or("");
-
-        // Row 1: status icon · name · plan · email · status · tokens used · window reset
-        println!(
-            "  {}  {}  {}  {}  {}  {}",
-            status_icon,
-            bold(&pad(&acc.name, 12)),
-            dim(&pad(plan_label, 10)),
-            dim(&pad(email_str, 34)),
-            pad(&status_str, 12),
-            format!("{tokens_str}  {}", dim(&window_str)),
-        );
-
-        // Row 2+: rate limit info from upstream headers (only if available)
         let live_acc = live.as_ref()
             .and_then(|v| v["accounts"].as_array())
             .and_then(|arr| arr.iter().find(|a| a["name"] == acc.name));
 
+        let status = live_acc.and_then(|a| a["status"].as_str()).unwrap_or("offline");
+
+        let (status_icon, status_text): (String, String) = match status {
+            "available"       => (green(CHECK),  green("available")),
+            "cooling"         => (yellow("↻"),   yellow("cooling")),
+            "disabled"        => (red(CROSS),    red("disabled")),
+            "reauth_required" => (red(CROSS),    red("session expired")),
+            "needs restart"   => (yellow("↻"),   yellow("needs restart")),
+            _ => match &acc.credential {
+                None        => (red(CROSS),  red("no credential")),
+                Some(c) if c.needs_refresh() => (yellow(CROSS), dim("offline")),
+                _           => (dim(EMPTY),  dim("offline")),
+            },
+        };
+
+        let tokens_str = live_acc
+            .and_then(|a| a["tokens_used"]["total"].as_u64())
+            .map(|t| dim(&format!("{} tokens used", term::fmt_tokens(t))))
+            .unwrap_or_default();
+
+        let email_str = acc.credential.as_ref().and_then(|c| c.email.as_deref()).unwrap_or("");
+        let plan_label = match acc.plan_type.to_lowercase().as_str() {
+            "max" | "claude_max" => "Max",
+            "team"               => "Team",
+            _                    => "Pro",
+        };
+
+        // Account header row
+        println!("  {}  {}  {}  {}  {}",
+            status_icon,
+            bold(&acc.name),
+            dim(plan_label),
+            dim(email_str),
+            status_text,
+        );
+        if !tokens_str.is_empty() {
+            println!("     {tokens_str}");
+        }
+
+        // Rate limit bars
         if let Some(rl) = live_acc.and_then(|a| a["rate_limit"].as_object()) {
             let util_5h  = rl.get("utilization_5h").and_then(|v| v.as_f64());
             let reset_5h = rl.get("reset_5h").and_then(|v| v.as_u64());
@@ -574,74 +553,41 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
             let util_7d  = rl.get("utilization_7d").and_then(|v| v.as_f64());
             let reset_7d = rl.get("reset_7d").and_then(|v| v.as_u64());
             let status_7d = rl.get("status_7d").and_then(|v| v.as_str()).unwrap_or("allowed");
-
-            let indent = "        ";
-
-            // 5-hour window
             let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs()).unwrap_or(0);
-            let window_5h_reset = reset_5h.and_then(|t| secs_until(t)); // None = already reset
+
+            let print_window = |label: &str, util: Option<f64>, reset: Option<u64>, wstatus: &str| {
+                if reset.map(|t| t <= now_secs).unwrap_or(false) {
+                    let ago = reset.map(|t| {
+                        let s = now_secs.saturating_sub(t);
+                        format!("  reset {} ago", term::fmt_duration_ms(s * 1000))
+                    }).unwrap_or_default();
+                    println!("     {}  {}  {}", dim(label), green("fresh"), dim(&ago));
+                } else if let Some(u) = util {
+                    let remaining = 100u64.saturating_sub((u * 100.0) as u64);
+                    let bar = util_bar(u, 20);
+                    let reset_str = reset.and_then(|t| secs_until(t))
+                        .map(|s| format!("  resets in {}", term::fmt_duration_ms(s * 1000)))
+                        .unwrap_or_default();
+                    let exhausted = wstatus == "exhausted";
+                    let pct_str = if exhausted { red("exhausted") } else { format!("{}%", cyan(&remaining.to_string())) };
+                    println!("     {}  {}  {} remaining{}", dim(label), bar, pct_str, dim(&reset_str));
+                }
+            };
+
             if util_5h.is_some() || reset_5h.is_some() {
-                if reset_5h.map(|t| t <= now_secs).unwrap_or(false) {
-                    // Window has rolled over — data is stale, show as fresh
-                    let reset_str = reset_5h
-                        .map(|t| {
-                            let ago = now_secs.saturating_sub(t);
-                            format!("  reset {} ago", term::fmt_duration_ms(ago * 1000))
-                        })
-                        .unwrap_or_default();
-                    println!("{}  {}  {}  {}",
-                        indent, dim("5h window "), green("fresh — window rolled over"), dim(&reset_str));
-                } else if let Some(util) = util_5h {
-                    let pct = (util * 100.0) as u64;
-                    let remaining_pct = 100u64.saturating_sub(pct);
-                    let bar = util_bar(util, 18);
-                    let reset_str = window_5h_reset
-                        .map(|s| format!("  resets in {}", term::fmt_duration_ms(s * 1000)))
-                        .unwrap_or_default();
-                    let status_col = if status_5h == "exhausted" { red("exhausted") } else { green("ok") };
-                    println!("{}  {}  {}  {}% remaining  {}{}",
-                        indent, dim("5h window "), bar, cyan(&remaining_pct.to_string()),
-                        status_col, dim(&reset_str));
-                }
+                print_window("5h", util_5h, reset_5h, status_5h);
             }
-
-            // 7-day window
-            let window_7d_reset = reset_7d.and_then(|t| secs_until(t));
             if util_7d.is_some() || reset_7d.is_some() {
-                if reset_7d.map(|t| t <= now_secs).unwrap_or(false) {
-                    let reset_str = reset_7d
-                        .map(|t| {
-                            let ago = now_secs.saturating_sub(t);
-                            format!("  reset {} ago", term::fmt_duration_ms(ago * 1000))
-                        })
-                        .unwrap_or_default();
-                    println!("{}  {}  {}  {}",
-                        indent, dim("7d window "), green("fresh — window rolled over"), dim(&reset_str));
-                } else if let Some(util) = util_7d {
-                    let pct = (util * 100.0) as u64;
-                    let remaining_pct = 100u64.saturating_sub(pct);
-                    let bar = util_bar(util, 18);
-                    let reset_str = window_7d_reset
-                        .map(|s| format!("  resets in {}", term::fmt_duration_ms(s * 1000)))
-                        .unwrap_or_default();
-                    let status_col = if status_7d == "exhausted" { red("exhausted") } else { green("ok") };
-                    println!("{}  {}  {}  {}% remaining  {}{}",
-                        indent, dim("7d window "), bar, cyan(&remaining_pct.to_string()),
-                        status_col, dim(&reset_str));
-                }
+                print_window("7d", util_7d, reset_7d, status_7d);
             }
-
         } else if acc.credential.is_none() {
-            println!("        {} No credential — run {} to authorize",
-                red(CROSS), cyan(&format!("shunt add-account {}", acc.name)));
-        } else if live_acc.is_some() {
-            let status = live_acc.unwrap()["status"].as_str().unwrap_or("");
-            if status == "reauth_required" {
-                println!("        {} Session expired — run {} to re-authorize",
-                    red(CROSS), cyan(&format!("shunt add-account {}", acc.name)));
-            } else {
-                println!("        {}", dim("No rate-limit data — make a request first"));
-            }
+            println!("     {} run {} to authorize",
+                dim("·"), cyan(&format!("shunt add-account {}", acc.name)));
+        } else if status == "reauth_required" {
+            println!("     {} run {} to re-authorize",
+                dim("·"), cyan(&format!("shunt add-account {}", acc.name)));
+        } else if live.is_some() && live_acc.is_some() {
+            println!("     {}", dim("no rate-limit data yet — make a request first"));
         }
 
         println!();
@@ -770,38 +716,23 @@ fn futures_executor_hack(resp: reqwest::Response) -> Option<serde_json::Value> {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Print the branded splash header with a 3-line routing logo alongside info lines.
-///
-/// Logo (3 lines):          Info lines:
-///   ─┐                       shunt  v0.1.0
-///   ─┼─▶                     2 accounts · http://...
-///   ─┘                       Proxying Claude API ...
 fn print_splash(info: &[String]) {
-    // Logo: represents multiple inputs being routed/shunted to one output
-    let logo_lines = ["─┐  ", "─┼─▶", "─┘  "];
     println!();
-    for (i, logo) in logo_lines.iter().enumerate() {
-        let line = info.get(i).map(|s| s.as_str()).unwrap_or("");
-        if line.is_empty() {
-            println!("  {}", dim(logo));
-        } else {
-            println!("  {}  {}", dim(logo), line);
-        }
-    }
-    // Any extra info lines, indented to align with text column
-    for extra in info.iter().skip(logo_lines.len()) {
-        if !extra.is_empty() {
-            println!("        {}", extra);
+    for line in info {
+        if !line.is_empty() {
+            println!("  {line}");
         }
     }
     println!();
 }
 
-/// Utilization bar — `util` is 0.0–1.0; bar shows how much is USED (red = high usage).
+/// Capacity bar — `util` is 0.0–1.0; filled blocks show REMAINING capacity.
+/// Green = plenty left, yellow = getting low, red = nearly exhausted.
 fn util_bar(util: f64, width: usize) -> String {
     let used = (util.clamp(0.0, 1.0) * width as f64).round() as usize;
     let free = width.saturating_sub(used);
-    let bar = format!("{}{}", "█".repeat(used), "░".repeat(free));
+    // filled = remaining, empty = used — so a full bar means lots of quota left
+    let bar = format!("{}{}", "█".repeat(free), "░".repeat(used));
     let pct = (util * 100.0) as u64;
     if pct < 50 { green(&bar) } else if pct < 80 { yellow(&bar) } else { red(&bar) }
 }
