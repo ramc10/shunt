@@ -98,6 +98,9 @@ struct StateData {
     /// If set, all requests are forced to this account (overrides routing).
     #[serde(default)]
     pinned_account: Option<String>,
+    /// The most recent account that successfully handled a proxied request.
+    #[serde(default)]
+    last_used_account: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -219,6 +222,18 @@ impl StateStore {
         data.quota.get(name).map(|q| q.window_start_ms).unwrap_or(u64::MAX)
     }
 
+    /// Unix epoch seconds when this account's 5h window resets.
+    /// Returns None if unknown or already past.
+    pub fn reset_5h_secs(&self, name: &str) -> Option<u64> {
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let data = self.inner.lock().unwrap();
+        let reset = data.rate_limits.get(name)?.reset_5h?;
+        if reset > now_secs { Some(reset) } else { None }
+    }
+
     /// 5-hour utilization 0.0–1.0 from the last upstream response headers.
     /// Returns 0.0 for fresh accounts or when the reset window has already passed.
     pub fn utilization_5h(&self, name: &str) -> f64 {
@@ -289,6 +304,22 @@ impl StateStore {
         {
             let mut data = self.inner.lock().unwrap();
             data.pinned_account = name;
+        }
+        self.persist();
+    }
+
+    // -----------------------------------------------------------------------
+    // Last-used tracking
+    // -----------------------------------------------------------------------
+
+    pub fn get_last_used(&self) -> Option<String> {
+        self.inner.lock().unwrap().last_used_account.clone()
+    }
+
+    pub fn set_last_used(&self, name: &str) {
+        {
+            let mut data = self.inner.lock().unwrap();
+            data.last_used_account = Some(name.to_owned());
         }
         self.persist();
     }

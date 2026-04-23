@@ -481,8 +481,11 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
         proxy_line,
     ]);
 
+    let pinned_account = live.as_ref().and_then(|v| v["pinned"].as_str()).map(|s| s.to_owned());
+    let last_used_account = live.as_ref().and_then(|v| v["last_used"].as_str()).map(|s| s.to_owned());
+
     // Pinned notice
-    if let Some(pinned) = live.as_ref().and_then(|v| v["pinned"].as_str()) {
+    if let Some(ref pinned) = pinned_account {
         println!("  {} Pinned to {}  {}", yellow("◆"), bold(pinned),
             dim("· shunt use auto to restore"));
         println!();
@@ -521,8 +524,18 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
             .unwrap_or_default();
 
         // ── account name ────────────────────────────────────
-        let fill_len = 52usize.saturating_sub(acc.name.len());
-        println!("  {} {} {}", dim("──"), bold(&acc.name), dim(&"─".repeat(fill_len)));
+        let is_pinned   = pinned_account.as_deref() == Some(&acc.name);
+        let is_last     = !is_pinned && last_used_account.as_deref() == Some(&acc.name);
+        // visible width of the tag (excluding ANSI codes): "  ▶ pinned" = 11, "  ▶ last routed" = 16
+        let (routing_tag, tag_vis_len): (String, usize) = if is_pinned {
+            (format!("  {}", yellow("▶ pinned")), 11)
+        } else if is_last {
+            (format!("  {}", green("▶ last routed")), 16)
+        } else {
+            (String::new(), 0)
+        };
+        let fill_len = 52usize.saturating_sub(acc.name.len() + tag_vis_len);
+        println!("  {} {}{} {}", dim("──"), bold(&acc.name), routing_tag, dim(&"─".repeat(fill_len)));
 
         // status · plan · email · tokens
         println!("  {}  {}  {}  {}  {}  {}{}",

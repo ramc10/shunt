@@ -120,6 +120,7 @@ async fn status_handler(State(s): State<AppState>) -> impl IntoResponse {
         "version": env!("CARGO_PKG_VERSION"),
         "accounts": accounts,
         "pinned": s.state.get_pinned(),
+        "last_used": s.state.get_last_used(),
     }))
 }
 
@@ -194,7 +195,10 @@ async fn proxy_handler(
             })?;
 
         match response.status().as_u16() {
-            200..=299 => return Ok(tap_usage(response, &s.state, &account_name).await),
+            200..=299 => {
+                s.state.set_last_used(&account_name);
+                return Ok(tap_usage(response, &s.state, &account_name).await);
+            }
             429 => {
                 warn!(account = %account_name, "429 rate-limited — cooling 60s");
                 capture_rate_limit_headers(response.headers(), &s.state, &account_name);

@@ -6,6 +6,7 @@ use crate::config::AccountConfig;
 use crate::state::StateStore;
 
 const STICKY_TTL_MS: u64 = 10 * 60 * 1000; // 10 minutes
+const EXPIRY_SOON_SECS: u64 = 30 * 60; // prefer expiring accounts within this window
 
 // ---------------------------------------------------------------------------
 // Fingerprinting
@@ -109,18 +110,36 @@ pub fn pick_account<'a>(
         }
     }
 
-    // Least-utilized-first: pick the account with the most headroom in its 5h window.
-    // Fresh accounts (never used) have utilization 0.0 and are picked first, ensuring
-    // all accounts get load. Falls back to window_start_ms ordering when utilization
-    // data is identical (e.g. before any requests have been proxied).
+    // Pick the best account:
+    // - "Expiring soon" (reset within 30 min, not exhausted) → use it or lose it;
+    //   among those, prefer the most urgent (soonest reset).
+    // - Otherwise → least-utilized-first so load spreads evenly across accounts.
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
     let chosen = accounts
         .iter()
         .filter(|a| !tried.contains(&a.name) && state.is_available(&a.name))
         .min_by(|a, b| {
             let ua = state.utilization_5h(&a.name);
             let ub = state.utilization_5h(&b.name);
-            ua.partial_cmp(&ub).unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| state.window_start_ms(&a.name).cmp(&state.window_start_ms(&b.name)))
+            let ra = state.reset_5h_secs(&a.name);
+            let rb = state.reset_5h_secs(&b.name);
+
+            let a_expiring = ra.map(|r| r.saturating_sub(now_secs) <= EXPIRY_SOON_SECS).unwrap_or(false) && ua < 1.0;
+            let b_expiring = rb.map(|r| r.saturating_sub(now_secs) <= EXPIRY_SOON_SECS).unwrap_or(false) && ub < 1.0;
+
+            match (a_expiring, b_expiring) {
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                (true, true) => ra.cmp(&rb), // most urgent first
+                (false, false) => {
+                    ua.partial_cmp(&ub).unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| state.window_start_ms(&a.name).cmp(&state.window_start_ms(&b.name)))
+                }
+            }
         })?;
 
     // Record stickiness for future requests in this conversation
