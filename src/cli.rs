@@ -55,10 +55,13 @@ enum Command {
         /// Name of the account to remove (omit to pick interactively)
         name: Option<String>,
     },
-    /// Enable remote access — expose the proxy to other devices on your network
+    /// Enable remote access — expose the proxy to other devices
     Share {
         #[arg(long)]
         config: Option<PathBuf>,
+        /// Create a public tunnel via Cloudflare (works over any network, not just LAN)
+        #[arg(long)]
+        tunnel: bool,
         /// Disable remote access and revert to localhost-only
         #[arg(long)]
         stop: bool,
@@ -85,7 +88,7 @@ pub async fn run() -> Result<()> {
         Command::Status { config } => cmd_status(config).await,
         Command::AddAccount { config, name } => cmd_add_account(config, name).await,
         Command::RemoveAccount { config, name } => cmd_remove_account(config, name).await,
-        Command::Share { config, stop } => cmd_share(config, stop).await,
+        Command::Share { config, tunnel, stop } => cmd_share(config, tunnel, stop).await,
         Command::Use { config, account } => cmd_use(config, account).await,
     }
 }
@@ -901,7 +904,7 @@ fn strip_ansi(s: &str) -> String {
 // share
 // ---------------------------------------------------------------------------
 
-async fn cmd_share(config_override: Option<PathBuf>, stop: bool) -> Result<()> {
+async fn cmd_share(config_override: Option<PathBuf>, tunnel: bool, stop: bool) -> Result<()> {
     let config_p = config_override.unwrap_or_else(config_path);
     if !config_p.exists() {
         bail!("No config found. Run `shunt setup` first.");
@@ -945,32 +948,114 @@ async fn cmd_share(config_override: Option<PathBuf>, stop: bool) -> Result<()> {
 
     std::fs::write(&config_p, &text)?;
 
-    // Read port from saved config
     let port = crate::config::load_config(Some(&config_p))
         .map(|c| c.server.port)
         .unwrap_or(8082);
 
-    let ip = local_ip().unwrap_or_else(|| "<your-ip>".to_string());
+    if tunnel {
+        // Cloudflare quick tunnel — works over any network, no account needed
+        print_splash(&[
+            format!("{}  {}", bold_white("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
+            dim("Starting Cloudflare tunnel…").to_string(),
+            String::new(),
+        ]);
 
-    print_splash(&[
-        format!("{}  {}", bold_white("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
-        dim("Remote sharing enabled").to_string(),
-        String::new(),
-    ]);
+        println!("  {} Make sure the proxy is running: {}", dim("·"), cyan("shunt start"));
+        println!();
 
-    println!("  Set on the remote device:\n");
-    println!("    {}{}",
-        dim("export ANTHROPIC_BASE_URL="),
-        cyan(&format!("http://{ip}:{port}")),
-    );
-    println!("    {}{}", dim("export ANTHROPIC_API_KEY="), cyan(&key));
-    println!();
-    println!("  {} Both devices must be on the same network (or port {port} forwarded).", dim("·"), port = port);
-    println!("  {} Restart to apply: {}", dim("·"), cyan("shunt start"));
-    println!("  {} To stop sharing: {}", dim("·"), cyan("shunt share --stop"));
-    println!();
+        let url = start_cloudflare_tunnel(port)?;
+
+        println!("  {}  Set on the remote device:\n", green(CHECK));
+        println!("    {}{}",
+            dim("export ANTHROPIC_BASE_URL="),
+            cyan(&url),
+        );
+        println!("    {}{}", dim("export ANTHROPIC_API_KEY="), cyan(&key));
+        println!();
+        println!("  {} Tunnel is active — keep this terminal open.", dim("·"));
+        println!("  {} Press Ctrl+C to stop.", dim("·"));
+        println!();
+
+        // Block until the user kills it
+        tokio::signal::ctrl_c().await.ok();
+        println!("\n  {} Tunnel closed.", dim("·"));
+    } else {
+        let ip = local_ip().unwrap_or_else(|| "<your-ip>".to_string());
+
+        print_splash(&[
+            format!("{}  {}", bold_white("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
+            dim("Remote sharing enabled (LAN)").to_string(),
+            String::new(),
+        ]);
+
+        println!("  Set on the remote device:\n");
+        println!("    {}{}",
+            dim("export ANTHROPIC_BASE_URL="),
+            cyan(&format!("http://{ip}:{port}")),
+        );
+        println!("    {}{}", dim("export ANTHROPIC_API_KEY="), cyan(&key));
+        println!();
+        println!("  {} Both devices must be on the same network.", dim("·"));
+        println!("  {} For any network: {}", dim("·"), cyan("shunt share --tunnel"));
+        println!("  {} Restart to apply: {}", dim("·"), cyan("shunt start"));
+        println!("  {} To stop sharing:  {}", dim("·"), cyan("shunt share --stop"));
+        println!();
+    }
 
     Ok(())
+}
+
+/// Spawn `cloudflared tunnel --url http://localhost:{port}`, wait for the public URL,
+/// and return it. The cloudflared process is left running in the background.
+fn start_cloudflare_tunnel(port: u16) -> Result<String> {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new("cloudflared")
+        .args(["tunnel", "--url", &format!("http://localhost:{port}")])
+        .stderr(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                anyhow::anyhow!(
+                    "cloudflared not found.\n\n  Install it:\n    brew install cloudflared\n  or: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/"
+                )
+            } else {
+                anyhow::anyhow!("Failed to start cloudflared: {e}")
+            }
+        })?;
+
+    let stderr = child.stderr.take().expect("stderr was piped");
+    let reader = BufReader::new(stderr);
+
+    for line in reader.lines() {
+        let line = line?;
+        if let Some(url) = extract_cloudflare_url(&line) {
+            // Leave the child running — it will be killed when the process exits
+            std::mem::forget(child);
+            return Ok(url);
+        }
+    }
+
+    bail!("cloudflared exited before providing a tunnel URL")
+}
+
+fn extract_cloudflare_url(line: &str) -> Option<String> {
+    // cloudflared prints the URL in a line like:
+    //   INF | https://random-words.trycloudflare.com |
+    // or just contains the URL somewhere in the log line
+    let lower = line.to_lowercase();
+    if lower.contains("trycloudflare.com") || lower.contains("cfargotunnel.com") {
+        // Extract the https:// URL from the line
+        if let Some(start) = line.find("https://") {
+            let rest = &line[start..];
+            let end = rest.find(|c: char| c.is_whitespace() || c == '|' || c == '"')
+                .unwrap_or(rest.len());
+            return Some(rest[..end].trim_end_matches('/').to_owned());
+        }
+    }
+    None
 }
 
 fn generate_remote_key() -> String {
