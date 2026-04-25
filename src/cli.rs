@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::{config_path, config_template, credentials_path, log_path, pid_path, CredentialsStore};
 use crate::oauth::{claude_credentials_path, read_claude_credentials, refresh_token, run_oauth_flow};
-use crate::term::{self, bold, bold_white, cyan, dim, green, red, yellow, CHECK, CROSS, DASH, DOT, EMPTY};
+use crate::term::{self, bold, bold_white, cyan, dim, green, red, yellow, CHECK, CROSS, DOT, EMPTY};
 
 #[derive(Parser)]
 #[command(name = "shunt", about = "Local Claude Code account-pooling proxy", version)]
@@ -55,6 +55,14 @@ enum Command {
         /// Name of the account to remove (omit to pick interactively)
         name: Option<String>,
     },
+    /// Enable remote access — expose the proxy to other devices on your network
+    Share {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Disable remote access and revert to localhost-only
+        #[arg(long)]
+        stop: bool,
+    },
     /// Pin routing to a specific account, or restore automatic routing
     ///
     /// Examples:
@@ -77,6 +85,7 @@ pub async fn run() -> Result<()> {
         Command::Status { config } => cmd_status(config).await,
         Command::AddAccount { config, name } => cmd_add_account(config, name).await,
         Command::RemoveAccount { config, name } => cmd_remove_account(config, name).await,
+        Command::Share { config, stop } => cmd_share(config, stop).await,
         Command::Use { config, account } => cmd_use(config, account).await,
     }
 }
@@ -415,7 +424,8 @@ async fn cmd_start(
     println!("  {}  {}", dim(&pad("config", col)), dim(&config.config_file.display().to_string()));
     println!("  {}  {}", dim(&pad("logs", col)), dim(&lp.display().to_string()));
     println!();
-    println!("  {}{}",
+    println!("  {}  {}{}",
+        dim(&pad("point Claude at", col)),
         dim("export ANTHROPIC_BASE_URL="),
         cyan(&format!("http://{host}:{port}")),
     );
@@ -537,16 +547,15 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
         let fill_len = 52usize.saturating_sub(acc.name.len() + tag_vis_len);
         println!("  {} {}{} {}", dim("──"), bold(&acc.name), routing_tag, dim(&"─".repeat(fill_len)));
 
-        // status · plan · email · tokens
-        println!("  {}  {}  {}  {}  {}  {}{}",
-            status_icon,
-            status_text,
-            dim("·"),
-            dim(plan_label),
-            dim("·"),
-            dim(email_str),
-            tokens_str,
-        );
+        // plan · email (subtitle, dim)
+        if !email_str.is_empty() {
+            println!("     {}  {}  {}", dim(plan_label), dim("·"), dim(email_str));
+        } else {
+            println!("     {}", dim(plan_label));
+        }
+
+        // status + token count
+        println!("  {}  {}{}", status_icon, status_text, tokens_str);
 
         // Rate limit bars
         if let Some(rl) = live_acc.and_then(|a| a["rate_limit"].as_object()) {
@@ -580,10 +589,10 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
             };
 
             if util_5h.is_some() || reset_5h.is_some() {
-                print_window("5h", util_5h, reset_5h, status_5h);
+                print_window("5h window", util_5h, reset_5h, status_5h);
             }
             if util_7d.is_some() || reset_7d.is_some() {
-                print_window("7d", util_7d, reset_7d, status_7d);
+                print_window("7d window", util_7d, reset_7d, status_7d);
             }
         } else if acc.credential.is_none() {
             println!("  {} run {} to authorize",
@@ -886,6 +895,119 @@ fn strip_ansi(s: &str) -> String {
         }
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// share
+// ---------------------------------------------------------------------------
+
+async fn cmd_share(config_override: Option<PathBuf>, stop: bool) -> Result<()> {
+    let config_p = config_override.unwrap_or_else(config_path);
+    if !config_p.exists() {
+        bail!("No config found. Run `shunt setup` first.");
+    }
+
+    let mut text = std::fs::read_to_string(&config_p)?;
+
+    if stop {
+        text = text.lines()
+            .filter(|l| !l.trim_start().starts_with("remote_key"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !text.ends_with('\n') { text.push('\n'); }
+        text = text.replace("host = \"0.0.0.0\"", "host = \"127.0.0.1\"");
+        std::fs::write(&config_p, &text)?;
+
+        print_splash(&[
+            format!("{}  {}", bold_white("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
+            dim("Remote sharing disabled").to_string(),
+            String::new(),
+        ]);
+        println!("  {} Restart to apply: {}", dim("·"), cyan("shunt start"));
+        println!();
+        return Ok(());
+    }
+
+    // Generate or reuse existing key
+    let key = match extract_remote_key(&text) {
+        Some(k) => k,
+        None => {
+            let k = generate_remote_key();
+            text = insert_into_server_section(&text, &format!("remote_key = \"{k}\""));
+            k
+        }
+    };
+
+    // Ensure host is 0.0.0.0
+    if text.contains("host = \"127.0.0.1\"") {
+        text = text.replace("host = \"127.0.0.1\"", "host = \"0.0.0.0\"");
+    }
+
+    std::fs::write(&config_p, &text)?;
+
+    // Read port from saved config
+    let port = crate::config::load_config(Some(&config_p))
+        .map(|c| c.server.port)
+        .unwrap_or(8082);
+
+    let ip = local_ip().unwrap_or_else(|| "<your-ip>".to_string());
+
+    print_splash(&[
+        format!("{}  {}", bold_white("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
+        dim("Remote sharing enabled").to_string(),
+        String::new(),
+    ]);
+
+    println!("  Set on the remote device:\n");
+    println!("    {}{}",
+        dim("export ANTHROPIC_BASE_URL="),
+        cyan(&format!("http://{ip}:{port}")),
+    );
+    println!("    {}{}", dim("export ANTHROPIC_API_KEY="), cyan(&key));
+    println!();
+    println!("  {} Both devices must be on the same network (or port {port} forwarded).", dim("·"), port = port);
+    println!("  {} Restart to apply: {}", dim("·"), cyan("shunt start"));
+    println!("  {} To stop sharing: {}", dim("·"), cyan("shunt share --stop"));
+    println!();
+
+    Ok(())
+}
+
+fn generate_remote_key() -> String {
+    let mut buf = [0u8; 16];
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        use std::io::Read;
+        let _ = f.read_exact(&mut buf);
+    }
+    hex::encode(buf)
+}
+
+fn extract_remote_key(config: &str) -> Option<String> {
+    for line in config.lines() {
+        let line = line.trim();
+        if line.starts_with("remote_key") {
+            return line.split('=')
+                .nth(1)
+                .map(|s| s.trim().trim_matches('"').to_owned());
+        }
+    }
+    None
+}
+
+fn insert_into_server_section(config: &str, line: &str) -> String {
+    // Insert just before the first [[accounts]] block
+    if let Some(pos) = config.find("\n[[accounts]]") {
+        let (before, after) = config.split_at(pos);
+        format!("{before}\n{line}{after}")
+    } else {
+        format!("{config}\n{line}\n")
+    }
+}
+
+fn local_ip() -> Option<String> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    Some(socket.local_addr().ok()?.ip().to_string())
 }
 
 fn offer_shell_export() -> Result<()> {

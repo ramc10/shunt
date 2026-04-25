@@ -101,6 +101,7 @@ struct RawServer {
     #[serde(default = "default_log_level")]
     log_level: String,
     upstream_url: Option<String>,
+    remote_key: Option<String>,
 }
 
 impl Default for RawServer {
@@ -110,6 +111,7 @@ impl Default for RawServer {
             port: default_port(),
             log_level: default_log_level(),
             upstream_url: None,
+            remote_key: None,
         }
     }
 }
@@ -136,6 +138,8 @@ pub struct ServerConfig {
     pub port: u16,
     pub log_level: String,
     pub upstream_url: String,
+    /// When set, remote requests must supply this value as `x-api-key`.
+    pub remote_key: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -186,6 +190,7 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
         port: raw.server.port,
         log_level: raw.server.log_level,
         upstream_url,
+        remote_key: raw.server.remote_key,
     };
 
     if raw.accounts.is_empty() {

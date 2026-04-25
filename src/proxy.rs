@@ -154,6 +154,17 @@ async fn proxy_handler(
     State(s): State<AppState>,
     req: Request,
 ) -> Result<Response, ProxyError> {
+    // Remote auth: if a remote_key is configured, the client must supply it as x-api-key.
+    if let Some(ref expected) = s.config.server.remote_key {
+        let provided = req.headers()
+            .get("x-api-key")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if provided != expected {
+            return Err(ProxyError::Unauthorized);
+        }
+    }
+
     let method = req.method().as_str().to_owned();
     let path = req.uri().path().to_owned();
     let headers = req.headers().clone();
@@ -444,6 +455,7 @@ enum ProxyError {
     BodyRead,
     Upstream,
     AllAccountsUnavailable,
+    Unauthorized,
 }
 
 impl IntoResponse for ProxyError {
@@ -454,6 +466,7 @@ impl IntoResponse for ProxyError {
             ProxyError::AllAccountsUnavailable => {
                 (StatusCode::SERVICE_UNAVAILABLE, "all accounts are on cooldown or disabled")
             }
+            ProxyError::Unauthorized => (StatusCode::UNAUTHORIZED, "invalid or missing api key"),
         };
 
         (status, axum::Json(json!({
