@@ -16,9 +16,6 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact: shunt-aarch64-apple-darwin
-          - os: macos-13
-            target: x86_64-apple-darwin
-            artifact: shunt-x86_64-apple-darwin
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             artifact: shunt-x86_64-unknown-linux-gnu
