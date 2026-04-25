@@ -1103,6 +1103,10 @@ async fn cmd_update() -> Result<()> {
     std::fs::rename(&tmp_path, &exe_path)
         .context("Failed to replace binary (try running with sudo?)")?;
 
+    // Remove macOS quarantine attribute so Gatekeeper doesn't block the updated binary
+    #[cfg(target_os = "macos")]
+    { std::process::Command::new("xattr").args(["-d", "com.apple.quarantine", &exe_path.display().to_string()]).status().ok(); }
+
     println!("  {} Updated to {}", green(CHECK), bold_white(&format!("v{latest}")));
     println!();
     Ok(())

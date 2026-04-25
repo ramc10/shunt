@@ -54,6 +54,11 @@ mkdir -p "$INSTALL_DIR"
 cp "$TMP/shunt-${VERSION}-${TARGET}/$BIN" "$INSTALL_DIR/$BIN"
 chmod +x "$INSTALL_DIR/$BIN"
 
+# Remove macOS quarantine attribute so Gatekeeper doesn't block unsigned binaries
+if [ "$OS" = "Darwin" ]; then
+  xattr -d com.apple.quarantine "$INSTALL_DIR/$BIN" 2>/dev/null || true
+fi
+
 echo ""
 echo "Installed $BIN $VERSION to $INSTALL_DIR/$BIN"
 
