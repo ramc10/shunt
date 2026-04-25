@@ -20,16 +20,15 @@ Claude's rate limits are per-account. If you hit your 5-hour or weekly limit on 
 ## Install
 
 ```bash
-cargo install --git https://github.com/ramc10/shunt
+curl -sSf https://raw.githubusercontent.com/ramc10/shunt/main/install.sh | sh
 ```
 
-Or build from source:
+This downloads the right pre-built binary for your OS and arch — no Rust or other dependencies needed.
+
+Or via cargo:
 
 ```bash
-git clone https://github.com/ramc10/shunt
-cd shunt
-cargo build --release
-cp target/release/shunt ~/.cargo/bin/
+cargo install shunt-proxy
 ```
 
 ## Setup
