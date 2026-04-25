@@ -195,7 +195,9 @@ async fn cmd_add_account(config_override: Option<PathBuf>, name: Option<String>)
     let (name, already_in_config) = if let Some(n) = name {
         let in_config = existing_config.contains(&format!("name = \"{n}\""));
         let has_cred  = store.accounts.contains_key(&n);
-        if in_config && has_cred {
+        let is_expired = store.accounts.get(&n).map(|c| c.needs_refresh()).unwrap_or(false);
+        // Block only if the credential exists AND is still valid — expired sessions can be re-authorized
+        if in_config && has_cred && !is_expired {
             bail!("Account '{}' already exists with a valid credential.\nTo add a new account use: shunt add-account <name>", n);
         }
         (n, in_config)
@@ -280,11 +282,9 @@ async fn cmd_remove_account(config_override: Option<PathBuf>, name: Option<Strin
         n
     } else {
         let config = crate::config::load_config(config_override.as_deref())?;
-        let removable: Vec<_> = config.accounts.iter()
-            .filter(|a| a.name != "main")
-            .collect();
+        let removable: Vec<_> = config.accounts.iter().collect();
         if removable.is_empty() {
-            bail!("No removable accounts (cannot remove 'main').");
+            bail!("No accounts to remove.");
         }
         let items: Vec<term::SelectItem> = removable.iter().map(|a| {
             let email = a.credential.as_ref().and_then(|c| c.email.as_deref()).unwrap_or("");
@@ -298,10 +298,6 @@ async fn cmd_remove_account(config_override: Option<PathBuf>, name: Option<Strin
             None => return Ok(()),
         }
     };
-
-    if name == "main" {
-        bail!("Cannot remove the 'main' account. Use `shunt setup` to reconfigure.");
-    }
 
     let config_text = std::fs::read_to_string(&config_p)?;
     if !config_text.contains(&format!("name = \"{name}\"")) {
