@@ -2,6 +2,15 @@
 name = "shunt"
 version = "0.1.0"
 edition = "2021"
+authors = ["Ramcharan <sairamcharansudagoni@gmail.com>"]
+description = "A local proxy that pools multiple Claude accounts behind a single endpoint, routing requests to maximise rate limits"
+license = "MIT"
+repository = "https://github.com/ramc10/shunt"
+homepage = "https://github.com/ramc10/shunt"
+readme = "README.md"
+keywords = ["claude", "anthropic", "proxy", "rate-limit", "llm"]
+categories = ["command-line-utilities", "network-programming"]
+exclude = [".github/", "tests/"]
 
 [[bin]]
 name = "shunt"
