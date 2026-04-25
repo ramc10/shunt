@@ -66,6 +66,8 @@ enum Command {
         #[arg(long)]
         stop: bool,
     },
+    /// Update shunt to the latest release
+    Update,
     /// Pin routing to a specific account, or restore automatic routing
     ///
     /// Examples:
@@ -88,6 +90,7 @@ pub async fn run() -> Result<()> {
         Command::Status { config } => cmd_status(config).await,
         Command::AddAccount { config, name } => cmd_add_account(config, name).await,
         Command::RemoveAccount { config, name } => cmd_remove_account(config, name).await,
+        Command::Update => cmd_update().await,
         Command::Share { config, tunnel, stop } => cmd_share(config, tunnel, stop).await,
         Command::Use { config, account } => cmd_use(config, account).await,
     }
@@ -1022,6 +1025,111 @@ fn strip_ansi(s: &str) -> String {
         }
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// update
+// ---------------------------------------------------------------------------
+
+async fn cmd_update() -> Result<()> {
+    const REPO: &str = "ramc10/shunt";
+    let current = env!("CARGO_PKG_VERSION");
+
+    print_splash(&[
+        format!("{}  {}", bold_white("shunt"), dim(&format!("v{current}"))),
+        dim("Checking for updates…").to_string(),
+        String::new(),
+    ]);
+
+    // Fetch latest release from GitHub API
+    let client = reqwest::Client::builder()
+        .user_agent("shunt-updater")
+        .timeout(std::time::Duration::from_secs(15))
+        .build()?;
+
+    let api_url = format!("https://api.github.com/repos/{REPO}/releases/latest");
+    let resp = client.get(&api_url).send().await
+        .context("Failed to reach GitHub API")?;
+
+    if !resp.status().is_success() {
+        bail!("GitHub API returned {}", resp.status());
+    }
+
+    let json: serde_json::Value = resp.json().await?;
+    let latest_tag = json["tag_name"].as_str().context("Missing tag_name in release")?;
+    let latest = latest_tag.trim_start_matches('v');
+
+    if latest == current {
+        println!("  {} Already up to date ({})", green(CHECK), bold(&format!("v{current}")));
+        println!();
+        return Ok(());
+    }
+
+    println!("  {} Update available: {}  →  {}", green("↑"),
+        dim(&format!("v{current}")), bold_white(&format!("v{latest}")));
+    println!();
+
+    // Detect platform
+    let target = detect_update_target()?;
+    let archive_name = format!("shunt-v{latest}-{target}.tar.gz");
+    let url = format!(
+        "https://github.com/{REPO}/releases/download/v{latest}/{archive_name}"
+    );
+
+    print!("  {} Downloading {}… ", dim("↓"), dim(&archive_name));
+    use std::io::Write as _;
+    std::io::stdout().flush().ok();
+
+    let bytes = client.get(&url).send().await
+        .context("Download request failed")?
+        .bytes().await
+        .context("Failed to read download")?;
+
+    println!("{}", green("done"));
+
+    // Extract binary from tarball into a temp file next to the current exe
+    let exe_path = std::env::current_exe().context("Cannot locate current executable")?;
+    let tmp_path = exe_path.with_extension("tmp");
+
+    extract_binary_from_tarball(&bytes, &tmp_path)
+        .context("Failed to extract binary from archive")?;
+
+    // Replace current executable atomically
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o755))?;
+    }
+    std::fs::rename(&tmp_path, &exe_path)
+        .context("Failed to replace binary (try running with sudo?)")?;
+
+    println!("  {} Updated to {}", green(CHECK), bold_white(&format!("v{latest}")));
+    println!();
+    Ok(())
+}
+
+fn detect_update_target() -> Result<&'static str> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos",  "aarch64") => Ok("aarch64-apple-darwin"),
+        ("linux",  "x86_64")  => Ok("x86_64-unknown-linux-gnu"),
+        ("linux",  "aarch64") => Ok("aarch64-unknown-linux-gnu"),
+        (os, arch) => bail!("No pre-built binary for {os}/{arch}. Build from source: cargo install shunt-proxy"),
+    }
+}
+
+fn extract_binary_from_tarball(data: &[u8], dest: &std::path::Path) -> Result<()> {
+    let gz = flate2::read::GzDecoder::new(data);
+    let mut archive = tar::Archive::new(gz);
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?;
+        if path.file_name().and_then(|n| n.to_str()) == Some("shunt") {
+            let mut out = std::fs::File::create(dest)?;
+            std::io::copy(&mut entry, &mut out)?;
+            return Ok(());
+        }
+    }
+    bail!("Binary 'shunt' not found in archive")
 }
 
 // ---------------------------------------------------------------------------
