@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{bail, Context as _, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -84,7 +84,7 @@ pub async fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Setup { config } => cmd_setup(config).await,
-        Command::Start { config, host, port, .. } => cmd_start(config, host, port).await,
+        Command::Start { config, host, port, foreground, daemon } => cmd_start(config, host, port, foreground, daemon).await,
         Command::Status { config } => cmd_status(config).await,
         Command::AddAccount { config, name } => cmd_add_account(config, name).await,
         Command::RemoveAccount { config, name } => cmd_remove_account(config, name).await,
@@ -371,82 +371,210 @@ async fn cmd_start(
     config_override: Option<PathBuf>,
     host_override: Option<String>,
     port_override: Option<u16>,
+    foreground: bool,
+    daemon: bool,
 ) -> Result<()> {
-    use std::io::Write as _;
-
     let config_p = config_override.clone().unwrap_or_else(config_path);
 
-    // Auto-run setup if not yet configured
-    if !config_p.exists() {
-        cmd_setup(config_override.clone()).await?;
-    }
+    // ── Daemon mode: internal re-exec, no user output ────────────────────────
+    if daemon {
+        if !config_p.exists() { return Ok(()); }
+        let mut config = crate::config::load_config(config_override.as_deref())?;
+        let host = host_override.unwrap_or_else(|| config.server.host.clone());
+        let port = port_override.unwrap_or(config.server.port);
 
-    let mut config = crate::config::load_config(config_override.as_deref())?;
-
-    let host = host_override.unwrap_or_else(|| config.server.host.clone());
-    let port = port_override.unwrap_or(config.server.port);
-    let n = config.accounts.len();
-    let acct_label = if n == 1 { "account".to_string() } else { format!("{n} accounts") };
-
-    // Print routing header with account names immediately so the user sees output
-    let account_names: Vec<&str> = config.accounts.iter().map(|a| a.name.as_str()).collect();
-    print_routing_header(&account_names, &[
-        format!("{}  {}", bold_white("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
-        dim(&acct_label).to_string(),
-    ]);
-
-    // Refresh any expired tokens (with visible progress + 10-second timeout each)
-    for account in &mut config.accounts {
-        if let Some(cred) = &account.credential {
-            if cred.needs_refresh() {
-                print!("  {} Refreshing token for '{}'… ", yellow("↻"), account.name);
-                std::io::stdout().flush().ok();
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(10),
-                    refresh_token(cred),
-                ).await {
-                    Ok(Ok(fresh)) => {
-                        println!("{}", green("done"));
+        for account in &mut config.accounts {
+            if let Some(cred) = &account.credential {
+                if cred.needs_refresh() {
+                    if let Ok(Ok(fresh)) = tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        refresh_token(cred),
+                    ).await {
                         let mut store = CredentialsStore::load();
                         store.accounts.insert(account.name.clone(), fresh.clone());
                         store.save().ok();
                         account.credential = Some(fresh);
                     }
-                    Ok(Err(e)) => println!("{} ({})", yellow("failed"), dim(&e.to_string())),
-                    Err(_)    => println!("{}", yellow("timed out — using existing token")),
                 }
             }
         }
+
+        let lp = log_path();
+        let _log_guard = crate::logging::setup(&lp, &config.server.log_level)?;
+        let state = crate::state::StateStore::load(&crate::config::state_path());
+        let app = crate::proxy::create_app_with_state(config.clone(), state.clone())?;
+        let listener = tokio::net::TcpListener::bind(format!("{}:{}", host, port)).await?;
+        write_pid();
+        tokio::spawn(crate::proxy::prefetch_rate_limits(std::sync::Arc::new(config), state));
+        axum::serve(listener, app).await?;
+        return Ok(());
     }
 
-    let lp = log_path();
-    let _log_guard = crate::logging::setup(&lp, &config.server.log_level)?;
+    // ── Auto-setup on first run ───────────────────────────────────────────────
+    if !config_p.exists() {
+        cmd_setup_auto(config_override.clone()).await?;
+    }
 
-    let col = 13usize;
-    println!("  {}  {}", dim(&pad("listening", col)), cyan(&format!("http://{host}:{port}")));
-    println!("  {}  {}", dim(&pad("config", col)), dim(&config.config_file.display().to_string()));
-    println!("  {}  {}", dim(&pad("logs", col)), dim(&lp.display().to_string()));
-    println!();
-    println!("  {}  {}{}",
-        dim(&pad("point Claude at", col)),
-        dim("export ANTHROPIC_BASE_URL="),
-        cyan(&format!("http://{host}:{port}")),
-    );
-    println!();
+    let config = crate::config::load_config(config_override.as_deref())?;
+    let host = host_override.clone().unwrap_or_else(|| config.server.host.clone());
+    let port = port_override.unwrap_or(config.server.port);
 
-    // Share one StateStore between the proxy and the prefetch task
-    use std::sync::Arc;
-    let state = crate::state::StateStore::load(&crate::config::state_path());
-    let app = crate::proxy::create_app_with_state(config.clone(), state.clone())?;
-    let listener = tokio::net::TcpListener::bind(format!("{}:{}", host, port)).await?;
-    write_pid();
+    // Kill any previous instance on this port
+    for pid in port_pids(port) {
+        let _ = std::process::Command::new("kill").arg(pid.to_string()).status();
+    }
+    if !port_pids(port).is_empty() {
+        std::thread::sleep(std::time::Duration::from_millis(400));
+    }
 
-    // Prefetch rate-limit data for accounts with no metrics yet (background)
-    tokio::spawn(crate::proxy::prefetch_rate_limits(Arc::new(config), state));
+    // ── Foreground mode (debugging) ───────────────────────────────────────────
+    if foreground {
+        use std::io::Write as _;
+        let mut config = config;
+        let account_names: Vec<&str> = config.accounts.iter().map(|a| a.name.as_str()).collect();
+        print_routing_header(&account_names, &[
+            format!("{}  {}", bold_white("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
+            dim("foreground").to_string(),
+        ]);
+        for account in &mut config.accounts {
+            if let Some(cred) = &account.credential {
+                if cred.needs_refresh() {
+                    print!("  {} Refreshing '{}'… ", yellow("↻"), account.name);
+                    std::io::stdout().flush().ok();
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        refresh_token(cred),
+                    ).await {
+                        Ok(Ok(fresh)) => {
+                            println!("{}", green("done"));
+                            let mut store = CredentialsStore::load();
+                            store.accounts.insert(account.name.clone(), fresh.clone());
+                            store.save().ok();
+                            account.credential = Some(fresh);
+                        }
+                        Ok(Err(e)) => println!("{}", yellow(&format!("failed ({})", e))),
+                        Err(_)    => println!("{}", yellow("timed out")),
+                    }
+                }
+            }
+        }
+        let lp = log_path();
+        let _log_guard = crate::logging::setup(&lp, &config.server.log_level)?;
+        let col = 13usize;
+        println!("  {}  {}", dim(&pad("listening", col)), cyan(&format!("http://{host}:{port}")));
+        println!("  {}  {}", dim(&pad("logs", col)), dim(&lp.display().to_string()));
+        println!();
+        let state = crate::state::StateStore::load(&crate::config::state_path());
+        let app = crate::proxy::create_app_with_state(config.clone(), state.clone())?;
+        let listener = tokio::net::TcpListener::bind(format!("{}:{}", host, port)).await?;
+        write_pid();
+        tokio::spawn(crate::proxy::prefetch_rate_limits(std::sync::Arc::new(config), state));
+        axum::serve(listener, app).await?;
+        return Ok(());
+    }
 
-    axum::serve(listener, app).await?;
+    // ── Background mode (default) ─────────────────────────────────────────────
+    let exe = std::env::current_exe().context("cannot locate current executable")?;
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg("start").arg("--daemon");
+    if let Some(ref p) = config_override { cmd.args(["--config", &p.display().to_string()]); }
+    if let Some(ref h) = host_override   { cmd.args(["--host", h]); }
+    if let Some(p) = port_override       { cmd.args(["--port", &p.to_string()]); }
+    cmd.stdin(std::process::Stdio::null())
+       .stdout(std::process::Stdio::null())
+       .stderr(std::process::Stdio::null())
+       .spawn()
+       .context("failed to start proxy in background")?;
+
+    // Wait until the proxy is accepting connections (up to 8 s)
+    let ready = wait_for_health(&host, port, 8).await;
+
+    // Auto-write ANTHROPIC_BASE_URL to shell profile (silent if already there)
+    auto_write_shell_export(port);
+
+    let account_names: Vec<&str> = config.accounts.iter().map(|a| a.name.as_str()).collect();
+    let status_line = if ready {
+        format!("{}  running  {}", green(DOT), cyan(&format!("http://{host}:{port}")))
+    } else {
+        format!("{}  starting  {}", yellow(DOT), dim(&format!("http://{host}:{port}")))
+    };
+    print_routing_header(&account_names, &[
+        format!("{}  {}", bold_white("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
+        status_line,
+    ]);
 
     Ok(())
+}
+
+/// Non-interactive setup called from `cmd_start`.
+/// Imports the existing Claude Code session silently.
+/// The only user interaction is the OAuth code paste if no session exists.
+async fn cmd_setup_auto(config_override: Option<PathBuf>) -> Result<()> {
+    let config_p = config_override.clone().unwrap_or_else(config_path);
+
+    let mut cred = match crate::oauth::read_claude_credentials() {
+        Some(mut c) => {
+            if c.needs_refresh() {
+                if let Ok(fresh) = refresh_token(&c).await { c = fresh; }
+            }
+            c
+        }
+        None => {
+            // No session on disk — run the full OAuth flow (user pastes code)
+            println!("  {} No Claude Code session found — opening browser for login…", yellow("·"));
+            crate::oauth::run_oauth_flow().await?
+        }
+    };
+
+    let plan = crate::oauth::read_claude_session_info()
+        .map(|s| s.plan)
+        .unwrap_or_else(|| "pro".to_string());
+
+    cred.email = crate::oauth::fetch_account_email(&cred.access_token).await;
+
+    if let Some(parent) = config_p.parent() { std::fs::create_dir_all(parent)?; }
+    std::fs::write(&config_p, crate::config::config_template(&[("main", &plan)]))?;
+    #[cfg(unix)] {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&config_p, std::fs::Permissions::from_mode(0o600))?;
+    }
+
+    let mut store = CredentialsStore::default();
+    store.accounts.insert("main".into(), cred);
+    store.save()?;
+
+    Ok(())
+}
+
+async fn wait_for_health(host: &str, port: u16, timeout_secs: u64) -> bool {
+    let url = format!("http://{host}:{port}/health");
+    let deadline = tokio::time::Instant::now()
+        + std::time::Duration::from_secs(timeout_secs);
+    while tokio::time::Instant::now() < deadline {
+        if reqwest::get(&url).await.map(|r| r.status().is_success()).unwrap_or(false) {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    false
+}
+
+fn auto_write_shell_export(port: u16) {
+    use std::io::Write;
+    let line = format!("export ANTHROPIC_BASE_URL=http://127.0.0.1:{port}");
+    let Some(profile) = detect_shell_profile() else { return };
+    if profile.exists() {
+        if let Ok(contents) = std::fs::read_to_string(&profile) {
+            if contents.contains("ANTHROPIC_BASE_URL") { return; }
+        }
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&profile) {
+        writeln!(f, "\n# Added by shunt").ok();
+        writeln!(f, "{line}").ok();
+        println!("  {} {} → {}",
+            green(CHECK), cyan("ANTHROPIC_BASE_URL"),
+            dim(&profile.display().to_string()));
+    }
 }
 
 // ---------------------------------------------------------------------------
