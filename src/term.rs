@@ -50,6 +50,21 @@ pub fn bold_white(s: &str) -> String {
     if is_tty() { format!("\x1b[1;97m{s}\x1b[0m") } else { s.to_owned() }
 }
 
+/// 256-colour dark forest green — used for borders and decorative chrome.
+pub fn dark_green(s: &str) -> String {
+    if is_tty() { format!("\x1b[38;5;28m{s}\x1b[0m") } else { s.to_owned() }
+}
+
+/// Bold bright green — used for account names in the routing diagram.
+pub fn green_bold(s: &str) -> String {
+    if is_tty() { format!("\x1b[1;32m{s}\x1b[0m") } else { s.to_owned() }
+}
+
+/// Bold medium green — the primary brand colour for the "shunt" wordmark.
+pub fn brand_green(s: &str) -> String {
+    if is_tty() { format!("\x1b[1;38;5;34m{s}\x1b[0m") } else { s.to_owned() }
+}
+
 // ---------------------------------------------------------------------------
 // Symbols
 // ---------------------------------------------------------------------------

@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::{config_path, config_template, credentials_path, log_path, pid_path, CredentialsStore};
 use crate::oauth::{claude_credentials_path, read_claude_credentials, refresh_token, revoke_token, run_oauth_flow};
-use crate::term::{self, bold, bold_white, cyan, dim, green, red, yellow, CHECK, CROSS, DOT, EMPTY};
+use crate::term::{self, bold, bold_white, brand_green, cyan, dark_green, dim, green, green_bold, red, yellow, CHECK, CROSS, DOT, EMPTY};
 
 #[derive(Parser)]
 #[command(name = "shunt", about = "Local Claude Code account-pooling proxy", version)]
@@ -120,7 +120,7 @@ pub async fn cmd_setup(config_override: Option<PathBuf>) -> Result<()> {
     let config_p = config_override.clone().unwrap_or_else(config_path);
 
     print_splash(&[
-        format!("{}  {}", bold_white("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
+        format!("{}  {}", brand_green("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
         dim("Setup"),
         String::new(),
     ]);
@@ -254,7 +254,7 @@ async fn cmd_add_account(config_override: Option<PathBuf>, name: Option<String>)
     };
 
     print_splash(&[
-        format!("{}  {}", bold_white("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
+        format!("{}  {}", brand_green("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
         format!("Adding account {}", bold(&format!("'{name}'"))),
         String::new(),
     ]);
@@ -324,7 +324,7 @@ async fn cmd_remove_account(config_override: Option<PathBuf>, name: Option<Strin
     }
 
     print_splash(&[
-        format!("{}  {}", bold_white("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
+        format!("{}  {}", brand_green("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
         format!("Removing account {}", bold(&format!("'{name}'"))),
         String::new(),
     ]);
@@ -407,7 +407,7 @@ async fn cmd_logout(config_override: Option<PathBuf>, name: Option<String>, all:
     };
 
     print_splash(&[
-        format!("{}  {}", bold_white("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
+        format!("{}  {}", brand_green("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
         format!("Logging out {label}"),
         String::new(),
     ]);
@@ -541,7 +541,7 @@ async fn cmd_start(
         let mut config = config;
         let account_names: Vec<&str> = config.accounts.iter().map(|a| a.name.as_str()).collect();
         print_routing_header(&account_names, &[
-            format!("{}  {}", bold_white("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
+            format!("{}  {}", brand_green("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
             dim("foreground").to_string(),
         ]);
         for account in &mut config.accounts {
@@ -569,7 +569,7 @@ async fn cmd_start(
         let lp = log_path();
         let _log_guard = crate::logging::setup(&lp, &config.server.log_level)?;
         let col = 13usize;
-        println!("  {}  {}", dim(&pad("listening", col)), cyan(&format!("http://{host}:{port}")));
+        println!("  {}  {}", dim(&pad("listening", col)), green_bold(&format!("http://{host}:{port}")));
         println!("  {}  {}", dim(&pad("logs", col)), dim(&lp.display().to_string()));
         println!();
         let state = crate::state::StateStore::load(&crate::config::state_path());
@@ -602,12 +602,12 @@ async fn cmd_start(
 
     let account_names: Vec<&str> = config.accounts.iter().map(|a| a.name.as_str()).collect();
     let status_line = if ready {
-        format!("{}  running  {}", green(DOT), cyan(&format!("http://{host}:{port}")))
+        format!("{}  {}  {}", green(DOT), green_bold("running"), cyan(&format!("http://{host}:{port}")))
     } else {
-        format!("{}  starting  {}", yellow(DOT), dim(&format!("http://{host}:{port}")))
+        format!("{}  {}  {}", yellow(DOT), yellow("starting"), dim(&format!("http://{host}:{port}")))
     };
     print_routing_header(&account_names, &[
-        format!("{}  {}", bold_white("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
+        format!("{}  {}", brand_green("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
         status_line,
     ]);
 
@@ -719,14 +719,14 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
     }
 
     let proxy_line = if live.is_some() {
-        format!("{}  running  {}", green(DOT), cyan(&proxy_url))
+        format!("{}  {}  {}", green(DOT), green_bold("running"), cyan(&proxy_url))
     } else {
-        format!("{}  stopped  {}", dim(EMPTY), dim("run shunt start"))
+        format!("{}  {}  {}", dim(EMPTY), dim("stopped"), dim("run shunt start"))
     };
 
     let account_names: Vec<&str> = config.accounts.iter().map(|a| a.name.as_str()).collect();
     print_routing_header(&account_names, &[
-        format!("{}  {}", bold_white("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
+        format!("{}  {}", brand_green("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
         proxy_line,
     ]);
 
@@ -772,10 +772,9 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
             .map(|t| format!("  {}  {}", dim("·"), dim(&format!("{} tokens used", term::fmt_tokens(t)))))
             .unwrap_or_default();
 
-        // ── account name ────────────────────────────────────
-        let is_pinned   = pinned_account.as_deref() == Some(&acc.name);
-        let is_last     = !is_pinned && last_used_account.as_deref() == Some(&acc.name);
-        // visible width of the tag (excluding ANSI codes): "  ▶ pinned" = 11, "  ▶ last routed" = 16
+        // ── routing tag ─────────────────────────────────────
+        let is_pinned  = pinned_account.as_deref() == Some(&acc.name);
+        let is_last    = !is_pinned && last_used_account.as_deref() == Some(&acc.name);
         let (routing_tag, tag_vis_len): (String, usize) = if is_pinned {
             (format!("  {}", yellow("▶ pinned")), 11)
         } else if is_last {
@@ -783,20 +782,25 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
         } else {
             (String::new(), 0)
         };
-        let fill_len = 52usize.saturating_sub(acc.name.len() + tag_vis_len);
-        println!("  {} {}{} {}", dim("──"), bold(&acc.name), routing_tag, dim(&"─".repeat(fill_len)));
 
-        // plan · email (subtitle, dim)
+        // ── card top border (name + tag + plan) ─────────────
+        println!("{}", card_top(&acc.name, &green_bold(&acc.name), &routing_tag, tag_vis_len, plan_label));
+
+        // ── email row ────────────────────────────────────────
         if !email_str.is_empty() {
-            println!("     {}  {}  {}", dim(plan_label), dim("·"), dim(email_str));
+            println!("{}", card_row(&dim(email_str)));
         } else {
-            println!("     {}", dim(plan_label));
+            println!("{}", card_row(&dim("—")));
         }
 
-        // status + token count
-        println!("  {}  {}{}", status_icon, status_text, tokens_str);
+        // ── divider ──────────────────────────────────────────
+        println!("{}", card_divider());
 
-        // Rate limit bars
+        // ── status + token count ─────────────────────────────
+        let status_line = format!("{}  {}{}", status_icon, status_text, tokens_str);
+        println!("{}", card_row(&status_line));
+
+        // ── rate limit bars ──────────────────────────────────
         if let Some(rl) = live_acc.and_then(|a| a["rate_limit"].as_object()) {
             let util_5h   = rl.get("utilization_5h").and_then(|v| v.as_f64());
             let reset_5h  = rl.get("reset_5h").and_then(|v| v.as_u64());
@@ -805,44 +809,51 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
             let reset_7d  = rl.get("reset_7d").and_then(|v| v.as_u64());
             let status_7d = rl.get("status_7d").and_then(|v| v.as_str()).unwrap_or("allowed");
 
-            let print_window = |label: &str, util: Option<f64>, reset: Option<u64>, wstatus: &str| {
+            let window_row = |label: &str, util: Option<f64>, reset: Option<u64>, wstatus: &str| {
                 if reset.map(|t| t <= now_secs).unwrap_or(false) {
-                    let ago = reset.map(|t| format!("  reset {} ago",
-                        term::fmt_duration_ms(now_secs.saturating_sub(t) * 1000)
+                    let ago = reset.map(|t| format!(
+                        "  {} ago", term::fmt_duration_ms(now_secs.saturating_sub(t) * 1000)
                     )).unwrap_or_default();
-                    println!("  {}  {}  {}{}",
-                        dim(label), green(&"─".repeat(20)), green("fresh"), dim(&ago));
+                    println!("{}", card_row(&format!(
+                        "{}  {}  {}{}",
+                        dim(label), green(&"─".repeat(20)), green("fresh"), dim(&ago)
+                    )));
                 } else if let Some(u) = util {
                     let rem = 100u64.saturating_sub((u * 100.0) as u64);
                     let bar = util_bar(u, 20);
-                    let reset_str = reset.and_then(|t| secs_until(t))
-                        .map(|s| format!("  resets in {}", term::fmt_duration_ms(s * 1000)))
+                    let in_str = reset.and_then(|t| secs_until(t))
+                        .map(|s| format!("  in {}", term::fmt_duration_ms(s * 1000)))
                         .unwrap_or_default();
                     let pct = if wstatus == "exhausted" {
                         red("exhausted")
                     } else {
                         format!("{}%", bold(&rem.to_string()))
                     };
-                    println!("  {}  {}  {} remaining{}", dim(label), bar, pct, dim(&reset_str));
+                    println!("{}", card_row(&format!(
+                        "{}  {}  {}{}",
+                        dim(label), bar, pct, dim(&in_str)
+                    )));
                 }
             };
 
             if util_5h.is_some() || reset_5h.is_some() {
-                print_window("5h window", util_5h, reset_5h, status_5h);
+                window_row("5h", util_5h, reset_5h, status_5h);
             }
             if util_7d.is_some() || reset_7d.is_some() {
-                print_window("7d window", util_7d, reset_7d, status_7d);
+                window_row("7d", util_7d, reset_7d, status_7d);
             }
         } else if acc.credential.is_none() {
-            println!("  {} run {} to authorize",
-                dim("·"), cyan(&format!("shunt add-account {}", acc.name)));
+            println!("{}", card_row(&format!("{}  run {}",
+                dim("·"), cyan(&format!("shunt add-account {}", acc.name)))));
         } else if status == "reauth_required" {
-            println!("  {} run {} to re-authorize",
-                dim("·"), cyan(&format!("shunt add-account {}", acc.name)));
+            println!("{}", card_row(&format!("{}  run {}",
+                dim("·"), cyan(&format!("shunt add-account {}", acc.name)))));
         } else if live.is_some() && live_acc.is_some() {
-            println!("  {}", dim("· no rate-limit data yet — make a request first"));
+            println!("{}", card_row(&dim("· no rate-limit data yet — make a request first")));
         }
 
+        // ── card bottom border ───────────────────────────────
+        println!("{}", card_bottom());
         println!();
     }
 
@@ -969,81 +980,140 @@ fn futures_executor_hack(resp: reqwest::Response) -> Option<serde_json::Value> {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Generic 3-line routing logo for commands that don't have an account list.
+/// Signal-lamp mascot splash — a railway signal post above a junction base.
+///
+///   ◉                    ← brand-green lamp
+///   ┃  shunt  v0.1.x     ← dark-green post + title
+///   ┃  Setup             ← post + subtitle
+///   ━━┻━━━━━━━━━━━━━━    ← junction base
 fn print_splash(info: &[String]) {
     println!();
-    let logo = ["──┐ ", "──┼─▶", "──┘ "];
-    for (i, l) in logo.iter().enumerate() {
-        let text = info.get(i).map(|s| s.as_str()).unwrap_or("");
-        if text.is_empty() {
-            println!("  {}", dim(l));
-        } else {
-            println!("  {}  {}", dim(l), text);
-        }
+    let title    = info.get(0).map(|s| s.as_str()).unwrap_or("");
+    let subtitle = info.get(1).map(|s| s.as_str()).unwrap_or("");
+
+    let content_w = strip_ansi(title).chars().count()
+        .max(strip_ansi(subtitle).chars().count())
+        .max(20);
+
+    println!("  {}", brand_green("◉"));
+    println!("  {}  {}", dark_green("┃"), title);
+    if !subtitle.is_empty() {
+        println!("  {}  {}", dark_green("┃"), subtitle);
     }
-    for extra in info.iter().skip(3) {
-        if !extra.is_empty() {
-            println!("         {extra}");
-        }
-    }
+    println!("  {}", dark_green(&format!("━━┻{}", "━".repeat(content_w + 2))));
     println!();
 }
 
-/// Dynamic routing logo showing actual account names feeding into the proxy.
+// ---------------------------------------------------------------------------
+// Account card helpers  (used by cmd_status)
+// ---------------------------------------------------------------------------
+
+/// Inner content width for account cards (chars between the padding and the border).
+const CARD_W: usize = 50;
+
+/// A full-width content row inside a card: "  │  <content><pad>  │"
+fn card_row(content: &str) -> String {
+    let vis = strip_ansi(content).chars().count();
+    let pad = CARD_W.saturating_sub(vis);
+    format!("  {}  {}{}  {}", dark_green("│"), content, " ".repeat(pad), dark_green("│"))
+}
+
+/// Top border with account name, routing tag, and plan type embedded.
 ///
-/// 2 accounts:          3 accounts:          4+ accounts:
-///   main ─┐              main ─┐              main ─┐
-///         ├──▶  [info]   work ─┼──▶  [info]   +2   ─┼──▶  [info]
-///   work ─┘              sec  ─┘              last ─┘
+///   ╭── main  ▶ last routed ──────── Claude Pro ──╮
+fn card_top(name: &str, name_c: &str, routing_tag: &str, tag_vis: usize, plan: &str) -> String {
+    // total dashes between ╭ and ╮ = CARD_W + 4
+    // layout: "── " + name + tag + " " + dashes + " " + plan + " ──"
+    let fixed = 3 + name.len() + tag_vis + 2 + plan.len() + 3;
+    let gap = (CARD_W + 4).saturating_sub(fixed);
+    format!(
+        "  {}── {}{} {} {} ──{}",
+        dark_green("╭"),
+        name_c,
+        routing_tag,
+        dark_green(&"─".repeat(gap)),
+        dim(plan),
+        dark_green("╮"),
+    )
+}
+
+fn card_divider() -> String {
+    format!("  {}{}{}",
+        dark_green("├"),
+        dark_green(&"─".repeat(CARD_W + 4)),
+        dark_green("┤"),
+    )
+}
+
+fn card_bottom() -> String {
+    format!("  {}{}{}",
+        dark_green("╰"),
+        dark_green(&"─".repeat(CARD_W + 4)),
+        dark_green("╯"),
+    )
+}
+
+/// Dynamic routing diagram — account names in bold green, chrome in dark green.
+///
+/// 1 account:           2 accounts:          3+ accounts:
+///   main ━━▶ [info]     main ━┓              main ━┓
+///                             ┣━━▶ [info]    work ━╋━━▶ [info]
+///                       work ━┛              sec  ━┛
 fn print_routing_header(account_names: &[&str], info: &[String]) {
     println!();
     let n = account_names.len();
     let name_w = account_names.iter().map(|s| s.len()).max().unwrap_or(4);
     let info0 = info.get(0).map(|s| s.as_str()).unwrap_or("");
 
-    // extra_indent: how many spaces (after the 2-char outer indent) to align
-    // continuation lines under info0.
-    // Layout: "  " + name_w + "  " + junction + "  " + info0
-    // junction widths: "──▶"=3, "├──▶"=4, "─┼──▶"=5
+    // extra_indent = chars before info0 starts (for aligning continuation lines)
+    // layout: "  " + name_w + "  " + junction + "  "
+    // junction widths: "━━▶"=3, "┣━━▶"=4, "━╋━━▶"=5
     let (extra_indent, lines): (usize, Vec<String>) = match n {
         0 => {
-            let logo = ["──┐", "──┼──▶", "──┘"];
-            for (i, l) in logo.iter().enumerate() {
-                let line = info.get(i).map(|s| s.as_str()).unwrap_or("");
-                if line.is_empty() { println!("  {}", dim(l)); }
-                else               { println!("  {}  {}", dim(l), line); }
-            }
+            // No accounts — reuse the boxed mascot splash
+            let title    = info.get(0).map(|s| s.as_str()).unwrap_or("");
+            let subtitle = info.get(1).map(|s| s.as_str()).unwrap_or("");
+            let m1 = dark_green("  ━━┓");
+            let m2 = format!("    {}  {}", dark_green("┣━▶"), title);
+            let m3 = format!("{}   {}", dark_green("  ━━┛"), subtitle);
+            let cw = 9usize.saturating_add(strip_ansi(title).chars().count()).max(26);
+            let hbar = "─".repeat(cw + 4);
+            let row = |c: &str, v: usize| {
+                format!("{}  {}{}  {}", dark_green("│"), c, " ".repeat(cw.saturating_sub(v)), dark_green("│"))
+            };
+            println!("  {}", dark_green(&format!("╭{hbar}╮")));
+            println!("  {}", row(&m1, 5));
+            println!("  {}", row(&m2, 9 + strip_ansi(title).chars().count()));
+            println!("  {}", row(&m3, 8 + strip_ansi(subtitle).chars().count()));
+            println!("  {}", dark_green(&format!("╰{hbar}╯")));
             println!();
             return;
         }
         1 => {
-            // "  " + name + "  " + "──▶" + "  " + info0  →  offset = name_w + 2+3+2 = name_w+7
             (name_w + 7, vec![
-                format!("  {}  {}  {}", bold(account_names[0]), dim("──▶"), info0),
+                format!("  {}  {}  {}", green_bold(account_names[0]), dark_green("━━▶"), info0),
             ])
         }
         2 => {
-            // middle: "  " + name_w spaces + "  " + "├──▶" + "  "  →  offset = name_w+2+4+2 = name_w+8
             (name_w + 8, vec![
-                format!("  {}  {}", bold(&pad(account_names[0], name_w)), dim("─┐")),
-                format!("  {}  {}  {}", " ".repeat(name_w), dim("├──▶"), info0),
-                format!("  {}  {}", bold(&pad(account_names[1], name_w)), dim("─┘")),
+                format!("  {}  {}", green_bold(&pad(account_names[0], name_w)), dark_green("━┓")),
+                format!("  {}  {}  {}", " ".repeat(name_w), dark_green("┣━━▶"), info0),
+                format!("  {}  {}", green_bold(&pad(account_names[1], name_w)), dark_green("━┛")),
             ])
         }
         3 => {
-            // "  " + name + "  " + "─┼──▶" + "  "  →  offset = name_w+2+5+2 = name_w+9
             (name_w + 9, vec![
-                format!("  {}  {}", bold(&pad(account_names[0], name_w)), dim("─┐")),
-                format!("  {}  {}  {}", bold(&pad(account_names[1], name_w)), dim("─┼──▶"), info0),
-                format!("  {}  {}", bold(&pad(account_names[2], name_w)), dim("─┘")),
+                format!("  {}  {}", green_bold(&pad(account_names[0], name_w)), dark_green("━┓")),
+                format!("  {}  {}  {}", green_bold(&pad(account_names[1], name_w)), dark_green("━╋━━▶"), info0),
+                format!("  {}  {}", green_bold(&pad(account_names[2], name_w)), dark_green("━┛")),
             ])
         }
         _ => {
             let more = dim(&pad(&format!("+ {} more", n - 2), name_w));
             (name_w + 9, vec![
-                format!("  {}  {}", bold(&pad(account_names[0], name_w)), dim("─┐")),
-                format!("  {}  {}  {}", more, dim("─┼──▶"), info0),
-                format!("  {}  {}", bold(&pad(account_names[n - 1], name_w)), dim("─┘")),
+                format!("  {}  {}", green_bold(&pad(account_names[0], name_w)), dark_green("━┓")),
+                format!("  {}  {}  {}", more, dark_green("━╋━━▶"), info0),
+                format!("  {}  {}", green_bold(&pad(account_names[n - 1], name_w)), dark_green("━┛")),
             ])
         }
     };
@@ -1051,7 +1121,6 @@ fn print_routing_header(account_names: &[&str], info: &[String]) {
     for line in &lines {
         println!("{line}");
     }
-    // Extra info lines aligned under info0
     for extra in info.iter().skip(1) {
         if !extra.is_empty() {
             println!("  {}{extra}", " ".repeat(extra_indent));
@@ -1145,7 +1214,7 @@ async fn cmd_update() -> Result<()> {
     let current = env!("CARGO_PKG_VERSION");
 
     print_splash(&[
-        format!("{}  {}", bold_white("shunt"), dim(&format!("v{current}"))),
+        format!("{}  {}", brand_green("shunt"), dim(&format!("v{current}"))),
         dim("Checking for updates…").to_string(),
         String::new(),
     ]);
@@ -1271,7 +1340,7 @@ async fn cmd_share(config_override: Option<PathBuf>, tunnel: bool, stop: bool) -
         std::fs::write(&config_p, &text)?;
 
         print_splash(&[
-            format!("{}  {}", bold_white("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
+            format!("{}  {}", brand_green("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
             dim("Remote sharing disabled").to_string(),
             String::new(),
         ]);
@@ -1304,7 +1373,7 @@ async fn cmd_share(config_override: Option<PathBuf>, tunnel: bool, stop: bool) -
     if tunnel {
         // Cloudflare quick tunnel — works over any network, no account needed
         print_splash(&[
-            format!("{}  {}", bold_white("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
+            format!("{}  {}", brand_green("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
             dim("Starting Cloudflare tunnel…").to_string(),
             String::new(),
         ]);
@@ -1332,7 +1401,7 @@ async fn cmd_share(config_override: Option<PathBuf>, tunnel: bool, stop: bool) -
         let ip = local_ip().unwrap_or_else(|| "<your-ip>".to_string());
 
         print_splash(&[
-            format!("{}  {}", bold_white("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
+            format!("{}  {}", brand_green("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
             dim("Remote sharing enabled (LAN)").to_string(),
             String::new(),
         ]);
