@@ -1,6 +1,6 @@
 [package]
 name = "shunt-proxy"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["Ramcharan <sairamcharansudagoni@gmail.com>"]
 description = "A local proxy that pools multiple Claude accounts behind a single endpoint, routing requests to maximise rate limits"
