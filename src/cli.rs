@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::{config_path, config_template, credentials_path, log_path, pid_path, CredentialsStore};
-use crate::oauth::{claude_credentials_path, read_claude_credentials, refresh_token, run_oauth_flow};
+use crate::oauth::{claude_credentials_path, read_claude_credentials, refresh_token, revoke_token, run_oauth_flow};
 use crate::term::{self, bold, bold_white, cyan, dim, green, red, yellow, CHECK, CROSS, DOT, EMPTY};
 
 #[derive(Parser)]
@@ -66,6 +66,21 @@ enum Command {
         #[arg(long)]
         stop: bool,
     },
+    /// Log out of an account — clears stored credentials (keeps account in config)
+    ///
+    /// Examples:
+    ///   shunt logout           — interactive picker
+    ///   shunt logout work      — log out 'work'
+    ///   shunt logout --all     — log out every account
+    Logout {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Account name to log out. Omit to pick interactively.
+        name: Option<String>,
+        /// Log out all accounts at once
+        #[arg(long)]
+        all: bool,
+    },
     /// Update shunt to the latest release
     Update,
     /// Pin routing to a specific account, or restore automatic routing
@@ -90,6 +105,7 @@ pub async fn run() -> Result<()> {
         Command::Status { config } => cmd_status(config).await,
         Command::AddAccount { config, name } => cmd_add_account(config, name).await,
         Command::RemoveAccount { config, name } => cmd_remove_account(config, name).await,
+        Command::Logout { config, name, all } => cmd_logout(config, name, all).await,
         Command::Update => cmd_update().await,
         Command::Share { config, tunnel, stop } => cmd_share(config, tunnel, stop).await,
         Command::Use { config, account } => cmd_use(config, account).await,
@@ -328,6 +344,99 @@ async fn cmd_remove_account(config_override: Option<PathBuf>, name: Option<Strin
     println!();
     println!("  {} Account {} removed.", green(CHECK), bold(&format!("'{name}'")));
     println!("  {} Restart to apply: {}", dim("·"), cyan("shunt start"));
+    println!();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// logout
+// ---------------------------------------------------------------------------
+
+async fn cmd_logout(config_override: Option<PathBuf>, name: Option<String>, all: bool) -> Result<()> {
+    let config_p = config_override.clone().unwrap_or_else(config_path);
+    if !config_p.exists() {
+        bail!("No config found. Run `shunt setup` first.");
+    }
+
+    let config = crate::config::load_config(config_override.as_deref())?;
+
+    // Collect account names to log out
+    let names: Vec<String> = if all {
+        config.accounts.iter()
+            .filter(|a| a.credential.is_some())
+            .map(|a| a.name.clone())
+            .collect()
+    } else if let Some(n) = name {
+        if !config.accounts.iter().any(|a| a.name == n) {
+            bail!("Account '{n}' not found.");
+        }
+        vec![n]
+    } else {
+        // Interactive picker — show only accounts that have credentials
+        let with_cred: Vec<_> = config.accounts.iter()
+            .filter(|a| a.credential.is_some())
+            .collect();
+        if with_cred.is_empty() {
+            println!("  {} No logged-in accounts.", dim("·"));
+            println!();
+            return Ok(());
+        }
+        let items: Vec<term::SelectItem> = with_cred.iter().map(|a| {
+            let email = a.credential.as_ref().and_then(|c| c.email.as_deref()).unwrap_or("");
+            term::SelectItem {
+                label: format!("{}  {}", bold(&pad(&a.name, 12)), dim(&pad(email, 32))),
+                value: a.name.clone(),
+            }
+        }).collect();
+        match term::select("Log out account:", &items, 0) {
+            Some(v) => vec![v],
+            None => return Ok(()),
+        }
+    };
+
+    if names.is_empty() {
+        println!("  {} No logged-in accounts.", dim("·"));
+        println!();
+        return Ok(());
+    }
+
+    let label = if names.len() == 1 {
+        format!("account {}", bold(&format!("'{}'", names[0])))
+    } else {
+        format!("{} accounts", bold(&names.len().to_string()))
+    };
+
+    print_splash(&[
+        format!("{}  {}", bold_white("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
+        format!("Logging out {label}"),
+        String::new(),
+    ]);
+
+    let mut store = CredentialsStore::load();
+
+    for name in &names {
+        // Revoke token on the server (best-effort)
+        if let Some(cred) = store.accounts.get(name) {
+            print!("  {} Revoking '{}' token… ", dim("↻"), name);
+            use std::io::Write;
+            std::io::stdout().flush().ok();
+            if revoke_token(&cred.access_token).await {
+                println!("{}", green("done"));
+            } else {
+                println!("{}", dim("(server did not confirm — cleared locally)"));
+            }
+        }
+
+        // Remove credential from local store
+        store.accounts.remove(name);
+        println!("  {} Credential for '{}' removed", green(CHECK), name);
+    }
+
+    store.save()?;
+
+    println!();
+    println!("  {} Logged out {}.", green(CHECK), label);
+    println!("  {} To re-authorize: {}", dim("·"), cyan("shunt add-account"));
     println!();
     Ok(())
 }

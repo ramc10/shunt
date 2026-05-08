@@ -387,6 +387,29 @@ async fn exchange_code(code: &str, state: &str, redirect_uri: &str, verifier: &s
     })
 }
 
+// ---------------------------------------------------------------------------
+// Token revocation
+// ---------------------------------------------------------------------------
+
+pub const OAUTH_REVOKE_URL: &str = "https://platform.claude.com/v1/oauth/revoke";
+
+/// Revoke an OAuth token on the server. Best-effort — errors are non-fatal.
+pub async fn revoke_token(access_token: &str) -> bool {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+        .unwrap_or_default();
+    client
+        .post(OAUTH_REVOKE_URL)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .header("anthropic-version", "2023-06-01")
+        .body(format!("token={}", urlencoding::encode(access_token)))
+        .send()
+        .await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false)
+}
+
 fn open_browser(url: &str) {
     #[cfg(target_os = "macos")]
     { std::process::Command::new("open").arg(url).spawn().ok(); }
