@@ -4,7 +4,7 @@
 /// stickiness is ephemeral (lost on restart is acceptable).
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -63,6 +63,24 @@ impl QuotaWindow {
 
 pub const WINDOW_MS: u64 = 5 * 60 * 60 * 1000; // 5 hours
 
+// ---------------------------------------------------------------------------
+// Request log
+// ---------------------------------------------------------------------------
+
+/// A single proxied request recorded for the live monitor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestLog {
+    pub ts_ms: u64,
+    pub account: String,
+    pub model: String,
+    pub status: u16,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub duration_ms: u64,
+}
+
+const MAX_RECENT: usize = 200;
+
 /// Rate-limit info extracted from `anthropic-ratelimit-unified-*` response headers.
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
 pub struct RateLimitInfo {
@@ -101,6 +119,9 @@ struct StateData {
     /// The most recent account that successfully handled a proxied request.
     #[serde(default)]
     last_used_account: Option<String>,
+    /// Recent request log (ephemeral — not persisted to disk).
+    #[serde(skip)]
+    recent_requests: VecDeque<RequestLog>,
 }
 
 // ---------------------------------------------------------------------------
@@ -322,6 +343,24 @@ impl StateStore {
             data.last_used_account = Some(name.to_owned());
         }
         self.persist();
+    }
+
+    // -----------------------------------------------------------------------
+    // Request log
+    // -----------------------------------------------------------------------
+
+    pub fn record_request(&self, log: RequestLog) {
+        let mut data = self.inner.lock().unwrap();
+        if data.recent_requests.len() >= MAX_RECENT {
+            data.recent_requests.pop_front();
+        }
+        data.recent_requests.push_back(log);
+    }
+
+    /// Most-recent first snapshot for the monitor / status endpoint.
+    pub fn recent_requests_snapshot(&self) -> Vec<RequestLog> {
+        let data = self.inner.lock().unwrap();
+        data.recent_requests.iter().rev().cloned().collect()
     }
 
     // -----------------------------------------------------------------------

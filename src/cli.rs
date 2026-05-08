@@ -81,6 +81,11 @@ enum Command {
         #[arg(long)]
         all: bool,
     },
+    /// Live fullscreen TUI dashboard — shows account utilization and request log
+    Monitor {
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
     /// Update shunt to the latest release
     Update,
     /// Pin routing to a specific account, or restore automatic routing
@@ -106,6 +111,7 @@ pub async fn run() -> Result<()> {
         Command::AddAccount { config, name } => cmd_add_account(config, name).await,
         Command::RemoveAccount { config, name } => cmd_remove_account(config, name).await,
         Command::Logout { config, name, all } => cmd_logout(config, name, all).await,
+        Command::Monitor { config } => cmd_monitor(config).await,
         Command::Update => cmd_update().await,
         Command::Share { config, tunnel, stop } => cmd_share(config, tunnel, stop).await,
         Command::Use { config, account } => cmd_use(config, account).await,
@@ -1206,6 +1212,25 @@ fn strip_ansi(s: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// monitor
+// ---------------------------------------------------------------------------
+
+async fn cmd_monitor(config_override: Option<PathBuf>) -> Result<()> {
+    let config = crate::config::load_config(config_override.as_deref())?;
+    let base_url = format!("http://{}:{}", config.server.host, config.server.port);
+
+    // Quick check: is the proxy running?
+    if reqwest::get(format!("{base_url}/health")).await.is_err() {
+        println!();
+        println!("  {} Proxy is not running.", red(CROSS));
+        println!("  {} Start it first with {}.", dim("·"), cyan("shunt start"));
+        println!();
+        return Ok(());
+    }
+
+    crate::monitor::run_monitor(&base_url).await
+}
+
 // update
 // ---------------------------------------------------------------------------
 

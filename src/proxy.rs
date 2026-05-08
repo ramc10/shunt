@@ -106,21 +106,45 @@ async fn status_handler(State(s): State<AppState>) -> impl IntoResponse {
             "updated_ms": r.updated_ms,
         }));
 
+        let acc_state = account_states.get(&a.name);
+        let email = a.credential.as_ref().and_then(|c| c.email.as_deref()).map(|e| e.to_owned());
+        let disabled = acc_state.map(|s| s.disabled).unwrap_or(false);
+        let auth_failed = acc_state.map(|s| s.auth_failed).unwrap_or(false);
+        let cooldown_until_ms = acc_state.map(|s| s.cooldown_until_ms).unwrap_or(0);
+        let utilization_5h = rl.and_then(|r| r.utilization_5h).unwrap_or(0.0);
+        let reset_5h = rl.and_then(|r| r.reset_5h);
+        let total_tokens = quota.map(|q| q.total_tokens()).unwrap_or(0);
+        let available = s.state.is_available(&a.name);
+
         json!({
             "name": a.name,
+            "email": email,
+            "plan": a.plan_type,
             "plan_type": a.plan_type,
             "status": avail_status,
+            "available": available,
+            "disabled": disabled,
+            "auth_failed": auth_failed,
+            "cooldown_until_ms": cooldown_until_ms,
+            "utilization_5h": utilization_5h,
+            "reset_5h": reset_5h,
+            "total_tokens": total_tokens,
             "window_expires_ms": window_expires_ms,
             "tokens_used": tokens_used,
             "rate_limit": rate_limit,
         })
     }).collect();
 
+    let recent_requests = s.state.recent_requests_snapshot();
+
     axum::Json(json!({
         "version": env!("CARGO_PKG_VERSION"),
         "accounts": accounts,
         "pinned": s.state.get_pinned(),
         "last_used": s.state.get_last_used(),
+        "pinned_account": s.state.get_pinned(),
+        "last_used_account": s.state.get_last_used(),
+        "recent_requests": recent_requests,
     }))
 }
 
@@ -173,6 +197,12 @@ async fn proxy_handler(
         .await
         .map_err(|_| ProxyError::BodyRead)?;
 
+    let model = serde_json::from_slice::<serde_json::Value>(&body_bytes)
+        .ok()
+        .and_then(|v| v["model"].as_str().map(|s| s.to_owned()))
+        .unwrap_or_default();
+    let req_start_ms = now_ms();
+
     let fp = router::fingerprint(&body_bytes);
     let fp_ref = fp.as_deref();
 
@@ -208,7 +238,7 @@ async fn proxy_handler(
         match response.status().as_u16() {
             200..=299 => {
                 s.state.set_last_used(&account_name);
-                return Ok(tap_usage(response, &s.state, &account_name).await);
+                return Ok(tap_usage(response, &s.state, &account_name, &model, req_start_ms).await);
             }
             429 => {
                 warn!(account = %account_name, "429 rate-limited — cooling 60s");
@@ -291,8 +321,15 @@ async fn proxy_handler(
 ///
 /// - Streaming: wraps the body stream with an SSE scanner (zero latency).
 /// - Non-streaming: buffers the body, parses usage, rebuilds the response.
-async fn tap_usage(resp: Response, state: &StateStore, account: &str) -> Response {
+async fn tap_usage(
+    resp: Response,
+    state: &StateStore,
+    account: &str,
+    model: &str,
+    req_start_ms: u64,
+) -> Response {
     use axum::body::Body;
+    use crate::state::RequestLog;
 
     // Capture rate-limit headers before the response is consumed
     capture_rate_limit_headers(resp.headers(), state, account);
@@ -300,8 +337,18 @@ async fn tap_usage(resp: Response, state: &StateStore, account: &str) -> Respons
     if quota::is_streaming_response(&resp) {
         let state = state.clone();
         let account = account.to_owned();
+        let model = model.to_owned();
         let on_complete = Arc::new(move |input: u64, output: u64| {
             state.record_usage(&account, input, output);
+            state.record_request(RequestLog {
+                ts_ms: req_start_ms,
+                account: account.clone(),
+                model: model.clone(),
+                status: 200,
+                input_tokens: input,
+                output_tokens: output,
+                duration_ms: now_ms().saturating_sub(req_start_ms),
+            });
         });
         let (parts, body) = resp.into_parts();
         let wrapped = quota::wrap_streaming_body(body, on_complete);
@@ -316,6 +363,15 @@ async fn tap_usage(resp: Response, state: &StateStore, account: &str) -> Respons
     };
     let (input, output) = quota::extract_usage_from_json(&bytes);
     state.record_usage(account, input, output);
+    state.record_request(RequestLog {
+        ts_ms: req_start_ms,
+        account: account.to_owned(),
+        model: model.to_owned(),
+        status: 200,
+        input_tokens: input,
+        output_tokens: output,
+        duration_ms: now_ms().saturating_sub(req_start_ms),
+    });
     Response::from_parts(parts, Body::from(bytes))
 }
 
