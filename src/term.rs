@@ -76,21 +76,33 @@ pub fn section(label: &str) {
     println!("{header}");
 }
 
-/// Format a duration in ms as "Xh Ym" or "Ym" or "< 1m"
+/// Format a duration in ms dynamically:
+///   >= 24h  → "Xd Yh" / "Xd"
+///   >= 1h   → "Xh Ym" / "Xh"
+///   >= 1m   → "Xm"
+///   < 1m    → "Xs"
 pub fn fmt_duration_ms(ms: u64) -> String {
     let secs = ms / 1000;
+    if secs == 0 {
+        return "0s".into();
+    }
     let mins = secs / 60;
     if mins == 0 {
-        return "< 1m".into();
+        return format!("{}s", secs);
     }
     let hours = mins / 60;
     let rem_mins = mins % 60;
     if hours == 0 {
-        format!("{mins}m")
-    } else if rem_mins == 0 {
-        format!("{hours}h")
+        return format!("{mins}m");
+    }
+    let days = hours / 24;
+    let rem_hours = hours % 24;
+    if days == 0 {
+        if rem_mins == 0 { format!("{hours}h") } else { format!("{hours}h {rem_mins}m") }
+    } else if rem_hours == 0 {
+        format!("{days}d")
     } else {
-        format!("{hours}h {rem_mins}m")
+        format!("{days}d {rem_hours}h")
     }
 }
 
@@ -146,8 +158,7 @@ pub fn select(prompt: &str, items: &[SelectItem], initial: usize) -> Option<Stri
         }
         let _ = write!(
             out,
-            "\r\n  \x1b[2m↑↓ navigate  ·  1-{} jump  ·  enter select  ·  esc cancel\x1b[0m\r\n",
-            items.len()
+            "\r\n  \x1b[2m↑ ↓  navigate  ·  enter  select  ·  esc  cancel\x1b[0m\r\n",
         );
         let _ = out.flush();
     };
@@ -206,6 +217,31 @@ pub fn select(prompt: &str, items: &[SelectItem], initial: usize) -> Option<Stri
     terminal::disable_raw_mode().ok();
     println!();
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fmt_duration_ms;
+
+    #[test]
+    fn test_fmt_duration_ms() {
+        assert_eq!(fmt_duration_ms(0),              "0s");
+        assert_eq!(fmt_duration_ms(500),            "0s");
+        assert_eq!(fmt_duration_ms(1_000),          "1s");
+        assert_eq!(fmt_duration_ms(45_000),         "45s");
+        assert_eq!(fmt_duration_ms(59_000),         "59s");
+        assert_eq!(fmt_duration_ms(60_000),         "1m");
+        assert_eq!(fmt_duration_ms(90_000),         "1m");   // 1m 30s → "1m"
+        assert_eq!(fmt_duration_ms(30 * 60_000),    "30m");
+        assert_eq!(fmt_duration_ms(60 * 60_000),    "1h");
+        assert_eq!(fmt_duration_ms(90 * 60_000),    "1h 30m");
+        assert_eq!(fmt_duration_ms(5 * 3600_000),   "5h");
+        assert_eq!(fmt_duration_ms(5 * 3600_000 + 30 * 60_000), "5h 30m");
+        assert_eq!(fmt_duration_ms(24 * 3600_000),  "1d");
+        assert_eq!(fmt_duration_ms(48 * 3600_000),  "2d");
+        assert_eq!(fmt_duration_ms(25 * 3600_000),  "1d 1h");
+        assert_eq!(fmt_duration_ms(7 * 24 * 3600_000), "7d");
+    }
 }
 
 /// Format a large token count as "1.2k" / "34k" / "1.1M" / raw
