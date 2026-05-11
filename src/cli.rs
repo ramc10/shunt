@@ -36,10 +36,33 @@ enum Command {
         #[arg(long, hide = true)]
         daemon: bool,
     },
+    /// Stop the running proxy daemon
+    Stop,
+    /// Restart the proxy daemon (stop then start)
+    Restart {
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
     /// Print current config and proxy status
     Status {
         #[arg(long)]
         config: Option<PathBuf>,
+    },
+    /// Tail the proxy log file
+    ///
+    /// Examples:
+    ///   shunt logs           — last 50 lines
+    ///   shunt logs -f        — follow in real time
+    ///   shunt logs -n 100    — last 100 lines
+    Logs {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Follow log output in real time (like tail -f)
+        #[arg(short, long)]
+        follow: bool,
+        /// Number of lines to show
+        #[arg(short = 'n', long, default_value = "50")]
+        lines: usize,
     },
     /// Import the current Claude Code session as an additional account
     AddAccount {
@@ -100,6 +123,16 @@ enum Command {
         /// Account name to pin to, or "auto". Omit to pick interactively.
         account: Option<String>,
     },
+    /// Print shell completion script
+    ///
+    /// Examples:
+    ///   shunt completions zsh  >> ~/.zshrc
+    ///   shunt completions bash >> ~/.bashrc
+    ///   shunt completions fish > ~/.config/fish/completions/shunt.fish
+    Completions {
+        /// Shell to generate completions for
+        shell: clap_complete::Shell,
+    },
 }
 
 pub async fn run() -> Result<()> {
@@ -107,7 +140,10 @@ pub async fn run() -> Result<()> {
     match cli.command {
         Command::Setup { config } => cmd_setup(config).await,
         Command::Start { config, host, port, foreground, daemon } => cmd_start(config, host, port, foreground, daemon).await,
+        Command::Stop => cmd_stop().await,
+        Command::Restart { config } => cmd_restart(config).await,
         Command::Status { config } => cmd_status(config).await,
+        Command::Logs { config, follow, lines } => cmd_logs(config, follow, lines).await,
         Command::AddAccount { config, name } => cmd_add_account(config, name).await,
         Command::RemoveAccount { config, name } => cmd_remove_account(config, name).await,
         Command::Logout { config, name, all } => cmd_logout(config, name, all).await,
@@ -115,6 +151,7 @@ pub async fn run() -> Result<()> {
         Command::Update => cmd_update().await,
         Command::Share { config, tunnel, stop } => cmd_share(config, tunnel, stop).await,
         Command::Use { config, account } => cmd_use(config, account).await,
+        Command::Completions { shell } => { cmd_completions(shell); Ok(()) }
     }
 }
 
@@ -287,7 +324,7 @@ async fn cmd_add_account(config_override: Option<PathBuf>, name: Option<String>)
 
     println!();
     println!("  {} Account {} authorized.", green(CHECK), bold(&format!("'{name}'")));
-    println!("  {} Restart to apply: {}", dim("·"), cyan("shunt start"));
+    offer_restart(config_override).await;
     println!();
     Ok(())
 }
@@ -349,7 +386,7 @@ async fn cmd_remove_account(config_override: Option<PathBuf>, name: Option<Strin
 
     println!();
     println!("  {} Account {} removed.", green(CHECK), bold(&format!("'{name}'")));
-    println!("  {} Restart to apply: {}", dim("·"), cyan("shunt start"));
+    offer_restart(config_override).await;
     println!();
     Ok(())
 }
@@ -620,6 +657,130 @@ async fn cmd_start(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// stop
+// ---------------------------------------------------------------------------
+
+async fn cmd_stop() -> Result<()> {
+    let pid_p = pid_path();
+    let content = match std::fs::read_to_string(&pid_p) {
+        Ok(c) => c,
+        Err(_) => {
+            println!("  {} Proxy is not running.", dim("·"));
+            println!();
+            return Ok(());
+        }
+    };
+    let pid = match content.trim().parse::<u32>() {
+        Ok(p) => p,
+        Err(_) => {
+            let _ = std::fs::remove_file(&pid_p);
+            println!("  {} Proxy is not running.", dim("·"));
+            println!();
+            return Ok(());
+        }
+    };
+    if !is_shunt_pid(pid) {
+        let _ = std::fs::remove_file(&pid_p);
+        println!("  {} Proxy is not running.", dim("·"));
+        println!();
+        return Ok(());
+    }
+
+    // SIGTERM — let axum drain connections cleanly
+    unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+
+    // Wait up to 3 s for clean exit, then SIGKILL
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if !is_shunt_pid(pid) { break; }
+    }
+    if is_shunt_pid(pid) {
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    let _ = std::fs::remove_file(&pid_p);
+    println!("  {} Proxy stopped.", green(CHECK));
+    println!();
+    Ok(())
+}
+
+fn is_shunt_pid(pid: u32) -> bool {
+    let Ok(out) = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "comm="])
+        .output()
+    else { return false };
+    String::from_utf8_lossy(&out.stdout).trim().contains("shunt")
+}
+
+// ---------------------------------------------------------------------------
+// restart
+// ---------------------------------------------------------------------------
+
+async fn cmd_restart(config_override: Option<PathBuf>) -> Result<()> {
+    cmd_stop().await?;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    cmd_start(config_override, None, None, false, false).await
+}
+
+// ---------------------------------------------------------------------------
+// logs
+// ---------------------------------------------------------------------------
+
+async fn cmd_logs(_config_override: Option<PathBuf>, follow: bool, lines: usize) -> Result<()> {
+    use std::io::{BufRead, BufReader, Write};
+
+    let log = log_path();
+    if !log.exists() {
+        println!("  {} No log file found.", dim("·"));
+        println!("  {} Start the proxy first: {}", dim("·"), cyan("shunt start"));
+        println!();
+        return Ok(());
+    }
+
+    let file = std::fs::File::open(&log)?;
+    let mut reader = BufReader::new(file);
+
+    // Collect all lines, print last N
+    let mut all_lines: Vec<String> = Vec::new();
+    let mut line = String::new();
+    while reader.read_line(&mut line)? > 0 {
+        all_lines.push(std::mem::take(&mut line));
+    }
+    let start = all_lines.len().saturating_sub(lines);
+    for l in &all_lines[start..] {
+        print!("{l}");
+    }
+    std::io::stdout().flush().ok();
+
+    if !follow {
+        return Ok(());
+    }
+
+    // Follow mode — poll for new content
+    eprintln!("{}", dim("--- following (Ctrl+C to stop) ---"));
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? > 0 {
+            print!("{line}");
+            std::io::stdout().flush().ok();
+        } else {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// completions
+// ---------------------------------------------------------------------------
+
+fn cmd_completions(shell: clap_complete::Shell) {
+    use clap::CommandFactory;
+    clap_complete::generate(shell, &mut Cli::command(), "shunt", &mut std::io::stdout());
+}
+
 /// Non-interactive setup called from `cmd_start`.
 /// Imports the existing Claude Code session silently.
 /// The only user interaction is the OAuth code paste if no session exists.
@@ -677,11 +838,41 @@ fn auto_write_shell_export(port: u16) {
     use std::io::Write;
     let line = format!("export ANTHROPIC_BASE_URL=http://127.0.0.1:{port}");
     let Some(profile) = detect_shell_profile() else { return };
+
     if profile.exists() {
         if let Ok(contents) = std::fs::read_to_string(&profile) {
-            if contents.contains("ANTHROPIC_BASE_URL") { return; }
+            if contents.contains(&line) {
+                // Already exactly correct — nothing to do.
+                return;
+            }
+            if contents.contains("ANTHROPIC_BASE_URL=http://127.0.0.1:") {
+                // Has the variable but with a different port — update it in-place.
+                let updated: String = contents
+                    .lines()
+                    .map(|l| {
+                        if l.contains("ANTHROPIC_BASE_URL=http://127.0.0.1:") {
+                            line.as_str()
+                        } else {
+                            l
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+                    + "\n";
+                if std::fs::write(&profile, updated).is_ok() {
+                    println!("  {} {} updated to port {}  → {}",
+                        green(CHECK), cyan("ANTHROPIC_BASE_URL"), port,
+                        dim(&profile.display().to_string()));
+                }
+                return;
+            }
+            if contents.contains("ANTHROPIC_BASE_URL") {
+                // Set to something else (e.g. remote URL) — leave it alone.
+                return;
+            }
         }
     }
+
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&profile) {
         writeln!(f, "\n# Added by shunt").ok();
         writeln!(f, "{line}").ok();
@@ -727,7 +918,14 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
     let proxy_line = if live.is_some() {
         format!("{}  {}  {}", green(DOT), green_bold("running"), cyan(&proxy_url))
     } else {
-        format!("{}  {}  {}", dim(EMPTY), dim("stopped"), dim("run shunt start"))
+        {
+            let log_hint = if log_path().exists() {
+                format!("  ·  {}", dim("shunt logs for details"))
+            } else {
+                String::new()
+            };
+            format!("{}  {}  {}{}", dim(EMPTY), dim("stopped"), dim("run shunt start"), log_hint)
+        }
     };
 
     let account_names: Vec<&str> = config.accounts.iter().map(|a| a.name.as_str()).collect();
@@ -967,10 +1165,40 @@ async fn cmd_use(config_override: Option<PathBuf>, account: Option<String>) -> R
             anyhow::bail!("Proxy returned error: {body}");
         }
         Err(_) => {
-            anyhow::bail!("Proxy is not running — start it with: shunt start");
+            // Proxy not running — persist directly to the state file so it
+            // takes effect when the proxy next starts.
+            write_pinned_to_state(if is_auto { None } else { Some(chosen.clone()) });
+            if is_auto {
+                println!("  {} Automatic routing saved  ·  {}", green(CHECK),
+                    dim("applies on next shunt start"));
+            } else {
+                println!("  {} Pinned to {}  ·  {}", green(CHECK), bold(&chosen),
+                    dim("applies on next shunt start"));
+            }
+            println!();
         }
     }
     Ok(())
+}
+
+/// Write a pinned account directly into the state file (used when proxy is not running).
+fn write_pinned_to_state(account: Option<String>) {
+    let path = crate::config::state_path();
+    let mut data: serde_json::Value = path.exists()
+        .then(|| std::fs::read_to_string(&path).ok())
+        .flatten()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    data["pinned_account"] = match account {
+        Some(a) => serde_json::Value::String(a),
+        None => serde_json::Value::Null,
+    };
+    if let Some(parent) = path.parent() { let _ = std::fs::create_dir_all(parent); }
+    let tmp = path.with_extension("tmp");
+    if let Ok(text) = serde_json::to_string_pretty(&data) {
+        let _ = std::fs::write(&tmp, text);
+        let _ = std::fs::rename(&tmp, &path);
+    }
 }
 
 /// Synchronously awaits a reqwest response to get its JSON.
@@ -1536,6 +1764,29 @@ fn local_ip() -> Option<String> {
     let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
     socket.connect("8.8.8.8:80").ok()?;
     Some(socket.local_addr().ok()?.ip().to_string())
+}
+
+/// If the proxy is currently running, offer to restart it immediately.
+async fn offer_restart(config_override: Option<PathBuf>) {
+    use std::io::Write;
+    let Ok(cfg) = crate::config::load_config(config_override.as_deref()) else { return };
+    let health_url = format!("http://{}:{}/health", cfg.server.host, cfg.server.port);
+    let running = reqwest::get(&health_url).await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false);
+    if !running { return; }
+
+    print!("  {} Proxy is running — restart now? [Y/n]: ", dim("·"));
+    std::io::stdout().flush().ok();
+    let mut buf = String::new();
+    std::io::stdin().read_line(&mut buf).ok();
+    if matches!(buf.trim().to_lowercase().as_str(), "n" | "no") {
+        println!("  {} Run {} when ready.", dim("·"), cyan("shunt restart"));
+        return;
+    }
+    if let Err(e) = cmd_restart(config_override).await {
+        println!("  {} Restart failed: {e}", red(CROSS));
+    }
 }
 
 fn offer_shell_export() -> Result<()> {

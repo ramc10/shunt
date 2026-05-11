@@ -1,7 +1,7 @@
 /// Live fullscreen TUI monitor for shunt.
 ///
 /// Connects to the running proxy's /status endpoint and refreshes every second.
-/// Press 'q' or Esc to exit.
+/// Press 'q' or Esc to exit, 'u' to pick an account to pin.
 use anyhow::Result;
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers},
@@ -13,7 +13,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Paragraph, Row, Table},
+    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table},
     Frame, Terminal,
 };
 use serde::Deserialize;
@@ -28,6 +28,8 @@ use std::{
 
 #[derive(Debug, Deserialize, Default)]
 struct StatusResponse {
+    #[serde(default)]
+    started_ms: Option<u64>,
     #[serde(default)]
     accounts: Vec<AccountStatus>,
     #[serde(default)]
@@ -53,6 +55,10 @@ struct AccountStatus {
     #[serde(default)]
     reset_5h: Option<u64>,
     #[serde(default)]
+    utilization_7d: f64,
+    #[serde(default)]
+    reset_7d: Option<u64>,
+    #[serde(default)]
     total_tokens: u64,
 }
 
@@ -72,14 +78,14 @@ struct ReqLog {
 // Colours
 // ---------------------------------------------------------------------------
 
-const GREEN:     Color = Color::Rgb(0, 170, 0);
-const DK_GREEN:  Color = Color::Rgb(0, 100, 0);
-const BRAND:     Color = Color::Rgb(34, 139, 34);
-const DIM:       Color = Color::Rgb(100, 100, 100);
-const YELLOW:    Color = Color::Yellow;
-const RED:       Color = Color::Red;
-const WHITE:     Color = Color::White;
-const CYAN:      Color = Color::Cyan;
+const GREEN:    Color = Color::Rgb(0, 170, 0);
+const DK_GREEN: Color = Color::Rgb(0, 100, 0);
+const BRAND:    Color = Color::Rgb(34, 139, 34);
+const DIM:      Color = Color::Rgb(100, 100, 100);
+const YELLOW:   Color = Color::Yellow;
+const RED:      Color = Color::Red;
+const WHITE:    Color = Color::White;
+const CYAN:     Color = Color::Cyan;
 
 fn style_brand()   -> Style { Style::default().fg(BRAND).add_modifier(Modifier::BOLD) }
 fn style_green()   -> Style { Style::default().fg(GREEN) }
@@ -92,11 +98,52 @@ fn style_cyan()    -> Style { Style::default().fg(CYAN) }
 fn style_bold()    -> Style { Style::default().add_modifier(Modifier::BOLD) }
 
 // ---------------------------------------------------------------------------
+// Error classification
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+enum FetchError {
+    /// TCP connection refused — proxy is not running.
+    NotRunning,
+    /// Got a response but something else went wrong.
+    Other(String),
+}
+
+
+// ---------------------------------------------------------------------------
+// Picker overlay state
+// ---------------------------------------------------------------------------
+
+struct Picker {
+    items: Vec<String>, // account names + "auto"
+    cursor: usize,
+}
+
+impl Picker {
+    fn new(accounts: &[AccountStatus], pinned: Option<&str>) -> Self {
+        let mut items: Vec<String> = accounts.iter().map(|a| a.name.clone()).collect();
+        items.push("auto".to_owned());
+        let cursor = pinned
+            .and_then(|p| items.iter().position(|i| i == p))
+            .unwrap_or(items.len() - 1);
+        Self { items, cursor }
+    }
+    fn up(&mut self) {
+        self.cursor = if self.cursor == 0 { self.items.len() - 1 } else { self.cursor - 1 };
+    }
+    fn down(&mut self) {
+        self.cursor = (self.cursor + 1) % self.items.len();
+    }
+    fn selected(&self) -> &str { &self.items[self.cursor] }
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
 pub async fn run_monitor(base_url: &str) -> Result<()> {
     let status_url = format!("{}/status", base_url.trim_end_matches('/'));
+    let use_url    = format!("{}/use",    base_url.trim_end_matches('/'));
 
     // Setup terminal
     terminal::enable_raw_mode()?;
@@ -106,25 +153,55 @@ pub async fn run_monitor(base_url: &str) -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     let mut state: Option<StatusResponse> = None;
-    let mut error_msg: Option<String> = None;
-    let mut last_fetch = Instant::now() - Duration::from_secs(10); // fetch immediately
-    let mut scroll: usize = 0; // scroll offset for request log
+    let mut fetch_err: Option<FetchError> = None;
+    let mut last_fetch = Instant::now() - Duration::from_secs(10);
+    let mut scroll: usize = 0;
+    let mut picker: Option<Picker> = None;
+    // Spinner frame counter for "not running" state
+    let start_time = Instant::now();
 
     loop {
         // Fetch status every second
         if last_fetch.elapsed() >= Duration::from_secs(1) {
             match fetch_status(&status_url).await {
-                Ok(s) => { state = Some(s); error_msg = None; }
-                Err(e) => { error_msg = Some(e.to_string()); }
+                Ok(s)  => { state = Some(s); fetch_err = None; }
+                Err(e) => { fetch_err = Some(e); state = None; }
             }
             last_fetch = Instant::now();
         }
 
-        terminal.draw(|f| draw(f, &state, &error_msg, scroll, base_url))?;
+        terminal.draw(|f| {
+            draw(f, &state, &fetch_err, scroll, base_url, &picker, start_time)
+        })?;
 
         // Poll for key events (non-blocking, 200ms timeout)
         if event::poll(Duration::from_millis(200))? {
             if let Event::Key(key) = event::read()? {
+                // Picker overlay active — intercept keys
+                if let Some(ref mut p) = picker {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char('q') => { picker = None; }
+                        KeyCode::Up   | KeyCode::Char('k') => p.up(),
+                        KeyCode::Down | KeyCode::Char('j') => p.down(),
+                        KeyCode::Enter => {
+                            let chosen = p.selected().to_owned();
+                            picker = None;
+                            // POST /use — best-effort, ignore errors
+                            let _ = reqwest::Client::new()
+                                .post(&use_url)
+                                .json(&serde_json::json!({ "account": chosen }))
+                                .timeout(Duration::from_secs(3))
+                                .send()
+                                .await;
+                            // Force immediate refresh
+                            last_fetch = Instant::now() - Duration::from_secs(10);
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
+                // Normal keys
                 match (key.code, key.modifiers) {
                     (KeyCode::Char('q'), _)
                     | (KeyCode::Esc, _)
@@ -136,8 +213,12 @@ pub async fn run_monitor(base_url: &str) -> Result<()> {
                         scroll = scroll.saturating_sub(1);
                     }
                     (KeyCode::Char('r'), _) => {
-                        // Force refresh
                         last_fetch = Instant::now() - Duration::from_secs(10);
+                    }
+                    (KeyCode::Char('u'), _) => {
+                        if let Some(ref s) = state {
+                            picker = Some(Picker::new(&s.accounts, s.pinned_account.as_deref()));
+                        }
                     }
                     _ => {}
                 }
@@ -151,50 +232,91 @@ pub async fn run_monitor(base_url: &str) -> Result<()> {
     Ok(())
 }
 
-async fn fetch_status(url: &str) -> Result<StatusResponse> {
+async fn fetch_status(url: &str) -> Result<StatusResponse, FetchError> {
     let resp = reqwest::Client::new()
         .get(url)
         .timeout(Duration::from_secs(3))
         .send()
-        .await?
-        .error_for_status()?;
-    Ok(resp.json().await?)
+        .await
+        .map_err(|e| {
+            if e.is_connect() || e.is_timeout() {
+                FetchError::NotRunning
+            } else {
+                FetchError::Other(e.to_string())
+            }
+        })?
+        .error_for_status()
+        .map_err(|e| FetchError::Other(e.to_string()))?;
+
+    resp.json::<StatusResponse>()
+        .await
+        .map_err(|e| FetchError::Other(format!("bad response: {e}")))
 }
 
 // ---------------------------------------------------------------------------
 // Drawing
 // ---------------------------------------------------------------------------
 
-fn draw(f: &mut Frame, state: &Option<StatusResponse>, error: &Option<String>, scroll: usize, base_url: &str) {
+const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+fn draw(
+    f: &mut Frame,
+    state: &Option<StatusResponse>,
+    error: &Option<FetchError>,
+    scroll: usize,
+    base_url: &str,
+    picker: &Option<Picker>,
+    start_time: Instant,
+) {
     let area = f.area();
 
-    // Root layout: header | body | footer
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),  // header
-            Constraint::Min(0),     // body
-            Constraint::Length(1),  // footer
+            Constraint::Length(3),
+            Constraint::Min(0),
+            Constraint::Length(1),
         ])
         .split(area);
 
-    draw_header(f, chunks[0]);
+    draw_header(f, chunks[0], state);
 
     match state {
-        None => draw_connecting(f, chunks[1], error, base_url),
+        None => draw_connecting(f, chunks[1], error, base_url, start_time),
         Some(s) => draw_body(f, chunks[1], s, scroll),
     }
 
-    draw_footer(f, chunks[2]);
+    draw_footer(f, chunks[2], picker.is_some());
+
+    if let Some(p) = picker {
+        draw_picker(f, p, area);
+    }
 }
 
-fn draw_header(f: &mut Frame, area: Rect) {
-    let title = Line::from(vec![
+fn draw_header(f: &mut Frame, area: Rect, state: &Option<StatusResponse>) {
+    let uptime_span = state
+        .as_ref()
+        .and_then(|s| s.started_ms)
+        .map(|ms| {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let elapsed = now_ms.saturating_sub(ms);
+            format!("  up {}", fmt_duration_ms(elapsed))
+        });
+
+    let mut spans = vec![
         Span::styled("◉ ", style_brand()),
         Span::styled("shunt", style_brand()),
         Span::styled("  monitor", style_dim()),
         Span::styled("  ·  live", Style::default().fg(GREEN).add_modifier(Modifier::BOLD)),
-    ]);
+    ];
+    if let Some(ref u) = uptime_span {
+        spans.push(Span::styled(u.as_str(), style_dim()));
+    }
+
+    let title = Line::from(spans);
     let block = Block::default()
         .borders(Borders::BOTTOM)
         .border_style(style_dkgreen());
@@ -202,29 +324,59 @@ fn draw_header(f: &mut Frame, area: Rect) {
     f.render_widget(p, area);
 }
 
-fn draw_footer(f: &mut Frame, area: Rect) {
-    let hint = Line::from(vec![
-        Span::styled(" q", style_green()),
-        Span::styled(" quit  ", style_dim()),
-        Span::styled("r", style_green()),
-        Span::styled(" refresh  ", style_dim()),
-        Span::styled("↑↓", style_green()),
-        Span::styled(" scroll log", style_dim()),
-    ]);
-    let p = Paragraph::new(hint);
-    f.render_widget(p, area);
+fn draw_footer(f: &mut Frame, area: Rect, picker_open: bool) {
+    let hint = if picker_open {
+        Line::from(vec![
+            Span::styled(" ↑↓", style_green()),
+            Span::styled(" navigate  ", style_dim()),
+            Span::styled("enter", style_green()),
+            Span::styled(" pin  ", style_dim()),
+            Span::styled("esc", style_green()),
+            Span::styled(" cancel", style_dim()),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(" q", style_green()),
+            Span::styled(" quit  ", style_dim()),
+            Span::styled("r", style_green()),
+            Span::styled(" refresh  ", style_dim()),
+            Span::styled("u", style_green()),
+            Span::styled(" pin account  ", style_dim()),
+            Span::styled("↑↓", style_green()),
+            Span::styled(" scroll log", style_dim()),
+        ])
+    };
+    f.render_widget(Paragraph::new(hint), area);
 }
 
-fn draw_connecting(f: &mut Frame, area: Rect, error: &Option<String>, base_url: &str) {
+fn draw_connecting(
+    f: &mut Frame,
+    area: Rect,
+    error: &Option<FetchError>,
+    base_url: &str,
+    start_time: Instant,
+) {
     let msg = match error {
-        Some(e) => Line::from(vec![
+        Some(FetchError::NotRunning) => {
+            let frame = (start_time.elapsed().as_millis() / 120) as usize % SPINNER.len();
+            Line::from(vec![
+                Span::styled(SPINNER[frame], style_dim()),
+                Span::styled(
+                    format!("  waiting for proxy at {base_url}  ·  run shunt start"),
+                    style_dim(),
+                ),
+            ])
+        }
+        Some(FetchError::Other(msg)) => Line::from(vec![
             Span::styled("✗ ", style_red()),
-            Span::styled(format!("Cannot reach {base_url} — {e}"), style_dim()),
+            Span::styled(
+                format!("Cannot reach {base_url} — {msg}"),
+                style_dim(),
+            ),
         ]),
-        None => Line::from(vec![
-            Span::styled("Connecting…", style_dim()),
-        ]),
+        None => Line::from(Span::styled("Connecting…", style_dim())),
     };
+
     let p = Paragraph::new(msg)
         .alignment(Alignment::Center)
         .block(Block::default());
@@ -232,13 +384,9 @@ fn draw_connecting(f: &mut Frame, area: Rect, error: &Option<String>, base_url: 
 }
 
 fn draw_body(f: &mut Frame, area: Rect, s: &StatusResponse, scroll: usize) {
-    // Split body: left = accounts, right = request log
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(45),
-            Constraint::Percentage(55),
-        ])
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
         .split(area);
 
     draw_accounts(f, chunks[0], s);
@@ -259,20 +407,17 @@ fn draw_accounts(f: &mut Frame, area: Rect, s: &StatusResponse) {
     f.render_widget(block, area);
 
     if s.accounts.is_empty() {
-        let p = Paragraph::new(Line::from(vec![
-            Span::styled("No accounts configured.", style_dim()),
-        ]));
+        let p = Paragraph::new(Line::from(Span::styled("No accounts configured.", style_dim())));
         f.render_widget(p, inner);
         return;
     }
 
-    // Build rows for each account
-    let mut lines: Vec<Line> = Vec::new();
     let pinned = s.pinned_account.as_deref().unwrap_or("");
-    let last = s.last_used_account.as_deref().unwrap_or("");
+    let last   = s.last_used_account.as_deref().unwrap_or("");
+
+    let mut lines: Vec<Line> = Vec::new();
 
     for acc in &s.accounts {
-        // Account name line
         let routing_tag = if acc.name == pinned {
             Span::styled(" [pinned]", style_yellow())
         } else if acc.name == last {
@@ -289,14 +434,12 @@ fn draw_accounts(f: &mut Frame, area: Rect, s: &StatusResponse) {
             ("✓", style_green())
         };
 
-        let name_line = Line::from(vec![
+        lines.push(Line::from(vec![
             Span::styled(format!(" {status_sym} "), status_style),
             Span::styled(&acc.name, Style::default().fg(GREEN).add_modifier(Modifier::BOLD)),
             routing_tag,
-        ]);
-        lines.push(name_line);
+        ]));
 
-        // Email
         if let Some(email) = &acc.email {
             lines.push(Line::from(vec![
                 Span::styled("   ", style_dim()),
@@ -304,41 +447,13 @@ fn draw_accounts(f: &mut Frame, area: Rect, s: &StatusResponse) {
             ]));
         }
 
-        // Utilization bar
-        let util = acc.utilization_5h.clamp(0.0, 1.0);
-        let bar_w = 24usize;
-        let filled = (util * bar_w as f64).round() as usize;
-        let bar_color = if util >= 0.9 { RED } else if util >= 0.6 { YELLOW } else { GREEN };
-        let bar: String = format!(
-            "{}{}",
-            "█".repeat(filled),
-            "░".repeat(bar_w.saturating_sub(filled))
-        );
-        let pct = format!("{:.0}%", util * 100.0);
+        // 5h bar
+        lines.push(util_bar_line("5h", acc.utilization_5h, acc.reset_5h));
+        // 7d bar
+        if acc.utilization_7d > 0.0 || acc.reset_7d.is_some() {
+            lines.push(util_bar_line("7d", acc.utilization_7d, acc.reset_7d));
+        }
 
-        let reset_str = if let Some(reset_secs) = acc.reset_5h {
-            let now_secs = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            if reset_secs > now_secs {
-                let diff_ms = (reset_secs - now_secs) * 1000;
-                format!("  resets in {}", fmt_duration_ms(diff_ms))
-            } else {
-                String::new()
-            }
-        } else {
-            String::new()
-        };
-
-        lines.push(Line::from(vec![
-            Span::styled("   ", style_dim()),
-            Span::styled(bar, Style::default().fg(bar_color)),
-            Span::styled(format!(" {pct}"), style_dim()),
-            Span::styled(reset_str, style_dim()),
-        ]));
-
-        // Tokens
         let tok_str = fmt_tokens(acc.total_tokens);
         lines.push(Line::from(vec![
             Span::styled("   ", style_dim()),
@@ -348,15 +463,58 @@ fn draw_accounts(f: &mut Frame, area: Rect, s: &StatusResponse) {
         lines.push(Line::raw(""));
     }
 
-    let p = Paragraph::new(lines);
-    f.render_widget(p, inner);
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn util_bar_line(label: &'static str, util: f64, reset: Option<u64>) -> Line<'static> {
+    let util = util.clamp(0.0, 1.0);
+    let bar_w = 20usize;
+    let filled = (util * bar_w as f64).round() as usize;
+    let bar_color = if util >= 0.9 { RED } else if util >= 0.6 { YELLOW } else { GREEN };
+    let bar = format!("{}{}", "█".repeat(filled), "░".repeat(bar_w.saturating_sub(filled)));
+    let pct = format!("{:.0}%", util * 100.0);
+
+    let reset_str = reset.map(|reset_secs| {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if reset_secs > now_secs {
+            let diff_ms = (reset_secs - now_secs) * 1000;
+            format!("  resets {}", fmt_duration_ms(diff_ms))
+        } else {
+            String::new()
+        }
+    }).unwrap_or_default();
+
+    Line::from(vec![
+        Span::styled(format!("   {label} "), style_dim()),
+        Span::styled(bar, Style::default().fg(bar_color)),
+        Span::styled(format!(" {pct}"), style_dim()),
+        Span::styled(reset_str, style_dim()),
+    ])
 }
 
 fn draw_request_log(f: &mut Frame, area: Rect, s: &StatusResponse, scroll: usize) {
+    // Calculate requests per minute from last 60s
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let req_per_min = s.recent_requests.iter()
+        .filter(|r| now_ms.saturating_sub(r.ts_ms) < 60_000)
+        .count();
+    let rate_str = if req_per_min > 0 {
+        format!("  {req_per_min}/min")
+    } else {
+        String::new()
+    };
+
     let block = Block::default()
         .title(Line::from(vec![
             Span::styled("── ", style_dkgreen()),
             Span::styled("RECENT REQUESTS", style_bold()),
+            Span::styled(rate_str, style_dim()),
             Span::styled(" ──────────────────", style_dkgreen()),
         ]))
         .borders(Borders::NONE);
@@ -365,14 +523,11 @@ fn draw_request_log(f: &mut Frame, area: Rect, s: &StatusResponse, scroll: usize
     f.render_widget(block, area);
 
     if s.recent_requests.is_empty() {
-        let p = Paragraph::new(Line::from(vec![
-            Span::styled("  No requests yet.", style_dim()),
-        ]));
+        let p = Paragraph::new(Line::from(Span::styled("  No requests yet.", style_dim())));
         f.render_widget(p, inner);
         return;
     }
 
-    // Column headers
     let header = Row::new(vec![
         Cell::from(Span::styled("time", style_dim())),
         Cell::from(Span::styled("account", style_dim())),
@@ -381,11 +536,6 @@ fn draw_request_log(f: &mut Frame, area: Rect, s: &StatusResponse, scroll: usize
         Cell::from(Span::styled("out", style_dim())),
         Cell::from(Span::styled("dur", style_dim())),
     ]).height(1);
-
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
 
     let rows: Vec<Row> = s.recent_requests
         .iter()
@@ -397,10 +547,7 @@ fn draw_request_log(f: &mut Frame, area: Rect, s: &StatusResponse, scroll: usize
             } else {
                 format!("{} ago", fmt_duration_ms(age_ms))
             };
-
-            // Shorten model name
             let model_short = shorten_model(&r.model);
-
             Row::new(vec![
                 Cell::from(Span::styled(time_str, style_dim())),
                 Cell::from(Span::styled(&r.account, style_green())),
@@ -430,14 +577,55 @@ fn draw_request_log(f: &mut Frame, area: Rect, s: &StatusResponse, scroll: usize
 }
 
 // ---------------------------------------------------------------------------
+// Picker overlay
+// ---------------------------------------------------------------------------
+
+fn draw_picker(f: &mut Frame, picker: &Picker, area: Rect) {
+    let h = (picker.items.len() + 4) as u16;
+    let w = 36u16;
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    let popup_area = Rect { x, y, width: w.min(area.width), height: h.min(area.height) };
+
+    f.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .title(Line::from(vec![
+            Span::styled("── ", style_dkgreen()),
+            Span::styled("PIN ACCOUNT", style_bold()),
+            Span::styled(" ──", style_dkgreen()),
+        ]))
+        .borders(Borders::ALL)
+        .border_style(style_dkgreen());
+
+    let inner = block.inner(popup_area);
+    f.render_widget(block, popup_area);
+
+    let rows: Vec<Row> = picker.items.iter().enumerate().map(|(i, item)| {
+        let is_sel = i == picker.cursor;
+        let label = if item == "auto" {
+            format!("  {} auto routing", if is_sel { "▶" } else { " " })
+        } else {
+            format!("  {} {}", if is_sel { "▶" } else { " " }, item)
+        };
+        let style = if is_sel {
+            Style::default().fg(GREEN).add_modifier(Modifier::BOLD)
+        } else {
+            style_dim()
+        };
+        Row::new(vec![Cell::from(Span::styled(label, style))])
+    }).collect();
+
+    let table = Table::new(rows, [Constraint::Min(0)]).column_spacing(0);
+    f.render_widget(table, inner);
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
 fn shorten_model(model: &str) -> String {
-    // "claude-sonnet-4-5-20251001" → "sonnet-4.5"
-    // "claude-opus-4-6" → "opus-4.6"
     let s = model.trim_start_matches("claude-");
-    // Drop trailing date suffix like -20251001
     let s = if let Some(idx) = s.rfind('-') {
         let suffix = &s[idx + 1..];
         if suffix.len() == 8 && suffix.chars().all(|c| c.is_ascii_digit()) {
@@ -464,13 +652,9 @@ fn fmt_tokens(n: u64) -> String {
 }
 
 fn fmt_dur_short(ms: u64) -> String {
-    if ms < 1_000 {
-        format!("{ms}ms")
-    } else if ms < 60_000 {
-        format!("{:.1}s", ms as f64 / 1_000.0)
-    } else {
-        format!("{}m", ms / 60_000)
-    }
+    if ms < 1_000 { format!("{ms}ms") }
+    else if ms < 60_000 { format!("{:.1}s", ms as f64 / 1_000.0) }
+    else { format!("{}m", ms / 60_000) }
 }
 
 fn fmt_duration_ms(ms: u64) -> String {

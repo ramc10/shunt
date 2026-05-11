@@ -25,6 +25,8 @@ struct AppState {
     state: StateStore,
     /// Live credentials — can be refreshed at runtime without restarting.
     credentials: Arc<RwLock<HashMap<String, OAuthCredential>>>,
+    /// Epoch-ms when this proxy instance started.
+    started_ms: u64,
 }
 
 pub fn create_app(config: Config) -> anyhow::Result<Router> {
@@ -51,6 +53,7 @@ pub fn create_app_with_state(config: Config, state: StateStore) -> anyhow::Resul
         forwarder: Arc::new(forwarder),
         state,
         credentials,
+        started_ms: now_ms(),
     };
 
     let app = Router::new()
@@ -139,6 +142,7 @@ async fn status_handler(State(s): State<AppState>) -> impl IntoResponse {
 
     axum::Json(json!({
         "version": env!("CARGO_PKG_VERSION"),
+        "started_ms": s.started_ms,
         "accounts": accounts,
         "pinned": s.state.get_pinned(),
         "last_used": s.state.get_last_used(),
