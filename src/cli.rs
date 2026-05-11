@@ -889,6 +889,15 @@ async fn cmd_login(code: String) -> Result<()> {
     let config_p = config_path();
     let account_names: Vec<_> = bundle.accounts.keys().cloned().collect();
 
+    // Strip sharing settings — remote_key and host=0.0.0.0 are tied to the
+    // source device and must not carry over to a new local install.
+    let config_toml: String = bundle.config_toml
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("remote_key"))
+        .map(|l| if l.trim() == "host = \"0.0.0.0\"" { "host = \"127.0.0.1\"" } else { l })
+        .collect::<Vec<_>>()
+        .join("\n") + "\n";
+
     // If config already exists, confirm overwrite
     if config_p.exists() {
         use std::io::{self, Write};
@@ -907,7 +916,7 @@ async fn cmd_login(code: String) -> Result<()> {
     if let Some(parent) = config_p.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&config_p, &bundle.config_toml)?;
+    std::fs::write(&config_p, &config_toml)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
