@@ -251,7 +251,7 @@ fn generate_pkce() -> Pkce {
     Pkce { verifier, challenge }
 }
 
-fn rand_bytes<const N: usize>() -> [u8; N] {
+pub fn rand_bytes<const N: usize>() -> [u8; N] {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     // Simple random bytes — not crypto-grade but fine for PKCE verifier.

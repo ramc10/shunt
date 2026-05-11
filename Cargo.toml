@@ -1,6 +1,6 @@
 [package]
 name = "shunt-proxy"
-version = "0.1.8"
+version = "0.1.9"
 edition = "2021"
 authors = ["Ramcharan <sairamcharansudagoni@gmail.com>"]
 description = "A local proxy that pools multiple Claude accounts behind a single endpoint, routing requests to maximise rate limits"
@@ -50,6 +50,7 @@ crossterm = "0.27"
 ratatui = "0.29"
 flate2 = "1"
 tar = "0.4"
+aes-gcm = "0.10"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

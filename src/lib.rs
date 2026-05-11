@@ -8,4 +8,5 @@ pub mod proxy;
 pub mod quota;
 pub mod router;
 pub mod state;
+pub mod sync;
 pub mod term;

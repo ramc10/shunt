@@ -102,6 +102,7 @@ struct RawServer {
     log_level: String,
     upstream_url: Option<String>,
     remote_key: Option<String>,
+    relay_url: Option<String>,
 }
 
 impl Default for RawServer {
@@ -112,6 +113,7 @@ impl Default for RawServer {
             log_level: default_log_level(),
             upstream_url: None,
             remote_key: None,
+            relay_url: None,
         }
     }
 }
@@ -140,6 +142,8 @@ pub struct ServerConfig {
     pub upstream_url: String,
     /// When set, remote requests must supply this value as `x-api-key`.
     pub remote_key: Option<String>,
+    /// Relay URL for `shunt push` / `shunt login`. Overridable via SHUNT_RELAY_URL.
+    pub relay_url: String,
 }
 
 #[derive(Debug, Clone)]
@@ -185,12 +189,20 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
         .or_else(|| std::env::var("SHUNT_UPSTREAM_URL").ok())
         .unwrap_or_else(|| "https://api.anthropic.com".into());
 
+    let relay_url = raw
+        .server
+        .relay_url
+        .clone()
+        .or_else(|| std::env::var("SHUNT_RELAY_URL").ok())
+        .unwrap_or_else(|| "https://relay.ramcharan.shop".into());
+
     let server = ServerConfig {
         host: raw.server.host,
         port: raw.server.port,
         log_level: raw.server.log_level,
         upstream_url,
         remote_key: raw.server.remote_key,
+        relay_url,
     };
 
     if raw.accounts.is_empty() {

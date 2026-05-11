@@ -123,6 +123,22 @@ enum Command {
         /// Account name to pin to, or "auto". Omit to pick interactively.
         account: Option<String>,
     },
+    /// Upload credentials to the relay for transfer to another device
+    ///
+    /// Examples:
+    ///   shunt push              — encrypt and upload, prints a transfer code
+    Push {
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Set up this device using a transfer code from `shunt push`
+    ///
+    /// Examples:
+    ///   shunt login SH-a3f2b1c4d5e6f7a8b9
+    Login {
+        /// Transfer code printed by `shunt push` on another device
+        code: String,
+    },
     /// Print shell completion script
     ///
     /// Examples:
@@ -151,6 +167,8 @@ pub async fn run() -> Result<()> {
         Command::Update => cmd_update().await,
         Command::Share { config, tunnel, stop } => cmd_share(config, tunnel, stop).await,
         Command::Use { config, account } => cmd_use(config, account).await,
+        Command::Push { config } => cmd_push(config).await,
+        Command::Login { code } => cmd_login(code).await,
         Command::Completions { shell } => { cmd_completions(shell); Ok(()) }
     }
 }
@@ -770,6 +788,151 @@ async fn cmd_logs(_config_override: Option<PathBuf>, follow: bool, lines: usize)
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// push
+// ---------------------------------------------------------------------------
+
+async fn cmd_push(config_override: Option<PathBuf>) -> Result<()> {
+    use crate::sync::{encrypt_bundle, generate_code, push_to_relay, SyncBundle};
+
+    let config_p = config_override.clone().unwrap_or_else(config_path);
+    if !config_p.exists() {
+        bail!("No config found. Run `shunt setup` first.");
+    }
+
+    print_splash(&[
+        format!("{}  {}", brand_green("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
+        dim("Push credentials to relay").to_string(),
+        String::new(),
+    ]);
+
+    let config = crate::config::load_config(config_override.as_deref())?;
+    let relay_url = &config.server.relay_url;
+
+    // Load raw config text + credentials
+    let config_toml = std::fs::read_to_string(&config_p)?;
+    let store = crate::config::CredentialsStore::load();
+
+    if store.accounts.is_empty() {
+        bail!("No credentials found. Run `shunt setup` or `shunt add-account` first.");
+    }
+
+    let n = store.accounts.len();
+    let names: Vec<_> = store.accounts.keys().cloned().collect();
+    println!("  {} Encrypting {} account{}…",
+        dim("·"), bold(&n.to_string()),
+        if n == 1 { "" } else { "s" });
+
+    let bundle = SyncBundle { config_toml, accounts: store.accounts };
+    let code = generate_code();
+    let payload = encrypt_bundle(&bundle, &code)?;
+
+    print!("  {} Uploading to relay… ", dim("↑"));
+    use std::io::Write as _;
+    std::io::stdout().flush().ok();
+
+    push_to_relay(&code, &payload, relay_url).await?;
+    println!("{}", green("done"));
+
+    println!();
+    println!("  {} Transfer code:", green(CHECK));
+    println!();
+    println!("      {}", bold_white(&code));
+    println!();
+    println!("  {} Accounts: {}", dim("·"), dim(&names.join(", ")));
+    println!("  {} Expires in 24h — one-time use", dim("·"));
+    println!();
+    println!("  On the new device, run:");
+    println!("    {}", cyan(&format!("shunt login {code}")));
+    println!();
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// login
+// ---------------------------------------------------------------------------
+
+async fn cmd_login(code: String) -> Result<()> {
+    use crate::sync::{decrypt_bundle, pull_from_relay, validate_code};
+
+    validate_code(&code)?;
+
+    print_splash(&[
+        format!("{}  {}", brand_green("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
+        dim("Login — applying credentials from relay").to_string(),
+        String::new(),
+    ]);
+
+    // Resolve relay URL: use existing config if present, else env var or default
+    let relay_url = crate::config::load_config(None)
+        .map(|c| c.server.relay_url.clone())
+        .unwrap_or_else(|_| {
+            std::env::var("SHUNT_RELAY_URL")
+                .unwrap_or_else(|_| "https://relay.ramcharan.shop".into())
+        });
+
+    print!("  {} Downloading from relay… ", dim("↓"));
+    use std::io::Write as _;
+    std::io::stdout().flush().ok();
+
+    let payload = pull_from_relay(&code, &relay_url).await?;
+    println!("{}", green("done"));
+
+    print!("  {} Decrypting… ", dim("·"));
+    std::io::stdout().flush().ok();
+    let bundle = decrypt_bundle(&payload, &code)?;
+    println!("{}", green("done"));
+
+    let config_p = config_path();
+    let account_names: Vec<_> = bundle.accounts.keys().cloned().collect();
+
+    // If config already exists, confirm overwrite
+    if config_p.exists() {
+        use std::io::{self, Write};
+        print!("  {} Config already exists — overwrite? [y/N]: ", yellow("!"));
+        io::stdout().flush()?;
+        let mut buf = String::new();
+        io::stdin().read_line(&mut buf)?;
+        if !matches!(buf.trim().to_lowercase().as_str(), "y" | "yes") {
+            println!("  {} Cancelled.", dim("·"));
+            println!();
+            return Ok(());
+        }
+    }
+
+    // Write config
+    if let Some(parent) = config_p.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&config_p, &bundle.config_toml)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&config_p, std::fs::Permissions::from_mode(0o600))?;
+    }
+    println!("  {} Config written", green(CHECK));
+
+    // Merge credentials (bundle wins; keeps any extra local accounts)
+    let mut store = crate::config::CredentialsStore::load();
+    for (name, cred) in bundle.accounts {
+        store.accounts.insert(name, cred);
+    }
+    store.save()?;
+    println!("  {} Credentials saved ({} accounts: {})",
+        green(CHECK),
+        account_names.len(),
+        account_names.join(", "));
+
+    offer_shell_export()?;
+
+    println!();
+    println!("  {} Run {} to start.", green(CHECK), cyan("shunt start"));
+    println!();
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
