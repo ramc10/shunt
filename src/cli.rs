@@ -1728,7 +1728,8 @@ async fn cmd_update() -> Result<()> {
     // Fetch latest release from GitHub API
     let client = reqwest::Client::builder()
         .user_agent("shunt-updater")
-        .timeout(std::time::Duration::from_secs(15))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(120))
         .build()?;
 
     let api_url = format!("https://api.github.com/repos/{REPO}/releases/latest");
@@ -1764,10 +1765,23 @@ async fn cmd_update() -> Result<()> {
     use std::io::Write as _;
     std::io::stdout().flush().ok();
 
-    let bytes = client.get(&url).send().await
-        .context("Download request failed")?
-        .bytes().await
+    let resp = client.get(&url).send().await
+        .context("Download request failed")?;
+
+    if !resp.status().is_success() {
+        bail!("Download failed: HTTP {} for {url}", resp.status());
+    }
+
+    let bytes = resp.bytes().await
         .context("Failed to read download")?;
+
+    // Sanity-check: gzip magic bytes are 0x1f 0x8b
+    if bytes.len() < 2 || bytes[0] != 0x1f || bytes[1] != 0x8b {
+        bail!(
+            "Downloaded file does not look like a gzip archive ({} bytes, first bytes: {:02x?})",
+            bytes.len(), &bytes[..bytes.len().min(4)]
+        );
+    }
 
     println!("{}", green("done"));
 
