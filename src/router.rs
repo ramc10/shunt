@@ -5,8 +5,6 @@ use std::collections::HashSet;
 use crate::config::AccountConfig;
 use crate::state::StateStore;
 
-const STICKY_TTL_MS: u64 = 10 * 60 * 1000; // 10 minutes
-const EXPIRY_SOON_SECS: u64 = 30 * 60; // prefer expiring accounts within this window
 
 // ---------------------------------------------------------------------------
 // Fingerprinting
@@ -84,6 +82,8 @@ pub fn pick_account<'a>(
     state: &StateStore,
     fp: Option<&str>,
     tried: &HashSet<String>,
+    sticky_ttl_ms: u64,
+    expiry_soon_secs: u64,
 ) -> Option<&'a AccountConfig> {
     // Pinned account overrides everything — user explicitly chose this one
     if let Some(pinned) = state.get_pinned() {
@@ -128,8 +128,8 @@ pub fn pick_account<'a>(
             let ra = state.reset_5h_secs(&a.name);
             let rb = state.reset_5h_secs(&b.name);
 
-            let a_expiring = ra.map(|r| r.saturating_sub(now_secs) <= EXPIRY_SOON_SECS).unwrap_or(false) && ua < 1.0;
-            let b_expiring = rb.map(|r| r.saturating_sub(now_secs) <= EXPIRY_SOON_SECS).unwrap_or(false) && ub < 1.0;
+            let a_expiring = ra.map(|r| r.saturating_sub(now_secs) <= expiry_soon_secs).unwrap_or(false) && ua < 1.0;
+            let b_expiring = rb.map(|r| r.saturating_sub(now_secs) <= expiry_soon_secs).unwrap_or(false) && ub < 1.0;
 
             match (a_expiring, b_expiring) {
                 (true, false) => std::cmp::Ordering::Less,
@@ -142,9 +142,11 @@ pub fn pick_account<'a>(
             }
         })?;
 
+    tracing::debug!(account = %chosen.name, "routing request to account");
+
     // Record stickiness for future requests in this conversation
     if let Some(fp) = fp {
-        state.set_sticky(fp, &chosen.name, STICKY_TTL_MS);
+        state.set_sticky(fp, &chosen.name, sticky_ttl_ms);
     }
 
     Some(chosen)

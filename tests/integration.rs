@@ -153,7 +153,7 @@ fn test_account() -> AccountConfig {
     AccountConfig {
         name: "test".into(),
         plan_type: "pro".into(),
-        credential: test_credential(),
+        credential: Some(test_credential()),
     }
 }
 
@@ -163,10 +163,11 @@ async fn setup(streaming: bool, upstream_status: u16) -> (TestServer, TestServer
 
     let cfg = Config {
         server: ServerConfig {
+            upstream_url: upstream.url(),
             host: "127.0.0.1".into(),
             port: 0,
             log_level: "error".into(),
-            upstream_url: upstream.url(),
+            ..ServerConfig::default()
         },
         accounts: vec![test_account()],
         config_file: std::path::PathBuf::from("/dev/null"),
@@ -357,12 +358,12 @@ fn test_account2() -> AccountConfig {
     AccountConfig {
         name: "second".into(),
         plan_type: "pro".into(),
-        credential: OAuthCredential {
-        email: None,
+        credential: Some(OAuthCredential {
+            email: None,
             access_token: TEST_TOKEN_2.into(),
             refresh_token: "test-refresh-2".into(),
             expires_at: u64::MAX / 2,
-        },
+        }),
     }
 }
 
@@ -399,10 +400,11 @@ async fn setup_multi() -> (TestServer, TestServer, Captures, Client) {
 
     let cfg = Config {
         server: ServerConfig {
+            upstream_url: upstream.url(),
             host: "127.0.0.1".into(),
             port: 0,
             log_level: "error".into(),
-            upstream_url: upstream.url(),
+            ..ServerConfig::default()
         },
         accounts: vec![test_account(), test_account2()],
         config_file: std::path::PathBuf::from("/dev/null"),
@@ -447,10 +449,11 @@ async fn test_stickiness_same_conversation() {
 
     let cfg = Config {
         server: ServerConfig {
+            upstream_url: upstream.url(),
             host: "127.0.0.1".into(),
             port: 0,
             log_level: "error".into(),
-            upstream_url: upstream.url(),
+            ..ServerConfig::default()
         },
         accounts: vec![test_account(), test_account2()],
         config_file: std::path::PathBuf::from("/dev/null"),
@@ -490,10 +493,11 @@ async fn test_all_accounts_exhausted_returns_503() {
 
     let cfg = Config {
         server: ServerConfig {
+            upstream_url: upstream.url(),
             host: "127.0.0.1".into(),
             port: 0,
             log_level: "error".into(),
-            upstream_url: upstream.url(),
+            ..ServerConfig::default()
         },
         accounts: vec![test_account(), test_account2()],
         config_file: std::path::PathBuf::from("/dev/null"),
@@ -547,6 +551,164 @@ async fn test_status_shows_account_status() {
 }
 
 // ---------------------------------------------------------------------------
+// New-feature coverage
+// ---------------------------------------------------------------------------
+
+/// /status must expose the correct canonical field names — no legacy duplicates.
+#[tokio::test]
+async fn test_status_response_shape() {
+    let (proxy, _up, _caps, client) = setup(false, 200).await;
+    let body: serde_json::Value = client
+        .get(format!("{}/status", proxy.url()))
+        .send().await.unwrap()
+        .json().await.unwrap();
+
+    // Top-level keys
+    assert!(body.get("version").is_some());
+    assert!(body.get("started_ms").is_some());
+    assert!(body.get("accounts").is_some());
+    // pinned_account / last_used_account present (may be null)
+    assert!(body.as_object().unwrap().contains_key("pinned_account"),
+        "top-level key 'pinned_account' must be present");
+    assert!(body.as_object().unwrap().contains_key("last_used_account"),
+        "top-level key 'last_used_account' must be present");
+    assert!(body.get("recent_requests").is_some());
+
+    // Account-level: canonical names, no legacy duplicates
+    let acc = &body["accounts"][0];
+    assert_eq!(acc["name"], "test");
+    assert!(acc.get("plan_type").is_some(), "account must have 'plan_type'");
+    assert!(acc.get("plan").is_none(),       "legacy 'plan' field must be absent");
+    assert!(acc.get("status").is_some());
+    assert!(acc.get("available").is_some());
+    assert!(acc.get("disabled").is_some());
+    assert!(acc.get("cooldown_until_ms").is_some());
+}
+
+/// remote_key: requests without / with wrong key must be rejected; correct key passes.
+#[tokio::test]
+async fn test_remote_key_auth() {
+    let caps = Captures::default();
+    let upstream = TestServer::start(make_mock_upstream(caps.clone(), false, 200)).await;
+
+    let cfg = Config {
+        server: ServerConfig {
+            upstream_url: upstream.url(),
+            host: "127.0.0.1".into(),
+            port: 0,
+            log_level: "error".into(),
+            remote_key: Some("mysecret".into()),
+            ..ServerConfig::default()
+        },
+        accounts: vec![test_account()],
+        config_file: std::path::PathBuf::from("/dev/null"),
+    };
+    let proxy = TestServer::start(create_app_with_state(cfg, StateStore::new_empty()).unwrap()).await;
+    let client = Client::new();
+    let body = r#"{"model":"claude-opus-4-5","max_tokens":1,"messages":[]}"#;
+
+    // No key → 401
+    let resp = client
+        .post(format!("{}/v1/messages", proxy.url()))
+        .header("content-type", "application/json")
+        .body(body)
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 401, "missing key must be rejected");
+
+    // Wrong key → 401
+    let resp = client
+        .post(format!("{}/v1/messages", proxy.url()))
+        .header("content-type", "application/json")
+        .header("x-api-key", "wrongkey")
+        .body(body)
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 401, "wrong key must be rejected");
+
+    // Correct key → 200 and upstream receives exactly one request
+    let resp = client
+        .post(format!("{}/v1/messages", proxy.url()))
+        .header("content-type", "application/json")
+        .header("x-api-key", "mysecret")
+        .body(body)
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 200, "correct key must be accepted");
+    assert_eq!(caps.len(), 1, "only the authenticated request should reach upstream");
+}
+
+/// /use pins an account; subsequent requests go straight to it without failover.
+#[tokio::test]
+async fn test_account_pinning() {
+    // setup_multi: account "test" → 429, account "second" → 200
+    let (proxy, _up, caps, client) = setup_multi().await;
+
+    // Pin the healthy account
+    let pin: serde_json::Value = client
+        .post(format!("{}/use", proxy.url()))
+        .json(&json!({"account": "second"}))
+        .send().await.unwrap()
+        .json().await.unwrap();
+    assert_eq!(pin["pinned"], "second");
+
+    // Request should go directly to "second" — no retry to "test"
+    let resp = client
+        .post(format!("{}/v1/messages", proxy.url()))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"claude-haiku-4-5-20251001","max_tokens":1,"messages":[]}"#)
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(caps.len(), 1, "pinned account means no failover attempt");
+    assert_eq!(
+        caps.get(0).headers.get("authorization").unwrap().to_str().unwrap(),
+        format!("Bearer {TEST_TOKEN_2}"),
+        "must use the pinned account's token"
+    );
+
+    // Unpin → /use with "auto"
+    let unpin: serde_json::Value = client
+        .post(format!("{}/use", proxy.url()))
+        .json(&json!({"account": "auto"}))
+        .send().await.unwrap()
+        .json().await.unwrap();
+    assert_eq!(unpin["pinned"], "auto");
+}
+
+/// After a successful proxied request, /status must report last_used_account.
+#[tokio::test]
+async fn test_last_used_account_tracked() {
+    let (proxy, _up, _caps, client) = setup(false, 200).await;
+
+    // No request yet
+    let status: serde_json::Value = client
+        .get(format!("{}/status", proxy.url()))
+        .send().await.unwrap().json().await.unwrap();
+    assert!(status["last_used_account"].is_null(), "should start null");
+
+    // Successful request
+    client
+        .post(format!("{}/v1/messages", proxy.url()))
+        .header("content-type", "application/json")
+        .body("{}")
+        .send().await.unwrap();
+
+    let status: serde_json::Value = client
+        .get(format!("{}/status", proxy.url()))
+        .send().await.unwrap().json().await.unwrap();
+    assert_eq!(status["last_used_account"], "test");
+}
+
+/// /use with an unknown account name returns an error.
+#[tokio::test]
+async fn test_use_unknown_account_returns_error() {
+    let (proxy, _up, _caps, client) = setup(false, 200).await;
+    let resp: serde_json::Value = client
+        .post(format!("{}/use", proxy.url()))
+        .json(&json!({"account": "nonexistent"}))
+        .send().await.unwrap()
+        .json().await.unwrap();
+    assert!(resp.get("error").is_some(), "unknown account must return error");
+}
+
+// ---------------------------------------------------------------------------
 // Live test — skipped unless ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN set
 // ---------------------------------------------------------------------------
 
@@ -576,8 +738,9 @@ async fn test_live_api() {
             host: "127.0.0.1".into(),
             port: 0,
             log_level: "error".into(),
+            ..ServerConfig::default()
         },
-        accounts: vec![AccountConfig { name: "live".into(), plan_type: "pro".into(), credential }],
+        accounts: vec![AccountConfig { name: "live".into(), plan_type: "pro".into(), credential: Some(credential) }],
         config_file: std::path::PathBuf::from("/dev/null"),
     };
 

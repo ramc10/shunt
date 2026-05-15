@@ -1,7 +1,7 @@
 /// Live fullscreen TUI monitor for shunt.
 ///
 /// Connects to the running proxy's /status endpoint and refreshes every second.
-/// Press 'q' or Esc to exit, 'u' to pick an account to pin.
+/// Press 'q' or Esc to exit, 'u' to pick an account to pin, '?' for help.
 use anyhow::Result;
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers},
@@ -21,6 +21,8 @@ use std::{
     io::stdout,
     time::{Duration, Instant},
 };
+
+use crate::term::{fmt_duration_ms, fmt_tokens};
 
 // ---------------------------------------------------------------------------
 // Status API response types (mirrors proxy.rs /status handler)
@@ -157,12 +159,14 @@ pub async fn run_monitor(base_url: &str) -> Result<()> {
     let mut last_fetch = Instant::now() - Duration::from_secs(10);
     let mut scroll: usize = 0;
     let mut picker: Option<Picker> = None;
+    let mut show_help = false;
+    let mut refresh_ms: u64 = 1_000;
     // Spinner frame counter for "not running" state
     let start_time = Instant::now();
 
     loop {
-        // Fetch status every second
-        if last_fetch.elapsed() >= Duration::from_secs(1) {
+        // Fetch status at the configured interval
+        if last_fetch.elapsed() >= Duration::from_millis(refresh_ms) {
             match fetch_status(&status_url).await {
                 Ok(s)  => { state = Some(s); fetch_err = None; }
                 Err(e) => { fetch_err = Some(e); state = None; }
@@ -171,12 +175,18 @@ pub async fn run_monitor(base_url: &str) -> Result<()> {
         }
 
         terminal.draw(|f| {
-            draw(f, &state, &fetch_err, scroll, base_url, &picker, start_time)
+            draw(f, &state, &fetch_err, scroll, base_url, &picker, show_help, refresh_ms, start_time)
         })?;
 
         // Poll for key events (non-blocking, 200ms timeout)
         if event::poll(Duration::from_millis(200))? {
             if let Event::Key(key) = event::read()? {
+                // Help overlay intercepts all keys
+                if show_help {
+                    show_help = false;
+                    continue;
+                }
+
                 // Picker overlay active — intercept keys
                 if let Some(ref mut p) = picker {
                     match key.code {
@@ -219,6 +229,17 @@ pub async fn run_monitor(base_url: &str) -> Result<()> {
                         if let Some(ref s) = state {
                             picker = Some(Picker::new(&s.accounts, s.pinned_account.as_deref()));
                         }
+                    }
+                    (KeyCode::Char('?'), _) => {
+                        show_help = true;
+                    }
+                    // +/= increase refresh rate (halve interval, min 200ms)
+                    (KeyCode::Char('+'), _) | (KeyCode::Char('='), _) => {
+                        refresh_ms = (refresh_ms / 2).max(200);
+                    }
+                    // - decrease refresh rate (double interval, max 10s)
+                    (KeyCode::Char('-'), _) => {
+                        refresh_ms = (refresh_ms * 2).min(10_000);
                     }
                     _ => {}
                 }
@@ -266,6 +287,8 @@ fn draw(
     scroll: usize,
     base_url: &str,
     picker: &Option<Picker>,
+    show_help: bool,
+    refresh_ms: u64,
     start_time: Instant,
 ) {
     let area = f.area();
@@ -286,10 +309,14 @@ fn draw(
         Some(s) => draw_body(f, chunks[1], s, scroll),
     }
 
-    draw_footer(f, chunks[2], picker.is_some());
+    draw_footer(f, chunks[2], picker.is_some(), refresh_ms);
 
     if let Some(p) = picker {
         draw_picker(f, p, area);
+    }
+
+    if show_help {
+        draw_help_overlay(f, area);
     }
 }
 
@@ -324,7 +351,7 @@ fn draw_header(f: &mut Frame, area: Rect, state: &Option<StatusResponse>) {
     f.render_widget(p, area);
 }
 
-fn draw_footer(f: &mut Frame, area: Rect, picker_open: bool) {
+fn draw_footer(f: &mut Frame, area: Rect, picker_open: bool, refresh_ms: u64) {
     let hint = if picker_open {
         Line::from(vec![
             Span::styled(" ↑↓", style_green()),
@@ -335,15 +362,24 @@ fn draw_footer(f: &mut Frame, area: Rect, picker_open: bool) {
             Span::styled(" cancel", style_dim()),
         ])
     } else {
+        let rate_str = if refresh_ms < 1_000 {
+            format!("  {}ms", refresh_ms)
+        } else {
+            format!("  {}s", refresh_ms / 1_000)
+        };
         Line::from(vec![
             Span::styled(" q", style_green()),
             Span::styled(" quit  ", style_dim()),
             Span::styled("r", style_green()),
             Span::styled(" refresh  ", style_dim()),
             Span::styled("u", style_green()),
-            Span::styled(" pin account  ", style_dim()),
+            Span::styled(" pin  ", style_dim()),
+            Span::styled("+/-", style_green()),
+            Span::styled(format!(" speed{rate_str}  "), style_dim()),
+            Span::styled("?", style_green()),
+            Span::styled(" help  ", style_dim()),
             Span::styled("↑↓", style_green()),
-            Span::styled(" scroll log", style_dim()),
+            Span::styled(" scroll", style_dim()),
         ])
     };
     f.render_widget(Paragraph::new(hint), area);
@@ -621,6 +657,55 @@ fn draw_picker(f: &mut Frame, picker: &Picker, area: Rect) {
 }
 
 // ---------------------------------------------------------------------------
+// Help overlay
+// ---------------------------------------------------------------------------
+
+fn draw_help_overlay(f: &mut Frame, area: Rect) {
+    let lines: &[(&str, &str)] = &[
+        ("q / Esc", "quit"),
+        ("r",       "force refresh"),
+        ("u",       "pin account"),
+        ("↑ / k",   "scroll log up"),
+        ("↓ / j",   "scroll log down"),
+        ("+  / =",  "faster refresh rate"),
+        ("-",        "slower refresh rate"),
+        ("?",        "toggle this help"),
+        ("any key",  "close help"),
+    ];
+
+    let h = (lines.len() + 4) as u16;
+    let w = 40u16;
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    let popup_area = Rect { x, y, width: w.min(area.width), height: h.min(area.height) };
+
+    f.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .title(Line::from(vec![
+            Span::styled("── ", style_dkgreen()),
+            Span::styled("KEYBOARD SHORTCUTS", style_bold()),
+            Span::styled(" ──", style_dkgreen()),
+        ]))
+        .borders(Borders::ALL)
+        .border_style(style_dkgreen());
+
+    let inner = block.inner(popup_area);
+    f.render_widget(block, popup_area);
+
+    let rows: Vec<Row> = lines.iter().map(|(key, desc)| {
+        Row::new(vec![
+            Cell::from(Span::styled(format!("  {key}"), style_green())),
+            Cell::from(Span::styled(format!("  {desc}"), style_dim())),
+        ])
+    }).collect();
+
+    let table = Table::new(rows, [Constraint::Length(12), Constraint::Min(0)])
+        .column_spacing(1);
+    f.render_widget(table, inner);
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -639,39 +724,8 @@ fn shorten_model(model: &str) -> String {
     s.to_owned()
 }
 
-fn fmt_tokens(n: u64) -> String {
-    if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
-    } else if n >= 10_000 {
-        format!("{}k", n / 1_000)
-    } else if n >= 1_000 {
-        format!("{:.1}k", n as f64 / 1_000.0)
-    } else {
-        format!("{n}")
-    }
-}
-
 fn fmt_dur_short(ms: u64) -> String {
     if ms < 1_000 { format!("{ms}ms") }
     else if ms < 60_000 { format!("{:.1}s", ms as f64 / 1_000.0) }
     else { format!("{}m", ms / 60_000) }
-}
-
-fn fmt_duration_ms(ms: u64) -> String {
-    let secs = ms / 1000;
-    if secs == 0 { return "0s".into(); }
-    let mins = secs / 60;
-    if mins == 0 { return format!("{secs}s"); }
-    let hours = mins / 60;
-    let rem_mins = mins % 60;
-    if hours == 0 { return format!("{mins}m"); }
-    let days = hours / 24;
-    let rem_hours = hours % 24;
-    if days == 0 {
-        if rem_mins == 0 { format!("{hours}h") } else { format!("{hours}h {rem_mins}m") }
-    } else if rem_hours == 0 {
-        format!("{days}d")
-    } else {
-        format!("{days}d {rem_hours}h")
-    }
 }

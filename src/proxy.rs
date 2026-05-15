@@ -34,7 +34,7 @@ pub fn create_app(config: Config) -> anyhow::Result<Router> {
 }
 
 pub fn create_app_with_state(config: Config, state: StateStore) -> anyhow::Result<Router> {
-    let forwarder = Forwarder::new(&config.server.upstream_url)?;
+    let forwarder = Forwarder::new(&config.server.upstream_url, config.server.request_timeout_secs)?;
 
     // Accounts with no credential are shown in status but skipped during routing.
     // Mark them disabled immediately so the router ignores them.
@@ -122,7 +122,6 @@ async fn status_handler(State(s): State<AppState>) -> impl IntoResponse {
         json!({
             "name": a.name,
             "email": email,
-            "plan": a.plan_type,
             "plan_type": a.plan_type,
             "status": avail_status,
             "available": available,
@@ -144,8 +143,6 @@ async fn status_handler(State(s): State<AppState>) -> impl IntoResponse {
         "version": env!("CARGO_PKG_VERSION"),
         "started_ms": s.started_ms,
         "accounts": accounts,
-        "pinned": s.state.get_pinned(),
-        "last_used": s.state.get_last_used(),
         "pinned_account": s.state.get_pinned(),
         "last_used_account": s.state.get_last_used(),
         "recent_requests": recent_requests,
@@ -215,7 +212,10 @@ async fn proxy_handler(
     let mut refreshed: HashSet<String> = HashSet::new();
 
     loop {
-        let account = match router::pick_account(&s.config.accounts, &s.state, fp_ref, &tried) {
+        let account = match router::pick_account(
+            &s.config.accounts, &s.state, fp_ref, &tried,
+            s.config.server.sticky_ttl_ms, s.config.server.expiry_soon_secs,
+        ) {
             Some(a) => a,
             None => return Err(ProxyError::AllAccountsUnavailable),
         };

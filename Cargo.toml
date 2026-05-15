@@ -51,6 +51,9 @@ ratatui = "0.29"
 flate2 = "1"
 tar = "0.4"
 aes-gcm = "0.10"
+getrandom = "0.2"
+toml_edit = "0.22"
+unicode-width = "0.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

@@ -42,9 +42,9 @@ pub struct Forwarder {
 }
 
 impl Forwarder {
-    pub fn new(base_url: impl Into<String>) -> Result<Self> {
+    pub fn new(base_url: impl Into<String>, timeout_secs: u64) -> Result<Self> {
         let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(600))
+            .timeout(std::time::Duration::from_secs(timeout_secs))
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .context("Failed to build HTTP client")?;

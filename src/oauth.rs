@@ -251,22 +251,12 @@ fn generate_pkce() -> Pkce {
     Pkce { verifier, challenge }
 }
 
+/// Generate N cryptographically random bytes using the OS entropy source.
+/// Panics if the system RNG is unavailable (unrecoverable error in a security context).
 pub fn rand_bytes<const N: usize>() -> [u8; N] {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    // Simple random bytes — not crypto-grade but fine for PKCE verifier.
-    // The verifier doesn't need to be secret from a client-side tool perspective.
     let mut bytes = [0u8; N];
-    let seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos();
-    let pid = std::process::id();
-    for (i, b) in bytes.iter_mut().enumerate() {
-        let mut h = DefaultHasher::new();
-        (seed, pid, i).hash(&mut h);
-        *b = (h.finish() & 0xff) as u8;
-    }
+    getrandom::getrandom(&mut bytes)
+        .expect("OS random number generator unavailable — cannot generate secure random bytes");
     bytes
 }
 
@@ -417,6 +407,49 @@ fn open_browser(url: &str) {
     #[cfg(target_os = "linux")]
     { std::process::Command::new("xdg-open").arg(url).spawn().ok(); }
 
+    // Use explorer.exe directly — avoids cmd.exe shell expansion of OAuth URL
+    // special characters (& % etc.) that would misparse with `cmd /c start`.
     #[cfg(target_os = "windows")]
-    { std::process::Command::new("cmd").args(["/c", "start", url]).spawn().ok(); }
+    { std::process::Command::new("explorer").arg(url).spawn().ok(); }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_rand_bytes_correct_length() {
+        let a: [u8; 16] = rand_bytes();
+        assert_eq!(a.len(), 16);
+        let b: [u8; 32] = rand_bytes();
+        assert_eq!(b.len(), 32);
+    }
+
+    #[test]
+    fn test_rand_bytes_not_all_zeros() {
+        // The probability of 32 random bytes all being zero is 1/2^256 — effectively impossible.
+        let bytes: [u8; 32] = rand_bytes();
+        assert!(bytes.iter().any(|&b| b != 0), "rand_bytes must not return all-zero output");
+    }
+
+    #[test]
+    fn test_rand_bytes_unique() {
+        // Two calls must not return the same value (probability 1/2^256 they'd collide).
+        let a: [u8; 32] = rand_bytes();
+        let b: [u8; 32] = rand_bytes();
+        assert_ne!(a, b, "rand_bytes must return unique values each call");
+    }
+
+    #[test]
+    fn test_pkce_pair_properties() {
+        let pkce = generate_pkce();
+        // Verifier must be base64url-safe (no padding, only URL-safe chars)
+        assert!(pkce.verifier.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_'),
+            "PKCE verifier must be base64url-safe");
+        // Challenge must differ from verifier (it's the SHA-256 hash)
+        assert_ne!(pkce.verifier, pkce.challenge,
+            "PKCE challenge must not equal verifier");
+        assert!(!pkce.challenge.is_empty());
+        assert!(!pkce.verifier.is_empty());
+    }
 }

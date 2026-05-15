@@ -6,6 +6,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::warn;
@@ -132,14 +133,18 @@ struct StateData {
 pub struct StateStore {
     path: PathBuf,
     inner: Arc<Mutex<StateData>>,
+    /// Set to true when a write is needed; the background writer thread clears it.
+    pending: Arc<AtomicBool>,
 }
 
 impl StateStore {
     /// Create a fresh in-memory store with no backing file (useful for tests).
     pub fn new_empty() -> Self {
+        // No background writer thread for the null store — writes are no-ops.
         Self {
             path: PathBuf::from("/dev/null"),
             inner: Arc::new(Mutex::new(StateData::default())),
+            pending: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -159,7 +164,32 @@ impl StateStore {
             StateData::default()
         };
 
-        Self { path: path.to_owned(), inner: Arc::new(Mutex::new(data)) }
+        let store = Self {
+            path: path.to_owned(),
+            inner: Arc::new(Mutex::new(data)),
+            pending: Arc::new(AtomicBool::new(false)),
+        };
+        store.start_writer_thread();
+        store
+    }
+
+    /// Spawn a single background thread that flushes state to disk at most every 100 ms.
+    /// This prevents unbounded thread spawning when many requests fire in rapid succession.
+    fn start_writer_thread(&self) {
+        let pending = Arc::clone(&self.pending);
+        let inner   = Arc::clone(&self.inner);
+        let path    = self.path.clone();
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                if pending.compare_exchange(true, false, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                    let data = inner.lock().unwrap().clone();
+                    if let Err(e) = write_to_disk(&data, &path) {
+                        warn!("Failed to persist state: {e}");
+                    }
+                }
+            }
+        });
     }
 
     // -----------------------------------------------------------------------
@@ -368,13 +398,122 @@ impl StateStore {
     // -----------------------------------------------------------------------
 
     fn persist(&self) {
-        let data = self.inner.lock().unwrap().clone();
-        let path = self.path.clone();
-        std::thread::spawn(move || {
-            if let Err(e) = write_to_disk(&data, &path) {
-                warn!("Failed to persist state: {e}");
-            }
-        });
+        // Signal the background writer thread; it will flush within ~100 ms.
+        self.pending.store(true, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sticky_ttl_expiry() {
+        let store = StateStore::new_empty();
+        let fp = "conv-fp-ttl";
+        store.set_sticky(fp, "account1", 1); // 1 ms TTL
+        assert_eq!(store.get_sticky(fp).as_deref(), Some("account1"),
+            "sticky should be available immediately");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert!(store.get_sticky(fp).is_none(),
+            "sticky must expire after TTL elapses");
+    }
+
+    #[test]
+    fn test_cooldown_blocks_availability() {
+        let store = StateStore::new_empty();
+        store.set_cooldown("acc", 5_000); // 5s cooldown
+        assert!(!store.is_available("acc"), "account should be unavailable during cooldown");
+    }
+
+    #[test]
+    fn test_disable_blocks_availability() {
+        let store = StateStore::new_empty();
+        store.disable_account("acc");
+        assert!(!store.is_available("acc"), "disabled account must be unavailable");
+    }
+
+    #[test]
+    fn test_quota_accumulates() {
+        let store = StateStore::new_empty();
+        store.record_usage("acc", 100, 50);
+        store.record_usage("acc", 200, 75);
+        let snap = store.quota_snapshot();
+        let q = &snap["acc"];
+        assert_eq!(q.input_tokens, 300);
+        assert_eq!(q.output_tokens, 125);
+        assert_eq!(q.total_tokens(), 425);
+    }
+
+    #[test]
+    fn test_pinned_account_round_trip() {
+        let store = StateStore::new_empty();
+        assert!(store.get_pinned().is_none());
+        store.set_pinned(Some("myaccount".into()));
+        assert_eq!(store.get_pinned().as_deref(), Some("myaccount"));
+        store.set_pinned(None);
+        assert!(store.get_pinned().is_none());
+    }
+
+    #[test]
+    fn test_last_used_round_trip() {
+        let store = StateStore::new_empty();
+        assert!(store.get_last_used().is_none());
+        store.set_last_used("acc1");
+        assert_eq!(store.get_last_used().as_deref(), Some("acc1"));
+    }
+
+    #[test]
+    fn test_recent_requests_ring_buffer() {
+        let store = StateStore::new_empty();
+        // Fill past MAX_RECENT
+        for i in 0..=(MAX_RECENT + 5) {
+            store.record_request(RequestLog {
+                ts_ms: i as u64,
+                account: "acc".into(),
+                model: "m".into(),
+                status: 200,
+                input_tokens: 1,
+                output_tokens: 1,
+                duration_ms: 1,
+            });
+        }
+        let snap = store.recent_requests_snapshot();
+        assert_eq!(snap.len(), MAX_RECENT, "buffer must not grow beyond MAX_RECENT");
+        // Most recent first
+        assert!(snap[0].ts_ms > snap[snap.len() - 1].ts_ms, "snapshot must be newest-first");
+    }
+
+    #[test]
+    fn test_state_persistence_roundtrip() {
+        // Use a unique temp path so parallel tests don't collide
+        let path = std::env::temp_dir().join(format!(
+            "shunt_test_state_{}.json",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        {
+            let store = StateStore::load(&path);
+            store.set_cooldown("acc", 999_999_000); // far-future cooldown
+            store.record_usage("acc", 111, 222);
+            store.set_last_used("acc");
+            // Wait for the background writer (polls every 100 ms) to flush
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+
+        // Load a fresh store from the persisted file
+        let store2 = StateStore::load(&path);
+        assert!(!store2.is_available("acc"), "cooldown must survive restart");
+        let snap = store2.quota_snapshot();
+        assert_eq!(snap["acc"].input_tokens, 111, "quota must survive restart");
+        assert_eq!(snap["acc"].output_tokens, 222);
+        assert_eq!(store2.get_last_used().as_deref(), Some("acc"),
+            "last_used_account must survive restart");
+
+        let _ = std::fs::remove_file(&path);
     }
 }
 

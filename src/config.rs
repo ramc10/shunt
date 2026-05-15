@@ -76,6 +76,21 @@ impl CredentialsStore {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600))?;
         }
+        // On Windows, restrict the file to the current user via icacls (best-effort).
+        #[cfg(windows)]
+        {
+            if let Some(path_str) = p.to_str() {
+                let username = std::env::var("USERNAME").unwrap_or_default();
+                if !username.is_empty() {
+                    let _ = std::process::Command::new("icacls")
+                        .arg(path_str)
+                        .arg("/inheritance:r")
+                        .arg("/grant:r")
+                        .arg(format!("{username}:F"))
+                        .status();
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -103,6 +118,12 @@ struct RawServer {
     upstream_url: Option<String>,
     remote_key: Option<String>,
     relay_url: Option<String>,
+    /// Conversation stickiness TTL in minutes (default: 10)
+    sticky_ttl_minutes: Option<u64>,
+    /// "use-it-or-lose-it" expiry window in minutes (default: 30)
+    expiry_soon_minutes: Option<u64>,
+    /// Upstream request timeout in seconds (default: 600)
+    request_timeout_secs: Option<u64>,
 }
 
 impl Default for RawServer {
@@ -114,6 +135,9 @@ impl Default for RawServer {
             upstream_url: None,
             remote_key: None,
             relay_url: None,
+            sticky_ttl_minutes: None,
+            expiry_soon_minutes: None,
+            request_timeout_secs: None,
         }
     }
 }
@@ -144,6 +168,28 @@ pub struct ServerConfig {
     pub remote_key: Option<String>,
     /// Relay URL for `shunt push` / `shunt login`. Overridable via SHUNT_RELAY_URL.
     pub relay_url: String,
+    /// Conversation stickiness TTL in milliseconds.
+    pub sticky_ttl_ms: u64,
+    /// Accounts whose 5h window resets within this many seconds are preferred ("use-it-or-lose-it").
+    pub expiry_soon_secs: u64,
+    /// Upstream request timeout in seconds.
+    pub request_timeout_secs: u64,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            host: "127.0.0.1".into(),
+            port: 8082,
+            log_level: "info".into(),
+            upstream_url: "https://api.anthropic.com".into(),
+            remote_key: None,
+            relay_url: "https://relay.ramcharan.shop".into(),
+            sticky_ttl_ms: 10 * 60 * 1000,
+            expiry_soon_secs: 30 * 60,
+            request_timeout_secs: 600,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -203,6 +249,9 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
         upstream_url,
         remote_key: raw.server.remote_key,
         relay_url,
+        sticky_ttl_ms: raw.server.sticky_ttl_minutes.unwrap_or(10) * 60 * 1000,
+        expiry_soon_secs: raw.server.expiry_soon_minutes.unwrap_or(30) * 60,
+        request_timeout_secs: raw.server.request_timeout_secs.unwrap_or(600),
     };
 
     if raw.accounts.is_empty() {

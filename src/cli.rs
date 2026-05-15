@@ -32,6 +32,9 @@ enum Command {
         /// Keep the process in the foreground instead of daemonizing
         #[arg(long)]
         foreground: bool,
+        /// Enable debug-level logging (shows routing decisions and token refresh details)
+        #[arg(long)]
+        verbose: bool,
         /// Internal: running as background daemon (do not use directly)
         #[arg(long, hide = true)]
         daemon: bool,
@@ -155,7 +158,7 @@ pub async fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Setup { config } => cmd_setup(config).await,
-        Command::Start { config, host, port, foreground, daemon } => cmd_start(config, host, port, foreground, daemon).await,
+        Command::Start { config, host, port, foreground, verbose, daemon } => cmd_start(config, host, port, foreground, verbose, daemon).await,
         Command::Stop => cmd_stop().await,
         Command::Restart { config } => cmd_restart(config).await,
         Command::Status { config } => cmd_status(config).await,
@@ -503,33 +506,101 @@ async fn cmd_logout(config_override: Option<PathBuf>, name: Option<String>, all:
 }
 
 /// Remove a `[[accounts]]` TOML block with the given name from config text.
+/// Uses toml_edit for correct structured editing that handles comments and edge cases.
 fn remove_account_block(config: &str, name: &str) -> String {
-    let marker = format!("name = \"{name}\"");
+    let mut doc = match config.parse::<toml_edit::DocumentMut>() {
+        Ok(d) => d,
+        Err(_) => return config.to_owned(), // unparseable — leave unchanged
+    };
 
-    // Split config into sections: preamble + one section per [[accounts]] block.
-    // Each section starts at the [[accounts]] line (except the first which is the preamble).
-    let mut sections: Vec<String> = Vec::new();
-    let mut current = String::new();
-    for line in config.lines() {
-        if line.trim() == "[[accounts]]" {
-            sections.push(std::mem::take(&mut current));
-            current = format!("[[accounts]]\n");
-        } else {
-            current.push_str(line);
-            current.push('\n');
+    if let Some(item) = doc.get_mut("accounts") {
+        if let Some(arr) = item.as_array_of_tables_mut() {
+            // Collect indices to remove in reverse order so removal doesn't shift indices
+            let to_remove: Vec<usize> = arr.iter()
+                .enumerate()
+                .filter(|(_, t)| t.get("name").and_then(|v| v.as_str()) == Some(name))
+                .map(|(i, _)| i)
+                .collect();
+            for i in to_remove.into_iter().rev() {
+                arr.remove(i);
+            }
         }
     }
-    sections.push(current);
 
-    // Drop the section that contains the marker, keep the rest.
-    let mut result: String = sections.into_iter()
-        .filter(|s| !s.contains(&marker))
-        .collect();
+    doc.to_string()
+}
 
-    if !result.ends_with('\n') {
-        result.push('\n');
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SAMPLE_CONFIG: &str = r#"
+[server]
+port = 8082
+
+[[accounts]]
+name = "alice"
+plan_type = "pro"
+
+[[accounts]]
+name = "bob"
+plan_type = "max"
+
+[[accounts]]
+name = "charlie"
+plan_type = "pro"
+"#;
+
+    #[test]
+    fn test_remove_account_block_removes_target() {
+        let result = remove_account_block(SAMPLE_CONFIG, "bob");
+        // bob must be gone
+        assert!(!result.contains("\"bob\"") && !result.contains("'bob'") && !result.contains("bob"),
+            "removed account must not appear: {result}");
+        // others must remain
+        assert!(result.contains("alice"));
+        assert!(result.contains("charlie"));
     }
-    result
+
+    #[test]
+    fn test_remove_account_block_preserves_others() {
+        let result = remove_account_block(SAMPLE_CONFIG, "alice");
+        assert!(!result.contains("alice"), "alice must be removed");
+        assert!(result.contains("bob"),     "bob must remain");
+        assert!(result.contains("charlie"), "charlie must remain");
+    }
+
+    #[test]
+    fn test_remove_account_block_noop_when_not_found() {
+        let result = remove_account_block(SAMPLE_CONFIG, "dave");
+        // All three must still be present
+        assert!(result.contains("alice"));
+        assert!(result.contains("bob"));
+        assert!(result.contains("charlie"));
+    }
+
+    #[test]
+    fn test_remove_account_block_last_account() {
+        let cfg = "[[accounts]]\nname = \"only\"\nplan_type = \"pro\"\n";
+        let result = remove_account_block(cfg, "only");
+        assert!(!result.contains("only"), "sole account must be removed");
+    }
+
+    #[test]
+    fn test_remove_account_block_handles_unparseable_input() {
+        let bad = "not valid [[toml{{ garbage";
+        let result = remove_account_block(bad, "anything");
+        // Must return input unchanged, not panic
+        assert_eq!(result, bad);
+    }
+
+    #[test]
+    fn test_remove_account_block_with_inline_comment() {
+        let cfg = "[[accounts]]\nname = \"alice\" # main account\nplan_type = \"pro\"\n\n[[accounts]]\nname = \"bob\"\nplan_type = \"max\"\n";
+        let result = remove_account_block(cfg, "alice");
+        assert!(!result.contains("alice"));
+        assert!(result.contains("bob"));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -541,6 +612,7 @@ async fn cmd_start(
     host_override: Option<String>,
     port_override: Option<u16>,
     foreground: bool,
+    verbose: bool,
     daemon: bool,
 ) -> Result<()> {
     let config_p = config_override.clone().unwrap_or_else(config_path);
@@ -569,7 +641,9 @@ async fn cmd_start(
         }
 
         let lp = log_path();
-        let _log_guard = crate::logging::setup(&lp, &config.server.log_level)?;
+        let log_level = if verbose { "debug" } else { config.server.log_level.as_str() };
+        crate::logging::prune_old_logs(&lp, 7);
+        let _log_guard = crate::logging::setup(&lp, log_level)?;
         let state = crate::state::StateStore::load(&crate::config::state_path());
         let app = crate::proxy::create_app_with_state(config.clone(), state.clone())?;
         let listener = tokio::net::TcpListener::bind(format!("{}:{}", host, port)).await?;
@@ -628,7 +702,9 @@ async fn cmd_start(
             }
         }
         let lp = log_path();
-        let _log_guard = crate::logging::setup(&lp, &config.server.log_level)?;
+        let log_level = if verbose { "debug" } else { config.server.log_level.as_str() };
+        crate::logging::prune_old_logs(&lp, 7);
+        let _log_guard = crate::logging::setup(&lp, log_level)?;
         let col = 13usize;
         println!("  {}  {}", dim(&pad("listening", col)), green_bold(&format!("http://{host}:{port}")));
         println!("  {}  {}", dim(&pad("logs", col)), dim(&lp.display().to_string()));
@@ -649,6 +725,7 @@ async fn cmd_start(
     if let Some(ref p) = config_override { cmd.args(["--config", &p.display().to_string()]); }
     if let Some(ref h) = host_override   { cmd.args(["--host", h]); }
     if let Some(p) = port_override       { cmd.args(["--port", &p.to_string()]); }
+    if verbose                           { cmd.arg("--verbose"); }
     cmd.stdin(std::process::Stdio::null())
        .stdout(std::process::Stdio::null())
        .stderr(std::process::Stdio::null())
@@ -740,7 +817,7 @@ fn is_shunt_pid(pid: u32) -> bool {
 async fn cmd_restart(config_override: Option<PathBuf>) -> Result<()> {
     cmd_stop().await?;
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    cmd_start(config_override, None, None, false, false).await
+    cmd_start(config_override, None, None, false, false, false).await
 }
 
 // ---------------------------------------------------------------------------
@@ -761,14 +838,17 @@ async fn cmd_logs(_config_override: Option<PathBuf>, follow: bool, lines: usize)
     let file = std::fs::File::open(&log)?;
     let mut reader = BufReader::new(file);
 
-    // Collect all lines, print last N
-    let mut all_lines: Vec<String> = Vec::new();
+    // Use a ring buffer so we only keep the last N lines in memory
+    // regardless of how large the log file is.
+    let mut ring: std::collections::VecDeque<String> = std::collections::VecDeque::with_capacity(lines + 1);
     let mut line = String::new();
     while reader.read_line(&mut line)? > 0 {
-        all_lines.push(std::mem::take(&mut line));
+        if ring.len() >= lines {
+            ring.pop_front();
+        }
+        ring.push_back(std::mem::take(&mut line));
     }
-    let start = all_lines.len().saturating_sub(lines);
-    for l in &all_lines[start..] {
+    for l in &ring {
         print!("{l}");
     }
     std::io::stdout().flush().ok();
@@ -1582,13 +1662,14 @@ fn kill_port(port: u16) -> bool {
     any
 }
 
-/// Pad a string to width using spaces (ignores ANSI codes — use before coloring).
+/// Pad a string to display width using spaces (strips ANSI codes first; handles Unicode).
 fn pad(s: &str, width: usize) -> String {
-    let visible_len = strip_ansi(s).len();
-    if visible_len >= width {
+    use unicode_width::UnicodeWidthStr;
+    let visible_width = UnicodeWidthStr::width(strip_ansi(s).as_str());
+    if visible_width >= width {
         s.to_owned()
     } else {
-        format!("{s}{}", " ".repeat(width - visible_len))
+        format!("{s}{}", " ".repeat(width - visible_width))
     }
 }
 
@@ -1902,12 +1983,7 @@ fn extract_cloudflare_url(line: &str) -> Option<String> {
 }
 
 fn generate_remote_key() -> String {
-    let mut buf = [0u8; 16];
-    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-        use std::io::Read;
-        let _ = f.read_exact(&mut buf);
-    }
-    hex::encode(buf)
+    hex::encode(crate::oauth::rand_bytes::<16>())
 }
 
 fn extract_remote_key(config: &str) -> Option<String> {
