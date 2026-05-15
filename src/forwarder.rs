@@ -84,38 +84,9 @@ impl Forwarder {
             }
         }
 
-        // Inject the live OAuth Bearer token
-        upstream_headers.insert(
-            reqwest::header::HeaderName::from_static("authorization"),
-            reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
-                .context("invalid access token value")?,
-        );
-
-        // Required by Anthropic when authenticating with OAuth tokens
-        upstream_headers.insert(
-            reqwest::header::HeaderName::from_static("anthropic-dangerous-direct-browser-access"),
-            reqwest::header::HeaderValue::from_static("true"),
-        );
-
-        // Ensure oauth-2025-04-20 is present in anthropic-beta (required for OAuth tokens).
-        // Merge with any beta flags the client already sent.
-        let beta_key = reqwest::header::HeaderName::from_static("anthropic-beta");
-        let existing_beta = upstream_headers
-            .get(&beta_key)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_owned();
-        let merged_beta = if existing_beta.split(',').any(|s| s.trim() == "oauth-2025-04-20") {
-            existing_beta
-        } else if existing_beta.is_empty() {
-            "oauth-2025-04-20".to_owned()
-        } else {
-            format!("{existing_beta},oauth-2025-04-20")
-        };
-        upstream_headers.insert(
-            beta_key,
-            reqwest::header::HeaderValue::from_str(&merged_beta).unwrap(),
-        );
+        // Inject provider-specific auth headers (Bearer token + any required protocol headers).
+        account.provider.inject_auth_headers(&mut upstream_headers, token)
+            .context("failed to inject auth headers")?;
 
         let t0 = Instant::now();
         let upstream_resp = self

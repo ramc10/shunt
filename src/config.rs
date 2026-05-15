@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::oauth::OAuthCredential;
+use crate::provider::Provider;
 
 pub const APP_NAME: &str = "shunt";
 
@@ -147,6 +148,9 @@ struct RawAccount {
     name: String,
     #[serde(default = "default_plan_type")]
     plan_type: String,
+    /// "anthropic" (default) | "openai" / "codex"
+    #[serde(default)]
+    provider: Option<String>,
 }
 
 fn default_host() -> String { "127.0.0.1".into() }
@@ -196,6 +200,7 @@ impl Default for ServerConfig {
 pub struct AccountConfig {
     pub name: String,
     pub plan_type: String,
+    pub provider: Provider,
     /// `None` when the account is in config but has no credential yet.
     /// These accounts are shown in status but skipped during proxying.
     pub credential: Option<OAuthCredential>,
@@ -228,12 +233,21 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
     let raw: RawConfig = toml::from_str(&raw_text)
         .with_context(|| format!("Failed to parse config: {}", p.display()))?;
 
+    // Derive the default upstream URL from the first account's provider so that
+    // an all-OpenAI config automatically points at api.openai.com without any
+    // explicit `upstream_url` in the config file.
+    let default_upstream = raw.accounts.first()
+        .map(|a| a.provider.as_deref().map(Provider::from_str).unwrap_or_default())
+        .unwrap_or_default()
+        .default_upstream_url()
+        .to_owned();
+
     let upstream_url = raw
         .server
         .upstream_url
         .clone()
         .or_else(|| std::env::var("SHUNT_UPSTREAM_URL").ok())
-        .unwrap_or_else(|| "https://api.anthropic.com".into());
+        .unwrap_or(default_upstream);
 
     let relay_url = raw
         .server
@@ -262,21 +276,19 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
 
     let mut accounts = Vec::new();
     for a in &raw.accounts {
-        // Resolve credential: env var → credentials store → auto-import primary
-        let cred = if a.name == "main" || store.accounts.is_empty() {
-            // Try the canonical Claude Code credentials as fallback for the primary account
-            store
-                .accounts
-                .get(&a.name)
-                .cloned()
-                .or_else(crate::oauth::read_claude_credentials)
-        } else {
-            store.accounts.get(&a.name).cloned()
-        };
+        let provider = a.provider.as_deref().map(Provider::from_str).unwrap_or_default();
+
+        // Resolve credential: stored credential first, then auto-import from provider's local CLI.
+        let cred = store
+            .accounts
+            .get(&a.name)
+            .cloned()
+            .or_else(|| provider.read_local_credentials());
 
         accounts.push(AccountConfig {
             name: a.name.clone(),
             plan_type: a.plan_type.clone(),
+            provider,
             credential: cred,
         });
     }

@@ -17,6 +17,7 @@ use tokio::net::TcpListener;
 
 use shunt::config::{AccountConfig, Config, ServerConfig};
 use shunt::oauth::OAuthCredential;
+use shunt::provider::Provider;
 use shunt::proxy::create_app_with_state;
 use shunt::state::StateStore;
 
@@ -153,6 +154,7 @@ fn test_account() -> AccountConfig {
     AccountConfig {
         name: "test".into(),
         plan_type: "pro".into(),
+        provider: Provider::default(),
         credential: Some(test_credential()),
     }
 }
@@ -172,7 +174,8 @@ async fn setup(streaming: bool, upstream_status: u16) -> (TestServer, TestServer
         accounts: vec![test_account()],
         config_file: std::path::PathBuf::from("/dev/null"),
     };
-    let proxy = TestServer::start(create_app_with_state(cfg, StateStore::new_empty()).unwrap()).await;
+    let (app, _) = create_app_with_state(cfg, StateStore::new_empty()).unwrap();
+    let proxy = TestServer::start(app).await;
     (proxy, upstream, caps, Client::new())
 }
 
@@ -358,6 +361,7 @@ fn test_account2() -> AccountConfig {
     AccountConfig {
         name: "second".into(),
         plan_type: "pro".into(),
+        provider: Provider::default(),
         credential: Some(OAuthCredential {
             email: None,
             access_token: TEST_TOKEN_2.into(),
@@ -409,7 +413,8 @@ async fn setup_multi() -> (TestServer, TestServer, Captures, Client) {
         accounts: vec![test_account(), test_account2()],
         config_file: std::path::PathBuf::from("/dev/null"),
     };
-    let proxy = TestServer::start(create_app_with_state(cfg, StateStore::new_empty()).unwrap()).await;
+    let (app, _) = create_app_with_state(cfg, StateStore::new_empty()).unwrap();
+    let proxy = TestServer::start(app).await;
     (proxy, upstream, caps, Client::new())
 }
 
@@ -458,7 +463,8 @@ async fn test_stickiness_same_conversation() {
         accounts: vec![test_account(), test_account2()],
         config_file: std::path::PathBuf::from("/dev/null"),
     };
-    let proxy = TestServer::start(create_app_with_state(cfg, StateStore::new_empty()).unwrap()).await;
+    let (app, _) = create_app_with_state(cfg, StateStore::new_empty()).unwrap();
+    let proxy = TestServer::start(app).await;
     let client = Client::new();
 
     // Same system + first user message = same fingerprint
@@ -502,7 +508,8 @@ async fn test_all_accounts_exhausted_returns_503() {
         accounts: vec![test_account(), test_account2()],
         config_file: std::path::PathBuf::from("/dev/null"),
     };
-    let proxy = TestServer::start(create_app_with_state(cfg, StateStore::new_empty()).unwrap()).await;
+    let (app, _) = create_app_with_state(cfg, StateStore::new_empty()).unwrap();
+    let proxy = TestServer::start(app).await;
     let client = Client::new();
 
     let resp = client
@@ -603,7 +610,8 @@ async fn test_remote_key_auth() {
         accounts: vec![test_account()],
         config_file: std::path::PathBuf::from("/dev/null"),
     };
-    let proxy = TestServer::start(create_app_with_state(cfg, StateStore::new_empty()).unwrap()).await;
+    let (app, _) = create_app_with_state(cfg, StateStore::new_empty()).unwrap();
+    let proxy = TestServer::start(app).await;
     let client = Client::new();
     let body = r#"{"model":"claude-opus-4-5","max_tokens":1,"messages":[]}"#;
 
@@ -740,11 +748,12 @@ async fn test_live_api() {
             log_level: "error".into(),
             ..ServerConfig::default()
         },
-        accounts: vec![AccountConfig { name: "live".into(), plan_type: "pro".into(), credential: Some(credential) }],
+        accounts: vec![AccountConfig { name: "live".into(), plan_type: "pro".into(), provider: Provider::default(), credential: Some(credential) }],
         config_file: std::path::PathBuf::from("/dev/null"),
     };
 
-    let proxy = TestServer::start(create_app_with_state(cfg, StateStore::new_empty()).unwrap()).await;
+    let (app, _) = create_app_with_state(cfg, StateStore::new_empty()).unwrap();
+    let proxy = TestServer::start(app).await;
     let client = Client::new();
 
     let resp = client

@@ -83,8 +83,6 @@ fn spawn_daemon() {
         }
     };
 
-    let addr = load_addr();
-
     // Collect original args, replace "start" with "start --_daemon"
     let mut child_args: Vec<String> = std::env::args()
         .skip(1) // skip argv[0]
@@ -96,25 +94,40 @@ fn spawn_daemon() {
     use std::os::unix::process::CommandExt;
     let log_file2 = log_file.try_clone().ok();
 
-    let result = std::process::Command::new(&exe)
-        .args(&child_args)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::from(log_file))
-        .stderr(std::process::Stdio::from(log_file2.unwrap_or_else(|| {
-            std::fs::OpenOptions::new()
-                .create(true).append(true).open(&log_path).unwrap()
-        })))
-        // Detach from the current process group so SIGHUP doesn't reach child
-        .process_group(0)
-        .spawn();
+    let result = unsafe {
+        std::process::Command::new(&exe)
+            .args(&child_args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::from(log_file))
+            .stderr(std::process::Stdio::from(log_file2.unwrap_or_else(|| {
+                std::fs::OpenOptions::new()
+                    .create(true).append(true).open(&log_path).unwrap()
+            })))
+            // setsid() creates a new session: detaches from the controlling
+            // terminal entirely so the daemon survives terminal close / logout.
+            .pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            })
+            .spawn()
+    };
 
     match result {
         Ok(_child) => {
             println!();
-            println!("  {}  {}  {}",
-                brand_green("◆"),
-                bold_white("shunt"),
-                dim(&format!("started  ·  {addr}")));
+            for (i, (provider, addr)) in load_addrs().iter().enumerate() {
+                if i == 0 {
+                    println!("  {}  {}  {}",
+                        brand_green("◆"),
+                        bold_white("shunt"),
+                        dim(&format!("started  ·  {addr}")));
+                } else {
+                    println!("  {}           {}  {}",
+                        dim("·"),
+                        dim(&format!("[{provider}]")),
+                        dim(addr));
+                }
+            }
             println!("  {}  run {} for account details",
                 dim("·"), cyan("shunt status"));
             println!();
@@ -127,10 +140,28 @@ fn spawn_daemon() {
     }
 }
 
-fn load_addr() -> String {
-    if let Ok(cfg) = shunt::config::load_config(None) {
-        format!("http://{}:{}", cfg.server.host, cfg.server.port)
-    } else {
-        "http://127.0.0.1:8082".into()
-    }
+/// Returns `(provider_label, url)` for each provider found in the config.
+/// Falls back to just the Anthropic default if the config can't be loaded.
+fn load_addrs() -> Vec<(String, String)> {
+    use shunt::provider::Provider;
+
+    let Ok(cfg) = shunt::config::load_config(None) else {
+        return vec![("anthropic".into(), "http://127.0.0.1:8082".into())];
+    };
+
+    let host = &cfg.server.host;
+    let primary_port = cfg.server.port;
+
+    use std::collections::BTreeSet;
+    let providers: BTreeSet<String> = cfg.accounts.iter()
+        .map(|a| a.provider.to_string())
+        .collect();
+
+    providers.into_iter().map(|p| {
+        let port = match Provider::from_str(&p) {
+            Provider::Anthropic => primary_port,
+            other => other.default_port(),
+        };
+        (p, format!("http://{host}:{port}"))
+    }).collect()
 }

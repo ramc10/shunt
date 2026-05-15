@@ -4,6 +4,7 @@ pub mod forwarder;
 pub mod logging;
 pub mod monitor;
 pub mod oauth;
+pub mod provider;
 pub mod proxy;
 pub mod quota;
 pub mod router;

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{any, get, post};
 use axum::Router;
 use bytes::Bytes;
 use serde_json::json;
@@ -13,10 +13,11 @@ use tracing::{error, warn};
 
 use crate::config::{state_path, Config, CredentialsStore};
 use crate::forwarder::Forwarder;
-use crate::oauth::{refresh_token, OAuthCredential};
+use crate::oauth::OAuthCredential;
+use crate::provider::Provider;
 use crate::quota;
 use crate::router;
-use crate::state::{RateLimitInfo, StateStore};
+use crate::state::StateStore;
 
 #[derive(Clone)]
 struct AppState {
@@ -30,10 +31,17 @@ struct AppState {
 }
 
 pub fn create_app(config: Config) -> anyhow::Result<Router> {
-    create_app_with_state(config, StateStore::load(&state_path()))
+    let (app, _) = create_app_with_state(config, StateStore::load(&state_path()))?;
+    Ok(app)
 }
 
-pub fn create_app_with_state(config: Config, state: StateStore) -> anyhow::Result<Router> {
+/// Shared live credentials map — can be written to without restarting the proxy.
+pub type LiveCredentials = Arc<RwLock<HashMap<String, OAuthCredential>>>;
+
+pub fn create_app_with_state(
+    config: Config,
+    state: StateStore,
+) -> anyhow::Result<(Router, LiveCredentials)> {
     let forwarder = Forwarder::new(&config.server.upstream_url, config.server.request_timeout_secs)?;
 
     // Accounts with no credential are shown in status but skipped during routing.
@@ -42,7 +50,7 @@ pub fn create_app_with_state(config: Config, state: StateStore) -> anyhow::Resul
         state.set_auth_failed(&a.name);
     }
 
-    let credentials = Arc::new(RwLock::new(
+    let credentials: LiveCredentials = Arc::new(RwLock::new(
         config.accounts.iter()
             .filter_map(|a| a.credential.as_ref().map(|c| (a.name.clone(), c.clone())))
             .collect::<HashMap<_, _>>(),
@@ -52,19 +60,34 @@ pub fn create_app_with_state(config: Config, state: StateStore) -> anyhow::Resul
         config: Arc::new(config),
         forwarder: Arc::new(forwarder),
         state,
-        credentials,
+        credentials: Arc::clone(&credentials),
         started_ms: now_ms(),
+    };
+
+    // Register proxy routes appropriate for the provider.
+    // Anthropic: explicit paths only (maintains existing behaviour).
+    // OpenAI/others: wildcard catches all paths with any HTTP method.
+    let provider = app_state.config.accounts.first()
+        .map(|a| &a.provider)
+        .cloned()
+        .unwrap_or_default();
+
+    let proxy_routes = match provider {
+        Provider::Anthropic => Router::new()
+            .route("/v1/messages", post(proxy_handler))
+            .route("/v1/messages/count_tokens", post(proxy_handler)),
+        Provider::OpenAI => Router::new()
+            .route("/*path", any(proxy_handler)),
     };
 
     let app = Router::new()
         .route("/health", get(health))
         .route("/status", get(status_handler))
         .route("/use", post(use_handler))
-        .route("/v1/messages", post(proxy_handler))
-        .route("/v1/messages/count_tokens", post(proxy_handler))
+        .merge(proxy_routes)
         .with_state(app_state);
 
-    Ok(app)
+    Ok((app, credentials))
 }
 
 async fn health() -> impl IntoResponse {
@@ -242,17 +265,24 @@ async fn proxy_handler(
         match response.status().as_u16() {
             200..=299 => {
                 s.state.set_last_used(&account_name);
+                if let Some(info) = account.provider.parse_rate_limits(response.headers()) {
+                    s.state.update_rate_limits(&account_name, info);
+                }
                 return Ok(tap_usage(response, &s.state, &account_name, &model, req_start_ms).await);
             }
             429 => {
                 warn!(account = %account_name, "429 rate-limited — cooling 60s");
-                capture_rate_limit_headers(response.headers(), &s.state, &account_name);
+                if let Some(info) = account.provider.parse_rate_limits(response.headers()) {
+                    s.state.update_rate_limits(&account_name, info);
+                }
                 s.state.set_cooldown(&account_name, 60_000);
                 tried.insert(account_name);
             }
             529 => {
                 warn!(account = %account_name, "529 overloaded — cooling 30s");
-                capture_rate_limit_headers(response.headers(), &s.state, &account_name);
+                if let Some(info) = account.provider.parse_rate_limits(response.headers()) {
+                    s.state.update_rate_limits(&account_name, info);
+                }
                 s.state.set_cooldown(&account_name, 30_000);
                 tried.insert(account_name);
             }
@@ -270,7 +300,7 @@ async fn proxy_handler(
                     };
                     match tokio::time::timeout(
                         std::time::Duration::from_secs(10),
-                        refresh_token(&cred),
+                        account.provider.refresh_token(&cred),
                     ).await {
                         Ok(Ok(fresh)) => {
                             warn!(account = %account_name, "401 — token refreshed, retrying");
@@ -335,9 +365,6 @@ async fn tap_usage(
     use axum::body::Body;
     use crate::state::RequestLog;
 
-    // Capture rate-limit headers before the response is consumed
-    capture_rate_limit_headers(resp.headers(), state, account);
-
     if quota::is_streaming_response(&resp) {
         let state = state.clone();
         let account = account.to_owned();
@@ -379,68 +406,22 @@ async fn tap_usage(
     Response::from_parts(parts, Body::from(bytes))
 }
 
-fn capture_rate_limit_headers(headers: &axum::http::HeaderMap, state: &StateStore, account: &str) {
-    fn hdr_u64(headers: &axum::http::HeaderMap, name: &str) -> Option<u64> {
-        headers.get(name)?.to_str().ok()?.parse().ok()
-    }
-    fn hdr_f64(headers: &axum::http::HeaderMap, name: &str) -> Option<f64> {
-        headers.get(name)?.to_str().ok()?.parse().ok()
-    }
-    fn hdr_str(headers: &axum::http::HeaderMap, name: &str) -> Option<String> {
-        Some(headers.get(name)?.to_str().ok()?.to_owned())
-    }
-
-    // Claude Code OAuth uses anthropic-ratelimit-unified-* headers
-    let utilization_5h  = hdr_f64(headers, "anthropic-ratelimit-unified-5h-utilization");
-    let reset_5h        = hdr_u64(headers, "anthropic-ratelimit-unified-5h-reset");
-    let status_5h       = hdr_str(headers, "anthropic-ratelimit-unified-5h-status");
-    let utilization_7d  = hdr_f64(headers, "anthropic-ratelimit-unified-7d-utilization");
-    let reset_7d        = hdr_u64(headers, "anthropic-ratelimit-unified-7d-reset");
-    let status_7d       = hdr_str(headers, "anthropic-ratelimit-unified-7d-status");
-    let overage_status          = hdr_str(headers, "anthropic-ratelimit-unified-overage-status");
-    let overage_disabled_reason = hdr_str(headers, "anthropic-ratelimit-unified-overage-disabled-reason");
-    let representative_claim    = hdr_str(headers, "anthropic-ratelimit-unified-representative-claim");
-
-    if utilization_5h.is_some() || utilization_7d.is_some() {
-        state.update_rate_limits(account, RateLimitInfo {
-            utilization_5h,
-            reset_5h,
-            status_5h,
-            utilization_7d,
-            reset_7d,
-            status_7d,
-            overage_status,
-            overage_disabled_reason,
-            representative_claim,
-            updated_ms: now_ms(),
-        });
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Rate limit prefetch
 // ---------------------------------------------------------------------------
 
-/// For any account with no rate-limit data yet, make a cheap count_tokens
-/// call directly to the upstream API so we populate metrics without waiting
-/// for a real user request. Runs as a background task after startup.
+/// For any account with no rate-limit data yet, make a cheap request directly
+/// to the upstream API so we populate metrics without waiting for a real user
+/// request. Runs as a background task after startup.
 pub async fn prefetch_rate_limits(config: Arc<Config>, state: StateStore) {
-    let upstream = &config.server.upstream_url;
-    let url = format!("{upstream}/v1/messages");
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(20))
         .build()
         .unwrap_or_default();
 
-    // Minimal 1-token message — cheapest way to get the unified rate limit headers
-    let body = json!({
-        "model": "claude-haiku-4-5-20251001",
-        "max_tokens": 1,
-        "messages": [{"role": "user", "content": "hi"}]
-    });
-
     for account in &config.accounts {
-        // Skip if we already have data for this account
+        // Skip if we already have data for this account.
         let rl = state.rate_limit_snapshot();
         if let Some(r) = rl.get(&account.name) {
             if r.utilization_5h.is_some() || r.utilization_7d.is_some() {
@@ -448,28 +429,24 @@ pub async fn prefetch_rate_limits(config: Arc<Config>, state: StateStore) {
             }
         }
 
+        // Skip accounts with no credentials or no prefetch support.
         let creds = match account.credential.clone() {
             Some(c) => c,
-            None => continue, // no credential — skip prefetch
+            None => continue,
         };
-        let resp = client
-            .post(&url)
-            .header("authorization", format!("Bearer {}", creds.access_token))
-            .header("anthropic-version", "2023-06-01")
-            .header("anthropic-dangerous-direct-browser-access", "true")
-            .json(&body)
-            .send()
-            .await;
+        let Some((path, body)) = account.provider.prefetch_request() else { continue };
+        let url = format!("{}{}", config.server.upstream_url, path);
+
+        let resp = prefetch_send(&client, &url, &account.provider, &creds.access_token, &body).await;
 
         let r = match resp {
             Ok(r) => r,
-            Err(e) => { tracing::warn!(account = %account.name, "prefetch request failed: {e}"); continue; }
+            Err(e) => { tracing::warn!(account = %account.name, "prefetch failed: {e}"); continue; }
         };
 
         if r.status() == reqwest::StatusCode::UNAUTHORIZED {
-            // Token expired — try to refresh and retry once
             tracing::info!(account = %account.name, "prefetch: token expired, refreshing");
-            let fresh = match crate::oauth::refresh_token(&creds).await {
+            let fresh = match account.provider.refresh_token(&creds).await {
                 Ok(f) => f,
                 Err(e) => {
                     tracing::warn!(account = %account.name, "token refresh failed: {e}");
@@ -477,34 +454,48 @@ pub async fn prefetch_rate_limits(config: Arc<Config>, state: StateStore) {
                     continue;
                 }
             };
-            // Persist updated token
             let mut store = crate::config::CredentialsStore::load();
             store.accounts.insert(account.name.clone(), fresh.clone());
             store.save().ok();
 
-            let retry = client
-                .post(&url)
-                .header("authorization", format!("Bearer {}", fresh.access_token))
-                .header("anthropic-version", "2023-06-01")
-                .header("anthropic-dangerous-direct-browser-access", "true")
-                .json(&body)
-                .send()
-                .await;
-            match retry {
+            match prefetch_send(&client, &url, &account.provider, &fresh.access_token, &body).await {
                 Ok(r2) if r2.status() == reqwest::StatusCode::UNAUTHORIZED => {
-                    tracing::error!(account = %account.name, "401 after refresh — credentials need re-authorization");
+                    tracing::error!(account = %account.name, "401 after refresh — needs re-authorization");
                     state.set_auth_failed(&account.name);
                 }
                 Ok(r2) => {
-                    capture_rate_limit_headers(r2.headers(), &state, &account.name);
+                    if let Some(info) = account.provider.parse_rate_limits(r2.headers()) {
+                        state.update_rate_limits(&account.name, info);
+                    }
                 }
                 Err(e) => tracing::warn!(account = %account.name, "prefetch retry failed: {e}"),
             }
         } else {
             tracing::info!(account = %account.name, status = %r.status(), "prefetch response");
-            capture_rate_limit_headers(r.headers(), &state, &account.name);
+            if let Some(info) = account.provider.parse_rate_limits(r.headers()) {
+                state.update_rate_limits(&account.name, info);
+            }
         }
     }
+}
+
+/// Build and send a prefetch request for the given provider + token.
+async fn prefetch_send(
+    client: &reqwest::Client,
+    url: &str,
+    provider: &crate::provider::Provider,
+    token: &str,
+    body: &serde_json::Value,
+) -> anyhow::Result<reqwest::Response> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    provider.inject_auth_headers(&mut headers, token)?;
+    for (name, value) in provider.prefetch_extra_headers() {
+        headers.insert(
+            reqwest::header::HeaderName::from_bytes(name.as_bytes())?,
+            reqwest::header::HeaderValue::from_static(value),
+        );
+    }
+    Ok(client.post(url).headers(headers).json(body).send().await?)
 }
 
 // ---------------------------------------------------------------------------
@@ -533,5 +524,123 @@ impl IntoResponse for ProxyError {
             "type": "error",
             "error": {"type": "api_error", "message": msg}
         }))).into_response()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Recovery watcher — periodically retries token refresh for auth_failed accounts
+// ---------------------------------------------------------------------------
+
+/// Runs as a background task. Every 2 minutes, tries to refresh tokens for any
+/// auth_failed account. If refresh succeeds the account is brought back online
+/// without a process restart. If all accounts remain unrecoverable, fires a
+/// macOS notification (at most once per hour).
+pub async fn recovery_watcher(
+    config: Arc<Config>,
+    state: StateStore,
+    credentials: LiveCredentials,
+) {
+    use std::time::{Duration, Instant};
+    const CHECK_INTERVAL: Duration = Duration::from_secs(120);
+    const NOTIFY_COOLDOWN: Duration = Duration::from_secs(3600);
+
+    let account_names: Vec<String> = config.accounts.iter().map(|a| a.name.clone()).collect();
+    let mut last_notified: Option<Instant> = None;
+
+    loop {
+        tokio::time::sleep(CHECK_INTERVAL).await;
+
+        let name_refs: Vec<&str> = account_names.iter().map(String::as_str).collect();
+        let failed = state.auth_failed_accounts(&name_refs);
+        if failed.is_empty() {
+            last_notified = None;
+            continue;
+        }
+
+        tracing::warn!(
+            accounts = ?failed,
+            "recovery: {} account(s) auth_failed, attempting token refresh",
+            failed.len()
+        );
+
+        let mut any_recovered = false;
+
+        for name in &failed {
+            let cred = {
+                let map = credentials.read().await;
+                map.get(*name).cloned()
+            };
+            let Some(cred) = cred else { continue };
+            if cred.refresh_token.is_empty() { continue; }
+
+            let provider = config.accounts.iter()
+                .find(|a| a.name == *name)
+                .map(|a| a.provider.clone())
+                .unwrap_or_default();
+
+            let result = tokio::time::timeout(
+                Duration::from_secs(20),
+                provider.refresh_token(&cred),
+            ).await;
+
+            match result {
+                Ok(Ok(fresh)) => {
+                    tracing::info!(account = %name, "recovery: token refreshed — account back online");
+                    {
+                        let mut map = credentials.write().await;
+                        map.insert(name.to_string(), fresh.clone());
+                    }
+                    let name_owned = name.to_string();
+                    let fresh_owned = fresh.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let mut store = crate::config::CredentialsStore::load();
+                        store.accounts.insert(name_owned, fresh_owned);
+                        store.save().ok();
+                    });
+                    state.clear_auth_failed(name);
+                    any_recovered = true;
+                }
+                Ok(Err(e)) => {
+                    tracing::error!(account = %name, error = %e, "recovery: token refresh failed");
+                }
+                Err(_) => {
+                    tracing::error!(account = %name, "recovery: token refresh timed out");
+                }
+            }
+        }
+
+        if any_recovered {
+            tracing::info!("recovery: at least one account is back online");
+            continue;
+        }
+
+        // All accounts still auth_failed after refresh attempts — notify.
+        let still_failed = state.auth_failed_accounts(&name_refs);
+        if still_failed.len() == account_names.len() {
+            let should_notify = last_notified
+                .map(|t| t.elapsed() >= NOTIFY_COOLDOWN)
+                .unwrap_or(true);
+            if should_notify {
+                error!(
+                    "ALL accounts are offline (auth failed). \
+                     Run `shunt add-account` to re-authorize."
+                );
+                notify_all_accounts_offline();
+                last_notified = Some(Instant::now());
+            }
+        }
+    }
+}
+
+fn notify_all_accounts_offline() {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("osascript")
+            .args(["-e", concat!(
+                r#"display notification "#,
+                r#""All accounts have lost authentication. Run `shunt add-account` to re-authorize." "#,
+                r#"with title "shunt: All Accounts Offline" sound name "Basso""#
+            )])
+            .status();
     }
 }

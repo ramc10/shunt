@@ -73,6 +73,9 @@ enum Command {
         config: Option<PathBuf>,
         /// Name for this account (e.g. "secondary", "work"). Omit to auto-detect.
         name: Option<String>,
+        /// Provider for this account: "anthropic" (default) or "openai"
+        #[arg(long, default_value = "anthropic")]
+        provider: String,
     },
     /// Remove an account from the pool
     RemoveAccount {
@@ -163,7 +166,7 @@ pub async fn run() -> Result<()> {
         Command::Restart { config } => cmd_restart(config).await,
         Command::Status { config } => cmd_status(config).await,
         Command::Logs { config, follow, lines } => cmd_logs(config, follow, lines).await,
-        Command::AddAccount { config, name } => cmd_add_account(config, name).await,
+        Command::AddAccount { config, name, provider } => cmd_add_account(config, name, provider).await,
         Command::RemoveAccount { config, name } => cmd_remove_account(config, name).await,
         Command::Logout { config, name, all } => cmd_logout(config, name, all).await,
         Command::Monitor { config } => cmd_monitor(config).await,
@@ -265,7 +268,9 @@ pub async fn cmd_setup(config_override: Option<PathBuf>) -> Result<()> {
 // add-account
 // ---------------------------------------------------------------------------
 
-async fn cmd_add_account(config_override: Option<PathBuf>, name: Option<String>) -> Result<()> {
+async fn cmd_add_account(config_override: Option<PathBuf>, name: Option<String>, provider_str: String) -> Result<()> {
+    use crate::provider::Provider;
+    let provider = Provider::from_str(&provider_str);
     let config_p = config_override.clone().unwrap_or_else(config_path);
     if !config_p.exists() {
         bail!("No config found. Run `shunt setup` first.");
@@ -323,10 +328,16 @@ async fn cmd_add_account(config_override: Option<PathBuf>, name: Option<String>)
         String::new(),
     ]);
 
-    let mut cred = run_oauth_flow().await?;
+    let mut cred = match provider {
+        Provider::Anthropic => run_oauth_flow().await?,
+        Provider::OpenAI => crate::oauth::run_openai_oauth_flow().await?,
+    };
 
     // Fetch email (non-fatal)
-    let email = crate::oauth::fetch_account_email(&cred.access_token).await;
+    let email = match provider {
+        Provider::Anthropic => crate::oauth::fetch_account_email(&cred.access_token).await,
+        Provider::OpenAI => crate::oauth::fetch_openai_account_email(&cred.access_token).await,
+    };
     if let Some(ref e) = email {
         println!("  {} Account: {}", green(CHECK), bold(e));
     }
@@ -335,7 +346,14 @@ async fn cmd_add_account(config_override: Option<PathBuf>, name: Option<String>)
     // Only append to config if not already there
     if !already_in_config {
         let mut config_text = existing_config;
-        config_text.push_str(&format!("\n[[accounts]]\nname = \"{name}\"\nplan_type = \"pro\"\n"));
+        match provider {
+            Provider::Anthropic => config_text.push_str(&format!(
+                "\n[[accounts]]\nname = \"{name}\"\nplan_type = \"pro\"\n"
+            )),
+            Provider::OpenAI => config_text.push_str(&format!(
+                "\n[[accounts]]\nname = \"{name}\"\nplan_type = \"pro\"\nprovider = \"openai\"\n"
+            )),
+        }
         std::fs::write(&config_p, &config_text)?;
     }
 
@@ -629,7 +647,7 @@ async fn cmd_start(
                 if cred.needs_refresh() {
                     if let Ok(Ok(fresh)) = tokio::time::timeout(
                         std::time::Duration::from_secs(10),
-                        refresh_token(cred),
+                        account.provider.refresh_token(cred),
                     ).await {
                         let mut store = CredentialsStore::load();
                         store.accounts.insert(account.name.clone(), fresh.clone());
@@ -645,11 +663,8 @@ async fn cmd_start(
         crate::logging::prune_old_logs(&lp, 7);
         let _log_guard = crate::logging::setup(&lp, log_level)?;
         let state = crate::state::StateStore::load(&crate::config::state_path());
-        let app = crate::proxy::create_app_with_state(config.clone(), state.clone())?;
-        let listener = tokio::net::TcpListener::bind(format!("{}:{}", host, port)).await?;
         write_pid();
-        tokio::spawn(crate::proxy::prefetch_rate_limits(std::sync::Arc::new(config), state));
-        axum::serve(listener, app).await?;
+        serve_all_providers(config, state, &host, port).await?;
         return Ok(());
     }
 
@@ -686,7 +701,7 @@ async fn cmd_start(
                     std::io::stdout().flush().ok();
                     match tokio::time::timeout(
                         std::time::Duration::from_secs(10),
-                        refresh_token(cred),
+                        account.provider.refresh_token(cred),
                     ).await {
                         Ok(Ok(fresh)) => {
                             println!("{}", green("done"));
@@ -706,15 +721,14 @@ async fn cmd_start(
         crate::logging::prune_old_logs(&lp, 7);
         let _log_guard = crate::logging::setup(&lp, log_level)?;
         let col = 13usize;
-        println!("  {}  {}", dim(&pad("listening", col)), green_bold(&format!("http://{host}:{port}")));
+        for (p, addr) in listener_addrs(&config.accounts, &host, port) {
+            println!("  {}  {} {}", dim(&pad("listening", col)), dim(&format!("[{p}]")), green_bold(&addr));
+        }
         println!("  {}  {}", dim(&pad("logs", col)), dim(&lp.display().to_string()));
         println!();
         let state = crate::state::StateStore::load(&crate::config::state_path());
-        let app = crate::proxy::create_app_with_state(config.clone(), state.clone())?;
-        let listener = tokio::net::TcpListener::bind(format!("{}:{}", host, port)).await?;
         write_pid();
-        tokio::spawn(crate::proxy::prefetch_rate_limits(std::sync::Arc::new(config), state));
-        axum::serve(listener, app).await?;
+        serve_all_providers(config, state, &host, port).await?;
         return Ok(());
     }
 
@@ -1590,6 +1604,95 @@ fn util_bar(util: f64, width: usize) -> String {
 fn secs_until(epoch_secs: u64) -> Option<u64> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
     epoch_secs.checked_sub(now).filter(|&s| s > 0)
+}
+
+// ---------------------------------------------------------------------------
+// Multi-provider listener helpers
+// ---------------------------------------------------------------------------
+
+/// Returns `(provider_label, url)` pairs for every provider present in accounts,
+/// using `primary_port` for Anthropic and each provider's default port for others.
+fn listener_addrs(
+    accounts: &[crate::config::AccountConfig],
+    host: &str,
+    primary_port: u16,
+) -> Vec<(String, String)> {
+    use crate::provider::Provider;
+    use std::collections::BTreeSet;
+
+    let providers: BTreeSet<String> = accounts.iter()
+        .map(|a| a.provider.to_string())
+        .collect();
+
+    providers.into_iter().map(|p| {
+        let port = match Provider::from_str(&p) {
+            Provider::Anthropic => primary_port,
+            other => other.default_port(),
+        };
+        (p.clone(), format!("http://{host}:{port}"))
+    }).collect()
+}
+
+/// Bind a listener and spawn an axum server for each provider group found in
+/// `config.accounts`. All servers run concurrently; the function returns when
+/// the first one stops (error or clean shutdown).
+async fn serve_all_providers(
+    config: crate::config::Config,
+    state: crate::state::StateStore,
+    host: &str,
+    primary_port: u16,
+) -> anyhow::Result<()> {
+    use crate::config::{Config, ServerConfig};
+    use crate::provider::Provider;
+    use std::collections::HashMap;
+
+    // Group accounts by provider.
+    let mut by_provider: HashMap<String, Vec<crate::config::AccountConfig>> = HashMap::new();
+    for account in config.accounts {
+        by_provider.entry(account.provider.to_string()).or_default().push(account);
+    }
+
+    let mut handles = Vec::new();
+
+    for (provider_str, accounts) in by_provider {
+        let provider = Provider::from_str(&provider_str);
+        let port = match provider {
+            Provider::Anthropic => primary_port,
+            ref other => other.default_port(),
+        };
+
+        let provider_config = Config {
+            accounts,
+            server: ServerConfig {
+                host: host.to_owned(),
+                port,
+                upstream_url: provider.default_upstream_url().to_owned(),
+                ..config.server.clone()
+            },
+            config_file: config.config_file.clone(),
+        };
+
+        let (app, live_creds) = crate::proxy::create_app_with_state(provider_config.clone(), state.clone())?;
+        let listener = tokio::net::TcpListener::bind(format!("{host}:{port}"))
+            .await
+            .with_context(|| format!("cannot bind {host}:{port} for {provider_str} proxy"))?;
+
+        let cfg_arc = std::sync::Arc::new(provider_config);
+        tokio::spawn(crate::proxy::prefetch_rate_limits(cfg_arc.clone(), state.clone()));
+        tokio::spawn(crate::proxy::recovery_watcher(cfg_arc, state.clone(), live_creds));
+        handles.push(tokio::spawn(async move {
+            axum::serve(listener, app).await
+        }));
+    }
+
+    if handles.is_empty() {
+        return Ok(());
+    }
+
+    // Wait until the first listener stops, then exit (whole daemon restarts on error).
+    let (result, _idx, _rest) = futures_util::future::select_all(handles).await;
+    result??;
+    Ok(())
 }
 
 fn write_pid() {

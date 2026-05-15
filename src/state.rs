@@ -240,6 +240,27 @@ impl StateStore {
         self.persist();
     }
 
+    /// Clear auth_failed + disabled for an account after a successful token refresh.
+    pub fn clear_auth_failed(&self, name: &str) {
+        {
+            let mut data = self.inner.lock().unwrap();
+            if let Some(acc) = data.accounts.get_mut(name) {
+                acc.auth_failed = false;
+                acc.disabled = false;
+            }
+        }
+        self.persist();
+    }
+
+    /// Returns names of accounts (from the given list) that have auth_failed set.
+    pub fn auth_failed_accounts<'a>(&self, names: &[&'a str]) -> Vec<&'a str> {
+        let data = self.inner.lock().unwrap();
+        names.iter()
+            .filter(|&&n| data.accounts.get(n).map(|s| s.auth_failed).unwrap_or(false))
+            .copied()
+            .collect()
+    }
+
     // -----------------------------------------------------------------------
     // Stickiness (ephemeral — not persisted)
     // -----------------------------------------------------------------------
