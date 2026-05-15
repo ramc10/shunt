@@ -75,6 +75,7 @@ pub const DOT:     &str = "●";
 pub const EMPTY:   &str = "○";
 pub const DASH:    &str = "—";
 pub const ARROW:   &str = "→";
+pub const DIAMOND: &str = "◆";
 
 // ---------------------------------------------------------------------------
 // Layout helpers
@@ -85,10 +86,10 @@ pub fn rule(width: usize) -> String {
     dim(&"─".repeat(width))
 }
 
-/// Print a section header like:  ── ACCOUNTS ──────────────────
+/// Print a section header like:  ◆ Accounts  ─────────────────
 pub fn section(label: &str) {
-    let header = format!("{} {} {}", dim("──"), bold(label), dim(&"─".repeat(44 - label.len())));
-    println!("{header}");
+    let dashes = "─".repeat(44usize.saturating_sub(label.len() + 4));
+    println!("  {}  {}  {}", bold_white("◆"), bold(label), dim(&dashes));
 }
 
 /// Format a duration in ms dynamically:
@@ -166,7 +167,7 @@ pub fn select(prompt: &str, items: &[SelectItem], initial: usize) -> Option<Stri
         let _ = write!(out, "\r\n  {prompt}\r\n\r\n");
         for (i, item) in items.iter().enumerate() {
             if i == sel {
-                let _ = write!(out, "  \x1b[1;36m▶\x1b[0m  \x1b[1m{}\x1b[0m\r\n", item.label);
+                let _ = write!(out, "  \x1b[1;32m◆\x1b[0m  \x1b[1m{}\x1b[0m\r\n", item.label);
             } else {
                 let _ = write!(out, "     {}\r\n", item.label);
             }

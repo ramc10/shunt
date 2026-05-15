@@ -1,3 +1,5 @@
+use shunt::term::{bold_white, brand_green, cyan, dim};
+
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let is_start = args.iter().any(|a| a == "start");
@@ -109,8 +111,12 @@ fn spawn_daemon() {
     match result {
         Ok(_child) => {
             println!();
-            println!("  shunt started  ·  {addr}");
-            println!("  shunt status   to see live info");
+            println!("  {}  {}  {}",
+                brand_green("◆"),
+                bold_white("shunt"),
+                dim(&format!("started  ·  {addr}")));
+            println!("  {}  run {} for account details",
+                dim("·"), cyan("shunt status"));
             println!();
             std::process::exit(0);
         }

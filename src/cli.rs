@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::{config_path, config_template, credentials_path, log_path, pid_path, CredentialsStore};
 use crate::oauth::{claude_credentials_path, read_claude_credentials, refresh_token, revoke_token, run_oauth_flow};
-use crate::term::{self, bold, bold_white, brand_green, cyan, dark_green, dim, green, green_bold, red, yellow, CHECK, CROSS, DOT, EMPTY};
+use crate::term::{self, bold, bold_white, brand_green, cyan, dark_green, dim, green, green_bold, red, yellow, CHECK, CROSS, DIAMOND, DOT, EMPTY};
 
 #[derive(Parser)]
 #[command(name = "shunt", about = "Local Claude Code account-pooling proxy", version)]
@@ -1191,8 +1191,10 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
 
     // Pinned notice
     if let Some(ref pinned) = pinned_account {
-        println!("  {} Pinned to {}  {}", yellow("◆"), bold(pinned),
-            dim("· shunt use auto to restore"));
+        println!("  {}  pinned to {}",
+            yellow(DIAMOND), bold(pinned));
+        println!("  {}  run {} to restore auto routing",
+            dim("·"), cyan("shunt use auto"));
         println!();
     }
 
@@ -1232,25 +1234,22 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
         let is_pinned  = pinned_account.as_deref() == Some(&acc.name);
         let is_last    = !is_pinned && last_used_account.as_deref() == Some(&acc.name);
         let (routing_tag, tag_vis_len): (String, usize) = if is_pinned {
-            (format!("  {}", yellow("▶ pinned")), 11)
+            (format!("  {}", yellow("pinned")), 8)
         } else if is_last {
-            (format!("  {}", green("▶ last routed")), 16)
+            (format!("  {}", green("active")), 8)
         } else {
             (String::new(), 0)
         };
 
-        // ── card top border (name + tag + plan) ─────────────
-        println!("{}", card_top(&acc.name, &green_bold(&acc.name), &routing_tag, tag_vis_len, plan_label));
+        // ── account header (name + tag + plan) ──────────────
+        println!("{}", card_header(&acc.name, &green_bold(&acc.name), &routing_tag, tag_vis_len, plan_label));
 
         // ── email row ────────────────────────────────────────
         if !email_str.is_empty() {
             println!("{}", card_row(&dim(email_str)));
-        } else {
-            println!("{}", card_row(&dim("—")));
         }
 
-        // ── divider ──────────────────────────────────────────
-        println!("{}", card_divider());
+        println!();
 
         // ── status + token count ─────────────────────────────
         let status_line = format!("{}  {}{}", status_icon, status_text, tokens_str);
@@ -1308,8 +1307,9 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
             println!("{}", card_row(&dim("· no rate-limit data yet — make a request first")));
         }
 
-        // ── card bottom border ───────────────────────────────
-        println!("{}", card_bottom());
+        // ── separator ────────────────────────────────────────
+        println!();
+        println!("{}", card_sep());
         println!();
     }
 
@@ -1360,7 +1360,7 @@ async fn cmd_use(config_override: Option<PathBuf>, account: Option<String>) -> R
         };
 
         let email = a.credential.as_ref().and_then(|c| c.email.as_deref()).unwrap_or("");
-        let pin = if is_pinned { format!("  {}", yellow("▶ active")) } else { String::new() };
+        let pin = if is_pinned { format!("  {}", yellow("pinned")) } else { String::new() };
 
         term::SelectItem {
             label: format!("{}  {}  {}{}", bold(&pad(&a.name, 12)), dim(&pad(email, 32)), status_str, pin),
@@ -1368,7 +1368,7 @@ async fn cmd_use(config_override: Option<PathBuf>, account: Option<String>) -> R
         }
     }).collect();
 
-    let auto_marker = if current_pinned.is_none() { format!("  {}", yellow("▶ active")) } else { String::new() };
+    let auto_marker = if current_pinned.is_none() { format!("  {}", yellow("active")) } else { String::new() };
     items.push(term::SelectItem {
         label: format!("{}  {}{}", bold(&pad("auto", 12)), dim("least-utilization routing"), auto_marker),
         value: "auto".to_owned(),
@@ -1466,27 +1466,20 @@ fn futures_executor_hack(resp: reqwest::Response) -> Option<serde_json::Value> {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Signal-lamp mascot splash — a railway signal post above a junction base.
-///
-///   ◉                    ← brand-green lamp
-///   ┃  shunt  v0.1.x     ← dark-green post + title
-///   ┃  Setup             ← post + subtitle
-///   ━━┻━━━━━━━━━━━━━━    ← junction base
+/// Clean header: ◆ followed by title and optional subtitle, then a rule.
 fn print_splash(info: &[String]) {
     println!();
     let title    = info.get(0).map(|s| s.as_str()).unwrap_or("");
     let subtitle = info.get(1).map(|s| s.as_str()).unwrap_or("");
 
-    let content_w = strip_ansi(title).chars().count()
-        .max(strip_ansi(subtitle).chars().count())
-        .max(20);
-
-    println!("  {}", brand_green("◉"));
-    println!("  {}  {}", dark_green("┃"), title);
+    println!("  {}  {}", brand_green(DIAMOND), title);
     if !subtitle.is_empty() {
-        println!("  {}  {}", dark_green("┃"), subtitle);
+        println!("       {}", subtitle);
     }
-    println!("  {}", dark_green(&format!("━━┻{}", "━".repeat(content_w + 2))));
+    let w = strip_ansi(title).chars().count()
+        .max(strip_ansi(subtitle).chars().count())
+        .max(18) + 3;
+    println!("  {}", dim(&"─".repeat(w)));
     println!();
 }
 
@@ -1494,124 +1487,91 @@ fn print_splash(info: &[String]) {
 // Account card helpers  (used by cmd_status)
 // ---------------------------------------------------------------------------
 
-/// Inner content width for account cards (chars between the padding and the border).
-const CARD_W: usize = 50;
+/// Target visible width for account header lines and separators.
+const CARD_W: usize = 58;
 
-/// A full-width content row inside a card: "  │  <content><pad>  │"
+/// Account header: "  ◆  name  tag                     Plan"
+fn card_header(name: &str, name_c: &str, routing_tag: &str, tag_vis: usize, plan: &str) -> String {
+    // Visible prefix: "  ◆  " = 5, then name (name.len()), then tag (tag_vis)
+    let left_vis = 5 + name.len() + tag_vis;
+    let gap = CARD_W.saturating_sub(left_vis + plan.len());
+    format!("  {}  {}{}{}{}", brand_green(DIAMOND), name_c, routing_tag, " ".repeat(gap), dim(plan))
+}
+
+/// An indented content row: "    content"
 fn card_row(content: &str) -> String {
-    let vis = strip_ansi(content).chars().count();
-    let pad = CARD_W.saturating_sub(vis);
-    format!("  {}  {}{}  {}", dark_green("│"), content, " ".repeat(pad), dark_green("│"))
+    format!("    {content}")
 }
 
-/// Top border with account name, routing tag, and plan type embedded.
-///
-///   ╭── main  ▶ last routed ──────── Claude Pro ──╮
-fn card_top(name: &str, name_c: &str, routing_tag: &str, tag_vis: usize, plan: &str) -> String {
-    // total dashes between ╭ and ╮ = CARD_W + 4
-    // layout: "── " + name + tag + " " + dashes + " " + plan + " ──"
-    let fixed = 3 + name.len() + tag_vis + 2 + plan.len() + 3;
-    let gap = (CARD_W + 4).saturating_sub(fixed);
-    format!(
-        "  {}── {}{} {} {} ──{}",
-        dark_green("╭"),
-        name_c,
-        routing_tag,
-        dark_green(&"─".repeat(gap)),
-        dim(plan),
-        dark_green("╮"),
-    )
+/// Thin separator line between accounts.
+fn card_sep() -> String {
+    format!("  {}", dim(&"─".repeat(CARD_W - 2)))
 }
 
-fn card_divider() -> String {
-    format!("  {}{}{}",
-        dark_green("├"),
-        dark_green(&"─".repeat(CARD_W + 4)),
-        dark_green("┤"),
-    )
-}
-
-fn card_bottom() -> String {
-    format!("  {}{}{}",
-        dark_green("╰"),
-        dark_green(&"─".repeat(CARD_W + 4)),
-        dark_green("╯"),
-    )
-}
-
-/// Dynamic routing diagram — account names in bold green, chrome in dark green.
+/// Routing diagram — account names in bold green, connectors in dark green.
 ///
 /// 1 account:           2 accounts:          3+ accounts:
-///   main ━━▶ [info]     main ━┓              main ━┓
-///                             ┣━━▶ [info]    work ━╋━━▶ [info]
-///                       work ━┛              sec  ━┛
+///   main  ─→  [info]    main ─┐ →  [info]    main ─┐
+///             [info1]   work ─┘     [info1]   work ─┼─→  [info]
+///                                             sec  ─┘     [info1]
 fn print_routing_header(account_names: &[&str], info: &[String]) {
     println!();
     let n = account_names.len();
     let name_w = account_names.iter().map(|s| s.len()).max().unwrap_or(4);
     let info0 = info.get(0).map(|s| s.as_str()).unwrap_or("");
+    let info1 = info.get(1).map(|s| s.as_str()).unwrap_or("");
 
-    // extra_indent = chars before info0 starts (for aligning continuation lines)
-    // layout: "  " + name_w + "  " + junction + "  "
-    // junction widths: "━━▶"=3, "┣━━▶"=4, "━╋━━▶"=5
-    let (extra_indent, lines): (usize, Vec<String>) = match n {
+    match n {
         0 => {
-            // No accounts — reuse the boxed mascot splash
-            let title    = info.get(0).map(|s| s.as_str()).unwrap_or("");
-            let subtitle = info.get(1).map(|s| s.as_str()).unwrap_or("");
-            let m1 = dark_green("  ━━┓");
-            let m2 = format!("    {}  {}", dark_green("┣━▶"), title);
-            let m3 = format!("{}   {}", dark_green("  ━━┛"), subtitle);
-            let cw = 9usize.saturating_add(strip_ansi(title).chars().count()).max(26);
-            let hbar = "─".repeat(cw + 4);
-            let row = |c: &str, v: usize| {
-                format!("{}  {}{}  {}", dark_green("│"), c, " ".repeat(cw.saturating_sub(v)), dark_green("│"))
-            };
-            println!("  {}", dark_green(&format!("╭{hbar}╮")));
-            println!("  {}", row(&m1, 5));
-            println!("  {}", row(&m2, 9 + strip_ansi(title).chars().count()));
-            println!("  {}", row(&m3, 8 + strip_ansi(subtitle).chars().count()));
-            println!("  {}", dark_green(&format!("╰{hbar}╯")));
-            println!();
-            return;
+            // No accounts yet — clean two-line header
+            println!("  {}  {}", brand_green(DIAMOND), info0);
+            if !info1.is_empty() {
+                println!("       {}", info1);
+            }
         }
         1 => {
-            (name_w + 7, vec![
-                format!("  {}  {}  {}", green_bold(account_names[0]), dark_green("━━▶"), info0),
-            ])
+            // "  name  ─→  info0"  (info1 indented to same column)
+            let indent = name_w + 8; // 2 + name + 2 + "─→" + 2
+            println!("  {}  {}  {}", green_bold(account_names[0]), dark_green("─→"), info0);
+            if !info1.is_empty() {
+                println!("  {}{}", " ".repeat(indent), info1);
+            }
         }
         2 => {
-            (name_w + 8, vec![
-                format!("  {}  {}", green_bold(&pad(account_names[0], name_w)), dark_green("━┓")),
-                format!("  {}  {}  {}", " ".repeat(name_w), dark_green("┣━━▶"), info0),
-                format!("  {}  {}", green_bold(&pad(account_names[1], name_w)), dark_green("━┛")),
-            ])
+            // "  name0 ─┐ →  info0"
+            // "  name1 ─┘     info1"
+            println!("  {}  {} {}  {}",
+                green_bold(&pad(account_names[0], name_w)),
+                dark_green("─┐"), dark_green("→"), info0);
+            println!("  {}  {}    {}",
+                green_bold(&pad(account_names[1], name_w)),
+                dark_green("─┘"), info1);
         }
         3 => {
-            (name_w + 9, vec![
-                format!("  {}  {}", green_bold(&pad(account_names[0], name_w)), dark_green("━┓")),
-                format!("  {}  {}  {}", green_bold(&pad(account_names[1], name_w)), dark_green("━╋━━▶"), info0),
-                format!("  {}  {}", green_bold(&pad(account_names[2], name_w)), dark_green("━┛")),
-            ])
+            // "  name0 ─┐"
+            // "  name1 ─┼─→  info0"
+            // "  name2 ─┘     info1"
+            println!("  {}  {}", green_bold(&pad(account_names[0], name_w)), dark_green("─┐"));
+            println!("  {}  {}  {}",
+                green_bold(&pad(account_names[1], name_w)),
+                dark_green("─┼─→"), info0);
+            println!("  {}  {}    {}",
+                green_bold(&pad(account_names[2], name_w)),
+                dark_green("─┘"), info1);
         }
         _ => {
+            // "  name0      ─┐"
+            // "  + N more   ─┼─→  info0"
+            // "  nameN      ─┘     info1"
             let more = dim(&pad(&format!("+ {} more", n - 2), name_w));
-            (name_w + 9, vec![
-                format!("  {}  {}", green_bold(&pad(account_names[0], name_w)), dark_green("━┓")),
-                format!("  {}  {}  {}", more, dark_green("━╋━━▶"), info0),
-                format!("  {}  {}", green_bold(&pad(account_names[n - 1], name_w)), dark_green("━┛")),
-            ])
+            println!("  {}  {}", green_bold(&pad(account_names[0], name_w)), dark_green("─┐"));
+            println!("  {}  {}  {}", more, dark_green("─┼─→"), info0);
+            println!("  {}  {}    {}",
+                green_bold(&pad(account_names[n - 1], name_w)),
+                dark_green("─┘"), info1);
         }
-    };
+    }
 
-    for line in &lines {
-        println!("{line}");
-    }
-    for extra in info.iter().skip(1) {
-        if !extra.is_empty() {
-            println!("  {}{extra}", " ".repeat(extra_indent));
-        }
-    }
     println!();
 }
 

@@ -80,14 +80,14 @@ struct ReqLog {
 // Colours
 // ---------------------------------------------------------------------------
 
-const GREEN:    Color = Color::Rgb(0, 170, 0);
-const DK_GREEN: Color = Color::Rgb(0, 100, 0);
-const BRAND:    Color = Color::Rgb(34, 139, 34);
-const DIM:      Color = Color::Rgb(100, 100, 100);
-const YELLOW:   Color = Color::Yellow;
-const RED:      Color = Color::Red;
-const WHITE:    Color = Color::White;
-const CYAN:     Color = Color::Cyan;
+const GREEN:    Color = Color::Rgb(34, 197, 94);
+const DK_GREEN: Color = Color::Rgb(22, 101, 52);
+const BRAND:    Color = Color::Rgb(34, 197, 94);
+const DIM:      Color = Color::Rgb(120, 120, 120);
+const YELLOW:   Color = Color::Rgb(251, 191, 36);
+const RED:      Color = Color::Rgb(239, 68, 68);
+const WHITE:    Color = Color::Rgb(229, 229, 229);
+const CYAN:     Color = Color::Rgb(103, 190, 255);
 
 fn style_brand()   -> Style { Style::default().fg(BRAND).add_modifier(Modifier::BOLD) }
 fn style_green()   -> Style { Style::default().fg(GREEN) }
@@ -97,6 +97,7 @@ fn style_yellow()  -> Style { Style::default().fg(YELLOW) }
 fn style_red()     -> Style { Style::default().fg(RED) }
 fn style_white()   -> Style { Style::default().fg(WHITE) }
 fn style_cyan()    -> Style { Style::default().fg(CYAN) }
+#[allow(dead_code)]
 fn style_bold()    -> Style { Style::default().add_modifier(Modifier::BOLD) }
 
 // ---------------------------------------------------------------------------
@@ -334,10 +335,10 @@ fn draw_header(f: &mut Frame, area: Rect, state: &Option<StatusResponse>) {
         });
 
     let mut spans = vec![
-        Span::styled("◉ ", style_brand()),
+        Span::styled(" ◆ ", style_brand()),
         Span::styled("shunt", style_brand()),
         Span::styled("  monitor", style_dim()),
-        Span::styled("  ·  live", Style::default().fg(GREEN).add_modifier(Modifier::BOLD)),
+        Span::styled("  ·  live", Style::default().fg(GREEN)),
     ];
     if let Some(ref u) = uptime_span {
         spans.push(Span::styled(u.as_str(), style_dim()));
@@ -351,33 +352,41 @@ fn draw_header(f: &mut Frame, area: Rect, state: &Option<StatusResponse>) {
     f.render_widget(p, area);
 }
 
+fn sep() -> Span<'static> { Span::styled("  ·  ", Style::default().fg(DIM)) }
+
 fn draw_footer(f: &mut Frame, area: Rect, picker_open: bool, refresh_ms: u64) {
     let hint = if picker_open {
         Line::from(vec![
-            Span::styled(" ↑↓", style_green()),
-            Span::styled(" navigate  ", style_dim()),
+            Span::styled(" ↑↓ navigate", style_dim()),
+            sep(),
             Span::styled("enter", style_green()),
-            Span::styled(" pin  ", style_dim()),
+            Span::styled(" pin", style_dim()),
+            sep(),
             Span::styled("esc", style_green()),
             Span::styled(" cancel", style_dim()),
         ])
     } else {
         let rate_str = if refresh_ms < 1_000 {
-            format!("  {}ms", refresh_ms)
+            format!("{}ms", refresh_ms)
         } else {
-            format!("  {}s", refresh_ms / 1_000)
+            format!("{}s", refresh_ms / 1_000)
         };
         Line::from(vec![
             Span::styled(" q", style_green()),
-            Span::styled(" quit  ", style_dim()),
+            Span::styled(" quit", style_dim()),
+            sep(),
             Span::styled("r", style_green()),
-            Span::styled(" refresh  ", style_dim()),
+            Span::styled(" refresh", style_dim()),
+            sep(),
             Span::styled("u", style_green()),
-            Span::styled(" pin  ", style_dim()),
+            Span::styled(" pin", style_dim()),
+            sep(),
             Span::styled("+/-", style_green()),
-            Span::styled(format!(" speed{rate_str}  "), style_dim()),
+            Span::styled(format!(" speed  {rate_str}"), style_dim()),
+            sep(),
             Span::styled("?", style_green()),
-            Span::styled(" help  ", style_dim()),
+            Span::styled(" help", style_dim()),
+            sep(),
             Span::styled("↑↓", style_green()),
             Span::styled(" scroll", style_dim()),
         ])
@@ -398,19 +407,16 @@ fn draw_connecting(
             Line::from(vec![
                 Span::styled(SPINNER[frame], style_dim()),
                 Span::styled(
-                    format!("  waiting for proxy at {base_url}  ·  run shunt start"),
+                    format!("  waiting for proxy  ·  run shunt start"),
                     style_dim(),
                 ),
             ])
         }
         Some(FetchError::Other(msg)) => Line::from(vec![
             Span::styled("✗ ", style_red()),
-            Span::styled(
-                format!("Cannot reach {base_url} — {msg}"),
-                style_dim(),
-            ),
+            Span::styled(format!("cannot reach {base_url}  ·  {msg}"), style_dim()),
         ]),
-        None => Line::from(Span::styled("Connecting…", style_dim())),
+        None => Line::from(Span::styled("connecting…", style_dim())),
     };
 
     let p = Paragraph::new(msg)
@@ -432,9 +438,7 @@ fn draw_body(f: &mut Frame, area: Rect, s: &StatusResponse, scroll: usize) {
 fn draw_accounts(f: &mut Frame, area: Rect, s: &StatusResponse) {
     let block = Block::default()
         .title(Line::from(vec![
-            Span::styled("── ", style_dkgreen()),
-            Span::styled("ACCOUNTS", style_bold()),
-            Span::styled(" ──────────────────", style_dkgreen()),
+            Span::styled(" accounts", style_dim()),
         ]))
         .borders(Borders::RIGHT)
         .border_style(style_dkgreen());
@@ -443,7 +447,7 @@ fn draw_accounts(f: &mut Frame, area: Rect, s: &StatusResponse) {
     f.render_widget(block, area);
 
     if s.accounts.is_empty() {
-        let p = Paragraph::new(Line::from(Span::styled("No accounts configured.", style_dim())));
+        let p = Paragraph::new(Line::from(Span::styled("  no accounts configured", style_dim())));
         f.render_widget(p, inner);
         return;
     }
@@ -455,9 +459,9 @@ fn draw_accounts(f: &mut Frame, area: Rect, s: &StatusResponse) {
 
     for acc in &s.accounts {
         let routing_tag = if acc.name == pinned {
-            Span::styled(" [pinned]", style_yellow())
+            Span::styled("  pinned", style_yellow())
         } else if acc.name == last {
-            Span::styled(" [active]", style_green())
+            Span::styled("  active", style_green())
         } else {
             Span::raw("")
         };
@@ -526,7 +530,7 @@ fn util_bar_line(label: &'static str, util: f64, reset: Option<u64>) -> Line<'st
     Line::from(vec![
         Span::styled(format!("   {label} "), style_dim()),
         Span::styled(bar, Style::default().fg(bar_color)),
-        Span::styled(format!(" {pct}"), style_dim()),
+        Span::styled(format!(" {pct}"), Style::default().fg(bar_color)),
         Span::styled(reset_str, style_dim()),
     ])
 }
@@ -548,10 +552,8 @@ fn draw_request_log(f: &mut Frame, area: Rect, s: &StatusResponse, scroll: usize
 
     let block = Block::default()
         .title(Line::from(vec![
-            Span::styled("── ", style_dkgreen()),
-            Span::styled("RECENT REQUESTS", style_bold()),
+            Span::styled(" requests", style_dim()),
             Span::styled(rate_str, style_dim()),
-            Span::styled(" ──────────────────", style_dkgreen()),
         ]))
         .borders(Borders::NONE);
 
@@ -559,7 +561,7 @@ fn draw_request_log(f: &mut Frame, area: Rect, s: &StatusResponse, scroll: usize
     f.render_widget(block, area);
 
     if s.recent_requests.is_empty() {
-        let p = Paragraph::new(Line::from(Span::styled("  No requests yet.", style_dim())));
+        let p = Paragraph::new(Line::from(Span::styled("  no requests yet", style_dim())));
         f.render_widget(p, inner);
         return;
     }
@@ -627,9 +629,7 @@ fn draw_picker(f: &mut Frame, picker: &Picker, area: Rect) {
 
     let block = Block::default()
         .title(Line::from(vec![
-            Span::styled("── ", style_dkgreen()),
-            Span::styled("PIN ACCOUNT", style_bold()),
-            Span::styled(" ──", style_dkgreen()),
+            Span::styled(" pin account ", style_dim()),
         ]))
         .borders(Borders::ALL)
         .border_style(style_dkgreen());
@@ -640,9 +640,9 @@ fn draw_picker(f: &mut Frame, picker: &Picker, area: Rect) {
     let rows: Vec<Row> = picker.items.iter().enumerate().map(|(i, item)| {
         let is_sel = i == picker.cursor;
         let label = if item == "auto" {
-            format!("  {} auto routing", if is_sel { "▶" } else { " " })
+            format!("  {} auto routing", if is_sel { "◆" } else { " " })
         } else {
-            format!("  {} {}", if is_sel { "▶" } else { " " }, item)
+            format!("  {} {}", if is_sel { "◆" } else { " " }, item)
         };
         let style = if is_sel {
             Style::default().fg(GREEN).add_modifier(Modifier::BOLD)
@@ -683,9 +683,7 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
 
     let block = Block::default()
         .title(Line::from(vec![
-            Span::styled("── ", style_dkgreen()),
-            Span::styled("KEYBOARD SHORTCUTS", style_bold()),
-            Span::styled(" ──", style_dkgreen()),
+            Span::styled(" shortcuts ", style_dim()),
         ]))
         .borders(Borders::ALL)
         .border_style(style_dkgreen());
