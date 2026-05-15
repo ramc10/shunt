@@ -71,11 +71,11 @@ enum Command {
     AddAccount {
         #[arg(long)]
         config: Option<PathBuf>,
-        /// Name for this account (e.g. "secondary", "work"). Omit to auto-detect.
+        /// Name for this account (e.g. "secondary", "work"). Prompted if omitted.
         name: Option<String>,
-        /// Provider for this account: "anthropic" (default) or "openai"
-        #[arg(long, default_value = "anthropic")]
-        provider: String,
+        /// Provider: "anthropic" or "openai". Prompted interactively if omitted.
+        #[arg(long)]
+        provider: Option<String>,
     },
     /// Remove an account from the pool
     RemoveAccount {
@@ -166,7 +166,7 @@ pub async fn run() -> Result<()> {
         Command::Restart { config } => cmd_restart(config).await,
         Command::Status { config } => cmd_status(config).await,
         Command::Logs { config, follow, lines } => cmd_logs(config, follow, lines).await,
-        Command::AddAccount { config, name, provider } => cmd_add_account(config, name, provider).await,
+        Command::AddAccount { config, name, provider } => cmd_add_account(config, name, provider.as_deref()).await,
         Command::RemoveAccount { config, name } => cmd_remove_account(config, name).await,
         Command::Logout { config, name, all } => cmd_logout(config, name, all).await,
         Command::Monitor { config } => cmd_monitor(config).await,
@@ -268,82 +268,116 @@ pub async fn cmd_setup(config_override: Option<PathBuf>) -> Result<()> {
 // add-account
 // ---------------------------------------------------------------------------
 
-async fn cmd_add_account(config_override: Option<PathBuf>, name: Option<String>, provider_str: String) -> Result<()> {
+async fn cmd_add_account(
+    config_override: Option<PathBuf>,
+    name_arg: Option<String>,
+    provider_arg: Option<&str>,
+) -> Result<()> {
     use crate::provider::Provider;
-    let provider = Provider::from_str(&provider_str);
+
     let config_p = config_override.clone().unwrap_or_else(config_path);
     if !config_p.exists() {
         bail!("No config found. Run `shunt setup` first.");
     }
 
+    print_splash(&[
+        format!("{}  {}", brand_green("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
+        "Add account".to_string(),
+        String::new(),
+    ]);
+
+    // ── Step 1: choose provider ──────────────────────────────────────────────
+    let provider = if let Some(p) = provider_arg {
+        Provider::from_str(p)
+    } else {
+        let items = vec![
+            term::SelectItem {
+                label: format!("{}  {}",
+                    bold("Claude Code"),
+                    dim("(claude.ai — Anthropic)")),
+                value: "anthropic".into(),
+            },
+            term::SelectItem {
+                label: format!("{}  {}",
+                    bold("Codex"),
+                    dim("(chatgpt.com — OpenAI)")),
+                value: "openai".into(),
+            },
+        ];
+        match term::select("Which provider?", &items, 0) {
+            Some(v) => Provider::from_str(&v),
+            None => return Ok(()),
+        }
+    };
+
+    println!();
+
+    // ── Step 2: choose name ──────────────────────────────────────────────────
     let existing_config = std::fs::read_to_string(&config_p)?;
     let store = CredentialsStore::load();
 
-    // Resolve name: if not given, find accounts missing credentials or let user pick
-    let (name, already_in_config) = if let Some(n) = name {
+    let (name, already_in_config) = if let Some(n) = name_arg {
         let in_config = existing_config.contains(&format!("name = \"{n}\""));
         let has_cred  = store.accounts.contains_key(&n);
         let is_expired = store.accounts.get(&n).map(|c| c.needs_refresh()).unwrap_or(false);
-        // Block only if the credential exists AND is still valid — expired sessions can be re-authorized
         if in_config && has_cred && !is_expired {
-            bail!("Account '{}' already exists with a valid credential.\nTo add a new account use: shunt add-account <name>", n);
+            bail!("Account '{}' already has a valid credential.", n);
         }
         (n, in_config)
     } else {
-        // Find accounts in config that have no credential yet
+        // Check for existing config entries that are missing credentials for this provider
         let config = crate::config::load_config(config_override.as_deref())?;
         let missing: Vec<_> = config.accounts.iter()
-            .filter(|a| a.credential.is_none())
+            .filter(|a| a.provider == provider && a.credential.is_none())
             .collect();
+
         match missing.len() {
-            0 => {
-                // All accounts are authorised — user wants to add a brand new one
-                println!("  {} All accounts have credentials.", green(CHECK));
-                println!("  {} To add a new account, run: {}", dim("·"),
-                    cyan("shunt add-account <name>"));
-                println!();
-                return Ok(());
-            }
             1 => {
-                println!("  {} Account '{}' has no credential — authorizing now",
-                    yellow("↻"), missing[0].name);
+                println!("  {} Authorizing account {}", yellow("↻"), bold(&format!("'{}'", missing[0].name)));
+                println!();
                 (missing[0].name.clone(), true)
             }
-            _ => {
+            n if n > 1 => {
                 let items: Vec<term::SelectItem> = missing.iter().map(|a| term::SelectItem {
                     label: bold(&a.name).to_string(),
                     value: a.name.clone(),
                 }).collect();
-                match term::select("Authorize account:", &items, 0) {
+                match term::select("Which account to authorize?", &items, 0) {
                     Some(v) => (v, true),
                     None => return Ok(()),
                 }
             }
+            _ => {
+                // All configured — prompt for a new name
+                print!("  {} Account name: ", dim("·"));
+                use std::io::Write;
+                std::io::stdout().flush().ok();
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input)?;
+                let n = input.trim().to_string();
+                if n.is_empty() { bail!("Account name cannot be empty."); }
+                (n, false)
+            }
         }
     };
 
-    print_splash(&[
-        format!("{}  {}", brand_green("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
-        format!("Adding account {}", bold(&format!("'{name}'"))),
-        String::new(),
-    ]);
-
+    // ── Step 3: OAuth flow ───────────────────────────────────────────────────
     let mut cred = match provider {
         Provider::Anthropic => run_oauth_flow().await?,
-        Provider::OpenAI => crate::oauth::run_openai_oauth_flow().await?,
+        Provider::OpenAI    => crate::oauth::run_openai_oauth_flow().await?,
     };
 
     // Fetch email (non-fatal)
     let email = match provider {
         Provider::Anthropic => crate::oauth::fetch_account_email(&cred.access_token).await,
-        Provider::OpenAI => crate::oauth::fetch_openai_account_email(&cred.access_token).await,
+        Provider::OpenAI    => crate::oauth::fetch_openai_account_email(&cred.access_token).await,
     };
     if let Some(ref e) = email {
-        println!("  {} Account: {}", green(CHECK), bold(e));
+        println!("  {} Signed in as {}", green(CHECK), bold(e));
     }
     cred.email = email;
 
-    // Only append to config if not already there
+    // ── Step 4: persist ──────────────────────────────────────────────────────
     if !already_in_config {
         let mut config_text = existing_config;
         match provider {
@@ -362,7 +396,7 @@ async fn cmd_add_account(config_override: Option<PathBuf>, name: Option<String>,
     store.save()?;
 
     println!();
-    println!("  {} Account {} authorized.", green(CHECK), bold(&format!("'{name}'")));
+    println!("  {} Account {} added.", green(CHECK), bold(&format!("'{name}'")));
     offer_restart(config_override).await;
     println!();
     Ok(())
