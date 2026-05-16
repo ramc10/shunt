@@ -256,12 +256,20 @@ async fn proxy_handler(
         let account_name = account.name.clone();
 
         // Use the live (possibly refreshed) token rather than the one baked into config.
+        // For OpenAI/chatgpt.com accounts, use the id_token (short-lived OIDC JWT) as
+        // the bearer — chatgpt.com's API authenticates via id_token, not access_token.
         let token = {
             let creds = s.credentials.read().await;
-            creds.get(&account_name)
-                .map(|c| c.access_token.clone())
-                .or_else(|| account.credential.as_ref().map(|c| c.access_token.clone()))
-                .unwrap_or_default()
+            let cred = creds.get(&account_name)
+                .cloned()
+                .or_else(|| account.credential.clone());
+            match cred {
+                Some(c) if account.provider == crate::provider::Provider::OpenAI => {
+                    c.id_token.unwrap_or(c.access_token)
+                }
+                Some(c) => c.access_token,
+                None => String::new(),
+            }
         };
 
         let response = s.forwarder
@@ -548,7 +556,9 @@ async fn auth_probe_get(
         client.get(&url).headers(headers)
     };
 
-    let resp = match do_get(&creds.access_token).send().await {
+    // Use id_token for chatgpt.com (same as the proxy handler).
+    let probe_token = creds.id_token.as_deref().unwrap_or(&creds.access_token);
+    let resp = match do_get(probe_token).send().await {
         Ok(r) => r,
         Err(e) => { tracing::warn!(account = %account.name, "auth probe failed: {e}"); return; }
     };
@@ -570,7 +580,8 @@ async fn auth_probe_get(
             crate::oauth::write_codex_auth_file(&fresh);
         }
 
-        match do_get(&fresh.access_token).send().await {
+        let fresh_token = fresh.id_token.as_deref().unwrap_or(&fresh.access_token);
+        match do_get(fresh_token).send().await {
             Ok(r2) if r2.status() == reqwest::StatusCode::UNAUTHORIZED => {
                 tracing::error!(account = %account.name, "401 after refresh — needs re-authorization");
                 state.set_auth_failed(&account.name);
