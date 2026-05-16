@@ -446,7 +446,13 @@ pub async fn prefetch_rate_limits(config: Arc<Config>, state: StateStore) {
             None => continue,
         };
 
-        let Some((path, body)) = account.provider.prefetch_request() else { continue };
+        let Some((path, body)) = account.provider.prefetch_request() else {
+            // No POST prefetch for this provider — do a lightweight GET auth check instead.
+            if let Some(probe_path) = account.provider.auth_probe_get_path() {
+                auth_probe_get(&client, probe_path, account, &state).await;
+            }
+            continue;
+        };
         let url = format!("{}{}", config.server.upstream_url, path);
 
         let resp = prefetch_send(&client, &url, &account.provider, &creds.access_token, &body).await;
@@ -511,6 +517,84 @@ async fn prefetch_send(
         );
     }
     Ok(client.post(url).headers(headers).json(body).send().await?)
+}
+
+/// GET a cheap endpoint to verify credentials are still valid for providers that
+/// don't expose rate-limit headers (e.g. OpenAI). On 401, attempts a token refresh;
+/// marks the account as `reauth_required` if the refresh also fails.
+async fn auth_probe_get(
+    client: &reqwest::Client,
+    path: &str,
+    account: &crate::config::AccountConfig,
+    state: &StateStore,
+) {
+    let creds = match account.credential.clone() {
+        Some(c) => c,
+        None => return,
+    };
+    let upstream = match account.provider {
+        crate::provider::Provider::OpenAI => "https://chatgpt.com",
+        crate::provider::Provider::Anthropic => "https://api.anthropic.com",
+    };
+    let url = format!("{}{}", upstream, path);
+
+    let do_get = |token: &str| -> reqwest::RequestBuilder {
+        let mut headers = reqwest::header::HeaderMap::new();
+        let _ = account.provider.inject_auth_headers(&mut headers, token);
+        client.get(&url).headers(headers)
+    };
+
+    let resp = match do_get(&creds.access_token).send().await {
+        Ok(r) => r,
+        Err(e) => { tracing::warn!(account = %account.name, "auth probe failed: {e}"); return; }
+    };
+
+    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        tracing::info!(account = %account.name, "auth probe: access token rejected, refreshing");
+        let fresh = match account.provider.refresh_token(&creds).await {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!(account = %account.name, "token refresh failed: {e}");
+                state.set_auth_failed(&account.name);
+                return;
+            }
+        };
+        let mut store = crate::config::CredentialsStore::load();
+        store.accounts.insert(account.name.clone(), fresh.clone());
+        store.save().ok();
+        if fresh.id_token.is_some() {
+            crate::oauth::write_codex_auth_file(&fresh);
+        }
+
+        match do_get(&fresh.access_token).send().await {
+            Ok(r2) if r2.status() == reqwest::StatusCode::UNAUTHORIZED => {
+                tracing::error!(account = %account.name, "401 after refresh — needs re-authorization");
+                state.set_auth_failed(&account.name);
+            }
+            Ok(_) => tracing::info!(account = %account.name, "auth probe ok after refresh"),
+            Err(e) => tracing::warn!(account = %account.name, "auth probe retry failed: {e}"),
+        }
+    } else {
+        tracing::info!(account = %account.name, status = %resp.status(), "auth probe ok, validating refresh token");
+        // Access token is valid, but the refresh token may still be dead (e.g. the user
+        // logged in elsewhere and OpenAI invalidated the session). Attempt a refresh now so
+        // we detect a dead refresh_token at startup rather than when codex CLI fails later.
+        match account.provider.refresh_token(&creds).await {
+            Ok(fresh) => {
+                tracing::info!(account = %account.name, "refresh token valid, credentials updated");
+                let mut store = crate::config::CredentialsStore::load();
+                store.accounts.insert(account.name.clone(), fresh.clone());
+                store.save().ok();
+                if fresh.id_token.is_some() {
+                    crate::oauth::write_codex_auth_file(&fresh);
+                }
+            }
+            Err(e) => {
+                tracing::warn!(account = %account.name, "refresh token rejected: {e}");
+                state.set_auth_failed(&account.name);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -133,6 +133,15 @@ impl Provider {
         }
     }
 
+    /// GET path for a lightweight auth-validity check (no rate-limit data expected).
+    /// Used for providers where `prefetch_request` is unavailable.
+    pub fn auth_probe_get_path(&self) -> Option<&'static str> {
+        match self {
+            Provider::Anthropic => None, // prefetch_request() already verifies auth
+            Provider::OpenAI => Some("/backend-api/me"),
+        }
+    }
+
     /// Extract rate-limit utilization from an upstream response's headers.
     ///
     /// Returns `None` when the response carries no recognisable rate-limit data.
