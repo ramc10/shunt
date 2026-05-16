@@ -321,8 +321,11 @@ async fn proxy_handler(
                             let fresh = fresh.clone();
                             tokio::task::spawn_blocking(move || {
                                 let mut store = CredentialsStore::load();
-                                store.accounts.insert(name, fresh);
+                                store.accounts.insert(name, fresh.clone());
                                 store.save().ok();
+                                if fresh.id_token.is_some() {
+                                    crate::oauth::write_codex_auth_file(&fresh);
+                                }
                             });
                             // Mark as refreshed but don't add to tried — retry this account.
                             refreshed.insert(account_name);
@@ -466,6 +469,9 @@ pub async fn prefetch_rate_limits(config: Arc<Config>, state: StateStore) {
             let mut store = crate::config::CredentialsStore::load();
             store.accounts.insert(account.name.clone(), fresh.clone());
             store.save().ok();
+            if fresh.id_token.is_some() {
+                crate::oauth::write_codex_auth_file(&fresh);
+            }
 
             match prefetch_send(&client, &url, &account.provider, &fresh.access_token, &body).await {
                 Ok(r2) if r2.status() == reqwest::StatusCode::UNAUTHORIZED => {
@@ -603,8 +609,11 @@ pub async fn recovery_watcher(
                     let fresh_owned = fresh.clone();
                     tokio::task::spawn_blocking(move || {
                         let mut store = crate::config::CredentialsStore::load();
-                        store.accounts.insert(name_owned, fresh_owned);
+                        store.accounts.insert(name_owned, fresh_owned.clone());
                         store.save().ok();
+                        if fresh_owned.id_token.is_some() {
+                            crate::oauth::write_codex_auth_file(&fresh_owned);
+                        }
                     });
                     state.clear_auth_failed(name);
                     any_recovered = true;

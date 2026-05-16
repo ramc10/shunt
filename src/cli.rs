@@ -392,8 +392,13 @@ async fn cmd_add_account(
     }
 
     let mut store = CredentialsStore::load();
-    store.accounts.insert(name.clone(), cred);
+    store.accounts.insert(name.clone(), cred.clone());
     store.save()?;
+
+    // Keep ~/.codex/auth.json in sync so the Codex CLI works without re-login.
+    if cred.id_token.is_some() {
+        crate::oauth::write_codex_auth_file(&cred);
+    }
 
     println!();
     println!("  {} Account {} added.", green(CHECK), bold(&format!("'{name}'")));

@@ -39,6 +39,9 @@ pub struct OAuthCredential {
     /// Account email, fetched from roles endpoint after auth
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
+    /// OpenAI id_token — required by the Codex CLI's ~/.codex/auth.json
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id_token: Option<String>,
 }
 
 impl OAuthCredential {
@@ -73,6 +76,29 @@ struct CodexTokens {
     access_token: String,
     #[serde(default)]
     refresh_token: Option<String>,
+    #[serde(default)]
+    id_token: Option<String>,
+}
+
+/// Write credentials to ~/.codex/auth.json so the Codex CLI can use them without re-login.
+///
+/// Called automatically after add-account and token refresh for OpenAI accounts.
+pub fn write_codex_auth_file(cred: &OAuthCredential) {
+    let Some(ref id_token) = cred.id_token else { return };
+    let path = codex_credentials_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let auth = serde_json::json!({
+        "tokens": {
+            "access_token": cred.access_token,
+            "refresh_token": cred.refresh_token,
+            "id_token": id_token,
+        }
+    });
+    if let Ok(text) = serde_json::to_string_pretty(&auth) {
+        let _ = std::fs::write(&path, text);
+    }
 }
 
 pub fn codex_credentials_path() -> PathBuf {
@@ -101,6 +127,7 @@ pub fn read_codex_credentials() -> Option<OAuthCredential> {
         refresh_token: raw.tokens.refresh_token.unwrap_or_default(),
         expires_at,
         email: None,
+        id_token: raw.tokens.id_token,
     })
 }
 
@@ -259,6 +286,7 @@ fn parse_claude_credentials_json(text: &str) -> Option<OAuthCredential> {
         refresh_token: inner.refresh_token,
         expires_at: inner.expires_at,
         email: None,
+        id_token: None,
     })
 }
 
@@ -308,7 +336,7 @@ pub async fn refresh_token(cred: &OAuthCredential) -> Result<OAuthCredential> {
         .as_millis() as u64;
     let expires_at = now_ms + expires_in_secs * 1000;
 
-    Ok(OAuthCredential { access_token, refresh_token, expires_at, email: cred.email.clone() })
+    Ok(OAuthCredential { access_token, refresh_token, expires_at, email: cred.email.clone(), id_token: None })
 }
 
 // ---------------------------------------------------------------------------
@@ -487,6 +515,7 @@ async fn exchange_code(code: &str, state: &str, redirect_uri: &str, verifier: &s
         refresh_token,
         expires_at: now_ms + expires_in * 1000,
         email: None,
+        id_token: None,
     })
 }
 
@@ -551,6 +580,9 @@ pub async fn refresh_openai_token(cred: &OAuthCredential) -> Result<OAuthCredent
         .unwrap_or(&cred.refresh_token)
         .to_owned();
 
+    let id_token = body["id_token"].as_str().map(|s| s.to_owned())
+        .or_else(|| cred.id_token.clone());
+
     let expires_in_secs = body["expires_in"].as_u64().unwrap_or(3600);
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -562,6 +594,7 @@ pub async fn refresh_openai_token(cred: &OAuthCredential) -> Result<OAuthCredent
         refresh_token,
         expires_at: now_ms + expires_in_secs * 1000,
         email: cred.email.clone(),
+        id_token,
     })
 }
 
@@ -684,6 +717,7 @@ pub async fn run_openai_oauth_flow() -> Result<OAuthCredential> {
         .context("token exchange: missing access_token")?
         .to_owned();
     let refresh_token = body["refresh_token"].as_str().unwrap_or("").to_owned();
+    let id_token = body["id_token"].as_str().map(|s| s.to_owned());
     let expires_at = jwt_exp_ms(&access_token).unwrap_or_else(|| {
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -692,7 +726,7 @@ pub async fn run_openai_oauth_flow() -> Result<OAuthCredential> {
         now_ms + body["expires_in"].as_u64().unwrap_or(3600) * 1000
     });
 
-    Ok(OAuthCredential { access_token, refresh_token, expires_at, email: None })
+    Ok(OAuthCredential { access_token, refresh_token, expires_at, email: None, id_token })
 }
 
 // ---------------------------------------------------------------------------
