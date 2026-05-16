@@ -1,5 +1,6 @@
 pub mod cli;
 pub mod config;
+pub mod pricing;
 pub mod forwarder;
 pub mod logging;
 pub mod monitor;

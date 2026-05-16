@@ -104,6 +104,29 @@ pub struct RateLimitInfo {
     pub updated_ms: u64,
 }
 
+/// Per-day token and API-cost accumulator (all accounts combined).
+#[derive(Debug, Serialize, Deserialize, Default, Clone)]
+pub struct DailyBucket {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    /// What those tokens would have cost on the public API (USD).
+    pub api_cost_usd: f64,
+}
+
+/// Snapshot returned by `savings_snapshot()` for the status endpoint + CLI.
+#[derive(Debug, Serialize, Deserialize, Default, Clone)]
+pub struct SavingsSnapshot {
+    pub today_input: u64,
+    pub today_output: u64,
+    pub today_cost_usd: f64,
+    pub week_input: u64,
+    pub week_output: u64,
+    pub week_cost_usd: f64,
+    pub all_time_input: u64,
+    pub all_time_output: u64,
+    pub all_time_cost_usd: f64,
+}
+
 #[derive(Serialize, Deserialize, Default, Clone)]
 struct StateData {
     #[serde(default)]
@@ -123,6 +146,16 @@ struct StateData {
     /// Recent request log (ephemeral — not persisted to disk).
     #[serde(skip)]
     recent_requests: VecDeque<RequestLog>,
+    /// Daily token + cost buckets keyed by "YYYY-MM-DD" (all accounts combined).
+    #[serde(default)]
+    global_daily: HashMap<String, DailyBucket>,
+    /// All-time totals.
+    #[serde(default)]
+    all_time_input: u64,
+    #[serde(default)]
+    all_time_output: u64,
+    #[serde(default)]
+    all_time_cost_usd: f64,
 }
 
 // ---------------------------------------------------------------------------
@@ -415,6 +448,71 @@ impl StateStore {
     }
 
     // -----------------------------------------------------------------------
+    // Global savings tracking
+    // -----------------------------------------------------------------------
+
+    /// Record tokens + API cost globally (across all accounts) for the savings display.
+    pub fn record_global(&self, model: &str, input_tokens: u64, output_tokens: u64) {
+        if input_tokens == 0 && output_tokens == 0 {
+            return;
+        }
+        let cost = crate::pricing::api_cost_usd(model, input_tokens, output_tokens);
+        let key = today_key();
+        {
+            let mut data = self.inner.lock().unwrap();
+            let bucket = data.global_daily.entry(key).or_default();
+            bucket.input_tokens  += input_tokens;
+            bucket.output_tokens += output_tokens;
+            bucket.api_cost_usd  += cost;
+            data.all_time_input      += input_tokens;
+            data.all_time_output     += output_tokens;
+            data.all_time_cost_usd   += cost;
+
+            // Prune buckets older than 90 days to prevent unbounded growth.
+            if data.global_daily.len() > 100 {
+                let cutoff = epoch_to_ymd(
+                    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+                        .saturating_sub(90 * 86400)
+                );
+                data.global_daily.retain(|k, _| k.as_str() >= cutoff.as_str());
+            }
+        }
+        self.persist();
+    }
+
+    /// Snapshot of daily and all-time savings for the status endpoint and CLI.
+    pub fn savings_snapshot(&self) -> SavingsSnapshot {
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let today   = today_key();
+        let week_ago = epoch_to_ymd(now_secs.saturating_sub(7 * 86400));
+
+        let data = self.inner.lock().unwrap();
+
+        let today_bucket = data.global_daily.get(&today).cloned().unwrap_or_default();
+
+        let (week_input, week_output, week_cost) = data.global_daily.iter()
+            .filter(|(k, _)| k.as_str() >= week_ago.as_str())
+            .fold((0u64, 0u64, 0f64), |(i, o, c), (_, b)| {
+                (i + b.input_tokens, o + b.output_tokens, c + b.api_cost_usd)
+            });
+
+        SavingsSnapshot {
+            today_input:      today_bucket.input_tokens,
+            today_output:     today_bucket.output_tokens,
+            today_cost_usd:   today_bucket.api_cost_usd,
+            week_input,
+            week_output,
+            week_cost_usd:    week_cost,
+            all_time_input:   data.all_time_input,
+            all_time_output:  data.all_time_output,
+            all_time_cost_usd: data.all_time_cost_usd,
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Persistence
     // -----------------------------------------------------------------------
 
@@ -536,6 +634,31 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
     }
+}
+
+/// "YYYY-MM-DD" string for today in UTC.
+fn today_key() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    epoch_to_ymd(secs)
+}
+
+/// Convert Unix epoch seconds to "YYYY-MM-DD" (UTC) using Hinnant's civil_from_days.
+fn epoch_to_ymd(secs: u64) -> String {
+    let days = (secs / 86400) as i64;
+    let z    = days + 719_468;
+    let era  = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe  = z - era * 146_097;
+    let yoe  = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y    = yoe + era * 400;
+    let doy  = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp   = (5 * doy + 2) / 153;
+    let d    = doy - (153 * mp + 2) / 5 + 1;
+    let m    = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y    = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
 }
 
 fn write_to_disk(data: &StateData, path: &Path) -> Result<()> {

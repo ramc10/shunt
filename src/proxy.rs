@@ -169,6 +169,7 @@ async fn status_handler(State(s): State<AppState>) -> impl IntoResponse {
     }).collect();
 
     let recent_requests = s.state.recent_requests_snapshot();
+    let savings = s.state.savings_snapshot();
 
     axum::Json(json!({
         "version": env!("CARGO_PKG_VERSION"),
@@ -177,6 +178,7 @@ async fn status_handler(State(s): State<AppState>) -> impl IntoResponse {
         "pinned_account": s.state.get_pinned(),
         "last_used_account": s.state.get_last_used(),
         "recent_requests": recent_requests,
+        "savings": savings,
     }))
 }
 
@@ -382,6 +384,7 @@ async fn tap_usage(
         let model = model.to_owned();
         let on_complete = Arc::new(move |input: u64, output: u64| {
             state.record_usage(&account, input, output);
+            state.record_global(&model, input, output);
             state.record_request(RequestLog {
                 ts_ms: req_start_ms,
                 account: account.clone(),
@@ -405,6 +408,7 @@ async fn tap_usage(
     };
     let (input, output) = quota::extract_usage_from_json(&bytes);
     state.record_usage(account, input, output);
+    state.record_global(model, input, output);
     state.record_request(RequestLog {
         ts_ms: req_start_ms,
         account: account.to_owned(),

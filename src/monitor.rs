@@ -40,6 +40,22 @@ struct StatusResponse {
     last_used_account: Option<String>,
     #[serde(default)]
     recent_requests: Vec<ReqLog>,
+    #[serde(default)]
+    savings: Option<SavingsInfo>,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
+struct SavingsInfo {
+    #[serde(default)]
+    today_input: u64,
+    #[serde(default)]
+    today_output: u64,
+    #[serde(default)]
+    today_cost_usd: f64,
+    #[serde(default)]
+    week_cost_usd: f64,
+    #[serde(default)]
+    all_time_cost_usd: f64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -334,6 +350,15 @@ fn draw_header(f: &mut Frame, area: Rect, state: &Option<StatusResponse>) {
             format!("  up {}", fmt_duration_ms(elapsed))
         });
 
+    let savings_span: Option<String> = state.as_ref().and_then(|s| {
+        let sv = s.savings.as_ref()?;
+        let today_tok = sv.today_input + sv.today_output;
+        if today_tok == 0 && sv.all_time_cost_usd == 0.0 { return None; }
+        let tok_str  = crate::term::fmt_tokens(today_tok);
+        let cost_str = crate::pricing::fmt_cost(sv.today_cost_usd);
+        Some(format!("  ·  today: {tok_str}  {cost_str}"))
+    });
+
     let mut spans = vec![
         Span::styled(" ◆ ", style_brand()),
         Span::styled("shunt", style_brand()),
@@ -342,6 +367,9 @@ fn draw_header(f: &mut Frame, area: Rect, state: &Option<StatusResponse>) {
     ];
     if let Some(ref u) = uptime_span {
         spans.push(Span::styled(u.as_str(), style_dim()));
+    }
+    if let Some(ref sv) = savings_span {
+        spans.push(Span::styled(sv.as_str(), style_dim()));
     }
 
     let title = Line::from(spans);

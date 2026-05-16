@@ -1259,10 +1259,30 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
     };
 
     let account_names: Vec<&str> = config.accounts.iter().map(|a| a.name.as_str()).collect();
+    // Build savings summary if proxy is running and has data.
+    let savings_line: Option<String> = live.and_then(|v| {
+        let s = v.get("savings")?;
+        let today_in  = s["today_input"].as_u64().unwrap_or(0);
+        let today_out = s["today_output"].as_u64().unwrap_or(0);
+        let today_cost = s["today_cost_usd"].as_f64().unwrap_or(0.0);
+        let all_cost   = s["all_time_cost_usd"].as_f64().unwrap_or(0.0);
+        if today_in + today_out == 0 && all_cost == 0.0 { return None; }
+        let today_tok = crate::term::fmt_tokens(today_in + today_out);
+        let cost_str  = crate::pricing::fmt_cost(today_cost);
+        let all_str   = crate::pricing::fmt_cost(all_cost);
+        Some(format!("{}  today {}  {}  {}  all time {}",
+            dim("·"), dim(&today_tok), dim(&cost_str), dim("·"), dim(&all_str)))
+    });
+
     print_routing_header(&account_names, &[
         format!("{}  {}", brand_green("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
         proxy_line,
     ]);
+
+    if let Some(ref line) = savings_line {
+        println!("  {line}");
+        println!();
+    }
 
     let pinned_account = live.and_then(|v| v["pinned"].as_str()).map(|s| s.to_owned());
     let last_used_account = live.and_then(|v| v["last_used"].as_str()).map(|s| s.to_owned());
