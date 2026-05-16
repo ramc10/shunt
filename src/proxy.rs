@@ -579,25 +579,10 @@ async fn auth_probe_get(
             Err(e) => tracing::warn!(account = %account.name, "auth probe retry failed: {e}"),
         }
     } else {
-        tracing::info!(account = %account.name, status = %resp.status(), "auth probe ok, validating refresh token");
-        // Access token is valid, but the refresh token may still be dead (e.g. the user
-        // logged in elsewhere and OpenAI invalidated the session). Attempt a refresh now so
-        // we detect a dead refresh_token at startup rather than when codex CLI fails later.
-        match account.provider.refresh_token(&creds).await {
-            Ok(fresh) => {
-                tracing::info!(account = %account.name, "refresh token valid, credentials updated");
-                let mut store = crate::config::CredentialsStore::load();
-                store.accounts.insert(account.name.clone(), fresh.clone());
-                store.save().ok();
-                if fresh.id_token.is_some() {
-                    crate::oauth::write_codex_auth_file(&fresh);
-                }
-            }
-            Err(e) => {
-                tracing::warn!(account = %account.name, "refresh token rejected: {e}");
-                state.set_auth_failed(&account.name);
-            }
-        }
+        tracing::info!(account = %account.name, status = %resp.status(), "auth probe ok");
+        // Access token is valid. Do NOT refresh here — rotating the refresh_token races
+        // with codex CLI, which also tries to refresh at startup using the same token.
+        // Proactive refreshing is handled solely by openai_token_refresh_loop.
     }
 }
 
@@ -605,68 +590,133 @@ async fn auth_probe_get(
 // Proactive OpenAI token refresh loop
 // ---------------------------------------------------------------------------
 
-/// Keeps OpenAI `id_token`s perpetually fresh by refreshing every 50 minutes.
+/// Returns true if the id_token inside `cred` has fewer than `threshold_mins`
+/// minutes remaining, or if there is no id_token / it cannot be parsed.
+fn id_token_expires_soon(cred: &crate::oauth::OAuthCredential, threshold_mins: u64) -> bool {
+    let Some(ref id_tok) = cred.id_token else { return true };
+    let Some(exp_ms) = crate::oauth::jwt_exp_ms(id_tok) else { return true };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    exp_ms < now_ms + threshold_mins * 60 * 1_000
+}
+
+/// Sync live_creds from auth.json if auth.json has a newer token.
 ///
-/// The `id_token` inside `~/.codex/auth.json` has a 1-hour TTL. If it expires
-/// the codex CLI tries to refresh it directly against OpenAI's OAuth endpoint,
-/// which often fails because the refresh token has rotated. By refreshing here
-/// before expiry we ensure codex CLI never needs to do its own refresh.
+/// Codex CLI refreshes its own token and writes auth.json. Before we refresh,
+/// we pull that in so we don't use a stale refresh_token that codex already rotated.
+async fn sync_live_creds_from_auth_json(
+    account_name: &str,
+    live_creds: &LiveCredentials,
+) {
+    let Some(from_file) = crate::oauth::read_codex_credentials() else { return };
+    let current_exp = live_creds.read().await
+        .get(account_name)
+        .map(|c| c.expires_at)
+        .unwrap_or(0);
+    if from_file.expires_at > current_exp {
+        tracing::info!(account = %account_name, "synced fresher token from auth.json");
+        live_creds.write().await.insert(account_name.to_owned(), from_file);
+    }
+}
+
+/// Perform a single proactive refresh for one account and persist the result.
+async fn do_proactive_refresh(
+    account: &crate::config::AccountConfig,
+    creds: &crate::oauth::OAuthCredential,
+    live_creds: &LiveCredentials,
+    state: &StateStore,
+) {
+    tracing::info!(account = %account.name, "proactive OpenAI token refresh");
+    match account.provider.refresh_token(creds).await {
+        Ok(fresh) => {
+            tracing::info!(account = %account.name, "proactive refresh ok — auth.json updated");
+            {
+                let mut map = live_creds.write().await;
+                map.insert(account.name.clone(), fresh.clone());
+            }
+            let mut store = crate::config::CredentialsStore::load();
+            store.accounts.insert(account.name.clone(), fresh.clone());
+            store.save().ok();
+            if fresh.id_token.is_some() {
+                crate::oauth::write_codex_auth_file(&fresh);
+            }
+            state.clear_auth_failed(&account.name);
+        }
+        Err(e) => {
+            tracing::warn!(account = %account.name, "proactive refresh failed: {e}");
+            state.set_auth_failed(&account.name);
+        }
+    }
+}
+
+/// Keeps OpenAI `id_token`s perpetually fresh.
+///
+/// Strategy:
+/// - At startup: only refresh if the id_token is already expired (< 2 min left).
+///   If the token is fresh, we skip — codex CLI does its own startup refresh and
+///   rotating the token from two places simultaneously causes "invalid_grant".
+/// - Every 45 minutes: re-sync from auth.json (codex may have refreshed it),
+///   then refresh only if id_token has < 15 minutes left.
+///
+/// This avoids racing with codex CLI's startup refresh while still ensuring
+/// the token is always fresh when codex needs it.
 pub async fn openai_token_refresh_loop(
     config: Arc<Config>,
     state: StateStore,
     live_creds: LiveCredentials,
 ) {
-    // Wait for the initial auth probe to complete first.
-    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+    // Startup pass: only refresh if token is already expired.
+    for account in config.accounts.iter()
+        .filter(|a| a.provider == crate::provider::Provider::OpenAI)
+    {
+        if state.account_states().get(&account.name).map(|s| s.auth_failed).unwrap_or(false) {
+            continue;
+        }
+        let creds = {
+            let map = live_creds.read().await;
+            map.get(&account.name).cloned().or_else(|| account.credential.clone())
+        };
+        if let Some(creds) = creds {
+            if id_token_expires_soon(&creds, 2) {
+                // Token already expired (or expiring within 2 min) at startup — refresh now.
+                do_proactive_refresh(account, &creds, &live_creds, &state).await;
+            } else {
+                tracing::info!(account = %account.name, "id_token fresh at startup — skipping immediate refresh");
+            }
+        }
+    }
 
     loop {
+        // Check every 45 minutes. This is well within the 60-minute id_token TTL,
+        // so we'll always catch expiring tokens before codex CLI needs to.
+        tokio::time::sleep(std::time::Duration::from_secs(45 * 60)).await;
+
         for account in config.accounts.iter()
             .filter(|a| a.provider == crate::provider::Provider::OpenAI)
         {
-            // Always use the LIVE credential — not the one baked into config at startup.
-            // After each refresh, OpenAI rotates the refresh_token, so the next iteration
-            // must use the freshly-saved token or it will fail with "already rotated".
-            let creds = {
-                let map = live_creds.read().await;
-                map.get(&account.name).cloned()
-                    .or_else(|| account.credential.clone())
-            };
-            let creds = match creds {
-                Some(c) => c,
-                None => continue,
-            };
-
-            // Skip accounts already marked as needing reauth.
             if state.account_states().get(&account.name).map(|s| s.auth_failed).unwrap_or(false) {
                 continue;
             }
 
-            tracing::info!(account = %account.name, "proactive OpenAI token refresh");
-            match account.provider.refresh_token(&creds).await {
-                Ok(fresh) => {
-                    tracing::info!(account = %account.name, "proactive refresh ok — auth.json updated");
-                    // Update the live map so the next loop iteration uses the new refresh_token.
-                    {
-                        let mut map = live_creds.write().await;
-                        map.insert(account.name.clone(), fresh.clone());
-                    }
-                    let mut store = crate::config::CredentialsStore::load();
-                    store.accounts.insert(account.name.clone(), fresh.clone());
-                    store.save().ok();
-                    if fresh.id_token.is_some() {
-                        crate::oauth::write_codex_auth_file(&fresh);
-                    }
-                    state.clear_auth_failed(&account.name);
-                }
-                Err(e) => {
-                    tracing::warn!(account = %account.name, "proactive refresh failed: {e}");
-                    state.set_auth_failed(&account.name);
-                }
-            }
-        }
+            // Pull in any token rotation codex CLI has done since our last refresh.
+            sync_live_creds_from_auth_json(&account.name, &live_creds).await;
 
-        // Refresh every 50 minutes — well before the 60-minute id_token TTL.
-        tokio::time::sleep(std::time::Duration::from_secs(50 * 60)).await;
+            let creds = {
+                let map = live_creds.read().await;
+                map.get(&account.name).cloned().or_else(|| account.credential.clone())
+            };
+            let Some(creds) = creds else { continue };
+
+            // Only refresh if id_token has < 15 minutes left.
+            if !id_token_expires_soon(&creds, 15) {
+                tracing::debug!(account = %account.name, "id_token still fresh, skipping refresh");
+                continue;
+            }
+
+            do_proactive_refresh(account, &creds, &live_creds, &state).await;
+        }
     }
 }
 

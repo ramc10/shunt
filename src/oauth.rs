@@ -133,7 +133,7 @@ pub fn read_codex_credentials() -> Option<OAuthCredential> {
 
 /// Decode the `exp` claim from a JWT payload (no signature verification).
 /// Returns expiry as Unix milliseconds.
-fn jwt_exp_ms(token: &str) -> Option<u64> {
+pub(crate) fn jwt_exp_ms(token: &str) -> Option<u64> {
     let payload_b64 = token.splitn(3, '.').nth(1)?;
     // base64url decode (no padding)
     let decoded = base64_url_decode(payload_b64)?;
