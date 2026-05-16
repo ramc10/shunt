@@ -114,19 +114,15 @@ fn spawn_daemon() {
 
     match result {
         Ok(_child) => {
+            let addrs = load_addrs();
             println!();
-            for (i, (provider, addr)) in load_addrs().iter().enumerate() {
-                if i == 0 {
-                    println!("  {}  {}  {}",
-                        brand_green("◆"),
-                        bold_white("shunt"),
-                        dim(&format!("started  ·  {addr}")));
-                } else {
-                    println!("  {}           {}  {}",
-                        dim("·"),
-                        dim(&format!("[{provider}]")),
-                        dim(addr));
-                }
+            println!("  {}  {}  {}",
+                brand_green("◆"),
+                bold_white("shunt"),
+                bold_white("started"));
+            for (provider, addr) in &addrs {
+                let label = format!("{provider:<12}");
+                println!("  {}  {}  {}", dim("·"), dim(&label), cyan(addr));
             }
             println!("  {}  run {} for account details",
                 dim("·"), cyan("shunt status"));

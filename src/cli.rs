@@ -1188,7 +1188,7 @@ fn auto_write_shell_export(port: u16) {
 
 async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
     let mut config = crate::config::load_config(config_override.as_deref())?;
-    let primary_url = format!("http://{}:{}", config.server.host, config.server.port);
+    let _primary_url = format!("http://{}:{}", config.server.host, config.server.port);
 
     // Fetch live status from every provider's proxy (each runs on its own port).
     // provider_label → serde_json::Value
@@ -1228,17 +1228,29 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
         store.save().ok();
     }
 
-    let proxy_line = if live.is_some() {
-        format!("{}  {}  {}", green(DOT), green_bold("running"), cyan(&primary_url))
+    // Build running address list: ":8082" or ":8082 · :8083"
+    let addr_str = if !live_by_provider.is_empty() {
+        let parts: Vec<String> = provider_urls.iter()
+            .filter(|(label, _)| live_by_provider.contains_key(label.as_str()))
+            .map(|(_, url)| {
+                let port = url.rsplit(':').next().unwrap_or("?");
+                cyan(&format!(":{port}"))
+            })
+            .collect();
+        parts.join(&dim("  ·  "))
     } else {
-        {
-            let log_hint = if log_path().exists() {
-                format!("  ·  {}", dim("shunt logs for details"))
-            } else {
-                String::new()
-            };
-            format!("{}  {}  {}{}", dim(EMPTY), dim("stopped"), dim("run shunt start"), log_hint)
-        }
+        String::new()
+    };
+
+    let proxy_line = if live.is_some() {
+        format!("{}  {}  {}", green(DOT), green_bold("running"), addr_str)
+    } else {
+        let log_hint = if log_path().exists() {
+            format!("  {}  {}", dim("·"), dim("shunt logs for details"))
+        } else {
+            String::new()
+        };
+        format!("{}  {}  {}{}", dim(EMPTY), dim("stopped"), dim("shunt start"), log_hint)
     };
 
     let account_names: Vec<&str> = config.accounts.iter().map(|a| a.name.as_str()).collect();
@@ -1295,10 +1307,6 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
             }
         };
         let email_str = acc.credential.as_ref().and_then(|c| c.email.as_deref()).unwrap_or("");
-        let tokens_str = live_acc
-            .and_then(|a| a["tokens_used"]["total"].as_u64())
-            .map(|t| format!("  {}  {}", dim("·"), dim(&format!("{} tokens used", term::fmt_tokens(t)))))
-            .unwrap_or_default();
 
         // ── routing tag ─────────────────────────────────────
         let is_pinned  = pinned_account.as_deref() == Some(&acc.name);
@@ -1314,16 +1322,19 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
         // ── account header (name + tag + plan) ──────────────
         println!("{}", card_header(&acc.name, &green_bold(&acc.name), &routing_tag, tag_vis_len, plan_label));
 
-        // ── email row ────────────────────────────────────────
+        // ── email + provider badge row ───────────────────────
+        let is_openai = acc.provider == crate::provider::Provider::OpenAI;
+        let provider_badge = if is_openai { format!("  {}  {}", dim("·"), dim("openai")) } else { String::new() };
         if !email_str.is_empty() {
-            println!("{}", card_row(&dim(email_str)));
+            println!("{}", card_row(&format!("{}{}", dim(email_str), provider_badge)));
+        } else if is_openai {
+            println!("{}", card_row(&dim("openai")));
         }
 
         println!();
 
-        // ── status + token count ─────────────────────────────
-        let status_line = format!("{}  {}{}", status_icon, status_text, tokens_str);
-        println!("{}", card_row(&status_line));
+        // ── status ───────────────────────────────────────────
+        println!("{}", card_row(&format!("{}  {}", status_icon, status_text)));
 
         // ── rate limit bars ──────────────────────────────────
         if let Some(rl) = live_acc.and_then(|a| a["rate_limit"].as_object()) {
@@ -1346,17 +1357,17 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
                 } else if let Some(u) = util {
                     let rem = 100u64.saturating_sub((u * 100.0) as u64);
                     let bar = util_bar(u, 20);
-                    let in_str = reset.and_then(|t| secs_until(t))
-                        .map(|s| format!("  in {}", term::fmt_duration_ms(s * 1000)))
+                    let reset_str = reset.and_then(|t| secs_until(t))
+                        .map(|s| format!("  ·  resets in {}", term::fmt_duration_ms(s * 1000)))
                         .unwrap_or_default();
                     let pct = if wstatus == "exhausted" {
                         red("exhausted")
                     } else {
-                        format!("{}%", bold(&rem.to_string()))
+                        format!("{}% left", bold(&rem.to_string()))
                     };
                     println!("{}", card_row(&format!(
                         "{}  {}  {}{}",
-                        dim(label), bar, pct, dim(&in_str)
+                        dim(label), bar, pct, dim(&reset_str)
                     )));
                 }
             };
@@ -1374,7 +1385,7 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
             println!("{}", card_row(&format!("{}  run {}",
                 dim("·"), cyan(&format!("shunt add-account {}", acc.name)))));
         } else if live.is_some() && live_acc.is_some() {
-            println!("{}", card_row(&dim("· no rate-limit data yet — make a request first")));
+            println!("{}", card_row(&dim("· quota data will appear after first request")));
         }
 
         // ── separator ────────────────────────────────────────
