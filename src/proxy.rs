@@ -611,15 +611,27 @@ async fn auth_probe_get(
 /// the codex CLI tries to refresh it directly against OpenAI's OAuth endpoint,
 /// which often fails because the refresh token has rotated. By refreshing here
 /// before expiry we ensure codex CLI never needs to do its own refresh.
-pub async fn openai_token_refresh_loop(config: Arc<Config>, state: StateStore) {
-    // Wait a bit after startup so the initial auth probe (prefetch) completes first.
+pub async fn openai_token_refresh_loop(
+    config: Arc<Config>,
+    state: StateStore,
+    live_creds: LiveCredentials,
+) {
+    // Wait for the initial auth probe to complete first.
     tokio::time::sleep(std::time::Duration::from_secs(30)).await;
 
     loop {
         for account in config.accounts.iter()
             .filter(|a| a.provider == crate::provider::Provider::OpenAI)
         {
-            let creds = match account.credential.clone() {
+            // Always use the LIVE credential — not the one baked into config at startup.
+            // After each refresh, OpenAI rotates the refresh_token, so the next iteration
+            // must use the freshly-saved token or it will fail with "already rotated".
+            let creds = {
+                let map = live_creds.read().await;
+                map.get(&account.name).cloned()
+                    .or_else(|| account.credential.clone())
+            };
+            let creds = match creds {
                 Some(c) => c,
                 None => continue,
             };
@@ -633,6 +645,11 @@ pub async fn openai_token_refresh_loop(config: Arc<Config>, state: StateStore) {
             match account.provider.refresh_token(&creds).await {
                 Ok(fresh) => {
                     tracing::info!(account = %account.name, "proactive refresh ok — auth.json updated");
+                    // Update the live map so the next loop iteration uses the new refresh_token.
+                    {
+                        let mut map = live_creds.write().await;
+                        map.insert(account.name.clone(), fresh.clone());
+                    }
                     let mut store = crate::config::CredentialsStore::load();
                     store.accounts.insert(account.name.clone(), fresh.clone());
                     store.save().ok();
