@@ -28,10 +28,13 @@ struct AppState {
     credentials: Arc<RwLock<HashMap<String, OAuthCredential>>>,
     /// Epoch-ms when this proxy instance started.
     started_ms: u64,
+    /// If set, /v1/chat/completions requests are translated and forwarded here
+    /// (the Anthropic proxy base URL, e.g. "http://127.0.0.1:8082").
+    anthropic_base_url: Option<String>,
 }
 
 pub fn create_app(config: Config) -> anyhow::Result<Router> {
-    let (app, _) = create_app_with_state(config, StateStore::load(&state_path()))?;
+    let (app, _) = create_app_with_state(config, StateStore::load(&state_path()), None)?;
     Ok(app)
 }
 
@@ -41,6 +44,7 @@ pub type LiveCredentials = Arc<RwLock<HashMap<String, OAuthCredential>>>;
 pub fn create_app_with_state(
     config: Config,
     state: StateStore,
+    anthropic_base_url: Option<String>,
 ) -> anyhow::Result<(Router, LiveCredentials)> {
     let forwarder = Forwarder::new(&config.server.upstream_url, config.server.request_timeout_secs)?;
 
@@ -62,11 +66,13 @@ pub fn create_app_with_state(
         state,
         credentials: Arc::clone(&credentials),
         started_ms: now_ms(),
+        anthropic_base_url,
     };
 
     // Register proxy routes appropriate for the provider.
     // Anthropic: explicit paths only (maintains existing behaviour).
-    // OpenAI/others: wildcard catches all paths with any HTTP method.
+    // OpenAI/others: wildcard catches all paths; also expose OpenAI-compat
+    //   endpoints that translate to Claude when anthropic_base_url is set.
     let provider = app_state.config.accounts.first()
         .map(|a| &a.provider)
         .cloned()
@@ -77,6 +83,8 @@ pub fn create_app_with_state(
             .route("/v1/messages", post(proxy_handler))
             .route("/v1/messages/count_tokens", post(proxy_handler)),
         Provider::OpenAI => Router::new()
+            .route("/v1/chat/completions", post(openai_compat_handler))
+            .route("/v1/models", get(openai_models_handler))
             .route("/*path", any(proxy_handler)),
     };
 
@@ -642,5 +650,276 @@ fn notify_all_accounts_offline() {
                 r#"with title "shunt: All Accounts Offline" sound name "Basso""#
             )])
             .status();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// OpenAI-compatible API (translates to Anthropic Claude)
+// ---------------------------------------------------------------------------
+//
+// When the OpenAI proxy receives a request at /v1/chat/completions, if an
+// anthropic_base_url is configured, it translates the request to Anthropic
+// Messages format and forwards it to the Anthropic proxy (which handles
+// account selection, token management, and rate limiting).
+// The response is translated back to OpenAI Chat Completions format.
+
+/// Map OpenAI model names → Claude model names.
+fn map_model(openai_model: &str) -> &'static str {
+    match openai_model {
+        m if m.starts_with("claude-") => {
+            // Already a Claude model name — but we need a &'static str, so match known ones
+            // or fall through to default
+            if m.contains("opus")   { "claude-opus-4-6" }
+            else if m.contains("haiku") { "claude-haiku-4-5-20251001" }
+            else                    { "claude-sonnet-4-6" }
+        }
+        "gpt-4o" | "gpt-4.5" | "o1" | "o1-pro" | "o3" | "o3-pro" | "gpt-5" | "gpt-5.5" => {
+            "claude-opus-4-6"
+        }
+        "gpt-4o-mini" | "gpt-4o-mini-2024-07-18" | "o1-mini" | "o3-mini" => {
+            "claude-haiku-4-5-20251001"
+        }
+        _ => "claude-sonnet-4-6",
+    }
+}
+
+/// Translate an OpenAI Chat Completions request body to an Anthropic Messages body.
+fn translate_to_anthropic(body: serde_json::Value) -> serde_json::Value {
+    let model = body["model"].as_str().unwrap_or("gpt-4o");
+    let claude_model = map_model(model).to_owned();
+
+    // Extract system message from messages array.
+    let mut system: Option<String> = None;
+    let mut messages = Vec::new();
+    if let Some(arr) = body["messages"].as_array() {
+        for msg in arr {
+            let role = msg["role"].as_str().unwrap_or("");
+            let content = msg["content"].as_str().unwrap_or("").to_owned();
+            if role == "system" {
+                system = Some(content);
+            } else {
+                messages.push(json!({ "role": role, "content": content }));
+            }
+        }
+    }
+
+    let max_tokens = body["max_tokens"].as_u64().unwrap_or(8096);
+    let stream = body["stream"].as_bool().unwrap_or(false);
+
+    let mut req = json!({
+        "model": claude_model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "stream": stream,
+    });
+
+    if let Some(sys) = system {
+        req["system"] = json!(sys);
+    }
+    if let Some(temp) = body.get("temperature") {
+        req["temperature"] = temp.clone();
+    }
+    if let Some(sp) = body.get("stop") {
+        req["stop_sequences"] = sp.clone();
+    }
+
+    req
+}
+
+/// Translate a complete (non-streaming) Anthropic Messages response to OpenAI format.
+fn translate_from_anthropic(body: serde_json::Value) -> serde_json::Value {
+    let id = format!("chatcmpl-{}", &uuid_v4()[..8]);
+    let model = body["model"].as_str().unwrap_or("claude-sonnet-4-6").to_owned();
+    let content = body["content"]
+        .as_array()
+        .and_then(|arr| arr.iter().find_map(|b| b["text"].as_str()))
+        .unwrap_or("")
+        .to_owned();
+    let stop_reason = body["stop_reason"].as_str().unwrap_or("end_turn");
+    let finish_reason = if stop_reason == "end_turn" { "stop" } else { stop_reason };
+    let input_tokens = body["usage"]["input_tokens"].as_u64().unwrap_or(0);
+    let output_tokens = body["usage"]["output_tokens"].as_u64().unwrap_or(0);
+
+    json!({
+        "id": id,
+        "object": "chat.completion",
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": { "role": "assistant", "content": content },
+            "finish_reason": finish_reason,
+        }],
+        "usage": {
+            "prompt_tokens": input_tokens,
+            "completion_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
+        }
+    })
+}
+
+fn uuid_v4() -> String {
+    use crate::oauth::rand_bytes;
+    let b: [u8; 16] = rand_bytes();
+    format!("{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+        u32::from_be_bytes(b[0..4].try_into().unwrap()),
+        u16::from_be_bytes(b[4..6].try_into().unwrap()),
+        u16::from_be_bytes(b[6..8].try_into().unwrap()),
+        u16::from_be_bytes(b[8..10].try_into().unwrap()),
+        {
+            let mut v = 0u64;
+            for &x in &b[10..16] { v = (v << 8) | x as u64; }
+            v
+        }
+    )
+}
+
+/// GET /v1/models — return Claude models in OpenAI format.
+async fn openai_models_handler() -> impl IntoResponse {
+    axum::Json(json!({
+        "object": "list",
+        "data": [
+            { "id": "claude-opus-4-6",           "object": "model", "owned_by": "anthropic" },
+            { "id": "claude-sonnet-4-6",          "object": "model", "owned_by": "anthropic" },
+            { "id": "claude-haiku-4-5-20251001",  "object": "model", "owned_by": "anthropic" },
+        ]
+    }))
+}
+
+/// POST /v1/chat/completions — translate OpenAI request to Anthropic, proxy through Claude pool.
+async fn openai_compat_handler(
+    State(s): State<AppState>,
+    req: Request,
+) -> Result<Response, ProxyError> {
+    let Some(ref anthropic_url) = s.anthropic_base_url else {
+        // No Anthropic proxy configured — fall back to normal forwarding
+        return proxy_handler(State(s), req).await;
+    };
+
+    let body_bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
+        .await
+        .map_err(|_| ProxyError::BodyRead)?;
+
+    let openai_body: serde_json::Value = serde_json::from_slice(&body_bytes)
+        .unwrap_or(json!({}));
+
+    let stream = openai_body["stream"].as_bool().unwrap_or(false);
+    let anthropic_body = translate_to_anthropic(openai_body);
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()
+        .map_err(|_| ProxyError::Upstream)?;
+
+    let resp = client
+        .post(format!("{anthropic_url}/v1/messages"))
+        .header("content-type", "application/json")
+        .header("x-shunt-compat", "openai")   // let Anthropic proxy pass through without re-auth
+        .json(&anthropic_body)
+        .send()
+        .await
+        .map_err(|_| ProxyError::Upstream)?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        let code = status.as_u16();
+        return Ok(axum::response::Response::builder()
+            .status(code)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body))
+            .unwrap());
+    }
+
+    if stream {
+        // Translate Anthropic SSE stream → OpenAI SSE stream
+        let chat_id = format!("chatcmpl-{}", &uuid_v4()[..8]);
+        let stream = translate_anthropic_stream(resp, chat_id);
+        Ok(axum::response::Response::builder()
+            .status(200)
+            .header("content-type", "text/event-stream")
+            .header("cache-control", "no-cache")
+            .body(axum::body::Body::from_stream(stream))
+            .unwrap())
+    } else {
+        let anthropic_resp: serde_json::Value = resp.json().await.map_err(|_| ProxyError::Upstream)?;
+        let openai_resp = translate_from_anthropic(anthropic_resp);
+        Ok(axum::Json(openai_resp).into_response())
+    }
+}
+
+/// Translate Anthropic SSE events to OpenAI SSE format, yielding raw bytes.
+fn translate_anthropic_stream(
+    resp: reqwest::Response,
+    chat_id: String,
+) -> impl futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> {
+    use futures_util::StreamExt;
+
+    let id = chat_id;
+    let byte_stream = resp.bytes_stream();
+
+    async_stream::stream! {
+        let mut buf = String::new();
+        futures_util::pin_mut!(byte_stream);
+
+        // Send initial role chunk
+        let init = format!(
+            "data: {}\n\n",
+            serde_json::to_string(&json!({
+                "id": id,
+                "object": "chat.completion.chunk",
+                "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": null}]
+            })).unwrap()
+        );
+        yield Ok(bytes::Bytes::from(init));
+
+        while let Some(chunk) = byte_stream.next().await {
+            let chunk = match chunk {
+                Ok(c) => c,
+                Err(_) => break,
+            };
+            buf.push_str(&String::from_utf8_lossy(&chunk));
+
+            // Process complete SSE lines
+            while let Some(nl) = buf.find('\n') {
+                let line = buf[..nl].trim_end_matches('\r').to_owned();
+                buf = buf[nl + 1..].to_owned();
+
+                if !line.starts_with("data: ") { continue; }
+                let data = &line["data: ".len()..];
+                if data == "[DONE]" { continue; }
+
+                let Ok(event) = serde_json::from_str::<serde_json::Value>(data) else { continue };
+                let event_type = event["type"].as_str().unwrap_or("");
+
+                let maybe_chunk = match event_type {
+                    "content_block_delta" => {
+                        let text = event["delta"]["text"].as_str().unwrap_or("");
+                        if text.is_empty() { continue; }
+                        Some(json!({
+                            "id": id,
+                            "object": "chat.completion.chunk",
+                            "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": null}]
+                        }))
+                    }
+                    "message_delta" => {
+                        let stop_reason = event["delta"]["stop_reason"].as_str().unwrap_or("stop");
+                        let finish = if stop_reason == "end_turn" { "stop" } else { stop_reason };
+                        Some(json!({
+                            "id": id,
+                            "object": "chat.completion.chunk",
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": finish}]
+                        }))
+                    }
+                    _ => None,
+                };
+
+                if let Some(c) = maybe_chunk {
+                    let out = format!("data: {}\n\n", serde_json::to_string(&c).unwrap());
+                    yield Ok(bytes::Bytes::from(out));
+                }
+            }
+        }
+
+        yield Ok(bytes::Bytes::from("data: [DONE]\n\n"));
     }
 }

@@ -1739,7 +1739,12 @@ async fn serve_all_providers(
             config_file: config.config_file.clone(),
         };
 
-        let (app, live_creds) = crate::proxy::create_app_with_state(provider_config.clone(), state.clone())?;
+        let anthropic_url = if provider == Provider::OpenAI {
+            Some(format!("http://{}:{}", host, primary_port))
+        } else {
+            None
+        };
+        let (app, live_creds) = crate::proxy::create_app_with_state(provider_config.clone(), state.clone(), anthropic_url)?;
         let listener = tokio::net::TcpListener::bind(format!("{host}:{port}"))
             .await
             .with_context(|| format!("cannot bind {host}:{port} for {provider_str} proxy"))?;

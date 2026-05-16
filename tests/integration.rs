@@ -174,7 +174,7 @@ async fn setup(streaming: bool, upstream_status: u16) -> (TestServer, TestServer
         accounts: vec![test_account()],
         config_file: std::path::PathBuf::from("/dev/null"),
     };
-    let (app, _) = create_app_with_state(cfg, StateStore::new_empty()).unwrap();
+    let (app, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
     let proxy = TestServer::start(app).await;
     (proxy, upstream, caps, Client::new())
 }
@@ -413,7 +413,7 @@ async fn setup_multi() -> (TestServer, TestServer, Captures, Client) {
         accounts: vec![test_account(), test_account2()],
         config_file: std::path::PathBuf::from("/dev/null"),
     };
-    let (app, _) = create_app_with_state(cfg, StateStore::new_empty()).unwrap();
+    let (app, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
     let proxy = TestServer::start(app).await;
     (proxy, upstream, caps, Client::new())
 }
@@ -463,7 +463,7 @@ async fn test_stickiness_same_conversation() {
         accounts: vec![test_account(), test_account2()],
         config_file: std::path::PathBuf::from("/dev/null"),
     };
-    let (app, _) = create_app_with_state(cfg, StateStore::new_empty()).unwrap();
+    let (app, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
     let proxy = TestServer::start(app).await;
     let client = Client::new();
 
@@ -508,7 +508,7 @@ async fn test_all_accounts_exhausted_returns_503() {
         accounts: vec![test_account(), test_account2()],
         config_file: std::path::PathBuf::from("/dev/null"),
     };
-    let (app, _) = create_app_with_state(cfg, StateStore::new_empty()).unwrap();
+    let (app, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
     let proxy = TestServer::start(app).await;
     let client = Client::new();
 
@@ -610,7 +610,7 @@ async fn test_remote_key_auth() {
         accounts: vec![test_account()],
         config_file: std::path::PathBuf::from("/dev/null"),
     };
-    let (app, _) = create_app_with_state(cfg, StateStore::new_empty()).unwrap();
+    let (app, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
     let proxy = TestServer::start(app).await;
     let client = Client::new();
     let body = r#"{"model":"claude-opus-4-5","max_tokens":1,"messages":[]}"#;
@@ -752,7 +752,7 @@ async fn test_live_api() {
         config_file: std::path::PathBuf::from("/dev/null"),
     };
 
-    let (app, _) = create_app_with_state(cfg, StateStore::new_empty()).unwrap();
+    let (app, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
     let proxy = TestServer::start(app).await;
     let client = Client::new();
 
