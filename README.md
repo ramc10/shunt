@@ -140,8 +140,49 @@ Credentials are stored separately in `credentials.json` (never in the config fil
 - One or more Claude Pro / Max accounts
 - Claude Code installed (shunt borrows its OAuth credentials)
 
+## Codex / OpenAI routing
+
+Shunt can route requests from OpenAI-compatible tools — including [Codex CLI](https://github.com/openai/codex) — through your Claude account pool. This lets you use Codex against Claude without an OpenAI subscription.
+
+When you have a Codex or OpenAI account in your config, shunt starts a second proxy on port **8083** that speaks the OpenAI API format. Requests are translated on the fly and forwarded to the Claude proxy on port 8082.
+
+### Add a Codex account
+
+```bash
+shunt add-account codex
+```
+
+Select **OpenAI / Codex** as the provider when prompted. Shunt uses the Codex device-code flow — it prints a short code, opens your browser, and completes auth automatically.
+
+### Point Codex at shunt
+
+```bash
+export OPENAI_BASE_URL=http://127.0.0.1:8083
+export OPENAI_API_KEY=dummy   # any non-empty value; shunt ignores it
+```
+
+Add these to your shell profile to make them permanent.
+
+### Model mapping
+
+OpenAI model names are mapped to Claude equivalents:
+
+| OpenAI model | Claude model |
+|---|---|
+| `gpt-4o`, `o1`, `o3`, `gpt-5` | `claude-opus-4-6` |
+| `gpt-4o-mini`, `o1-mini`, `o3-mini` | `claude-haiku-4-5-20251001` |
+| anything else | `claude-sonnet-4-6` |
+
+You can also pass Claude model names directly (e.g. `claude-sonnet-4-6`) and they pass through as-is.
+
+### What's supported
+
+- `POST /v1/chat/completions` — streaming and non-streaming, system messages, temperature, stop sequences
+- `GET /v1/models` — returns available Claude models in OpenAI format
+- Everything else is forwarded to the Codex/OpenAI upstream as-is
+
 ## Notes
 
 - Both accounts need to be **different Claude logins** — two sessions from the same account won't double your limits
-- Shunt only proxies `/v1/messages` and `/v1/messages/count_tokens` — everything else passes through untouched
+- Shunt only proxies `/v1/messages` and `/v1/messages/count_tokens` for the Anthropic endpoint — everything else passes through untouched
 - `shunt start` automatically kills and replaces any running instance
