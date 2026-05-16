@@ -142,11 +142,14 @@ Credentials are stored separately in `credentials.json` (never in the config fil
 
 ## Codex / OpenAI routing
 
-Shunt can route requests from OpenAI-compatible tools — including [Codex CLI](https://github.com/openai/codex) — through your Claude account pool. This lets you use Codex against Claude without an OpenAI subscription.
+Shunt supports two Codex use cases:
 
-When you have a Codex or OpenAI account in your config, shunt starts a second proxy on port **8083** that speaks the OpenAI API format. Requests are translated on the fly and forwarded to the Claude proxy on port 8082.
+1. **Route Codex through your Claude pool** — translate OpenAI requests to Anthropic format on the fly. No OpenAI/ChatGPT subscription needed.
+2. **Use a ChatGPT Pro account directly** — add your ChatGPT Pro account to the pool so Codex CLI authenticates through shunt. No separate login required.
 
-### Add a Codex account
+When any OpenAI/Codex account is configured, shunt starts a second proxy on port **8083** that speaks the OpenAI API format.
+
+### Add a Codex account (ChatGPT Pro)
 
 ```bash
 shunt add-account codex
@@ -154,18 +157,31 @@ shunt add-account codex
 
 Select **OpenAI / Codex** as the provider when prompted. Shunt uses the Codex device-code flow — it prints a short code, opens your browser, and completes auth automatically.
 
-### Point Codex at shunt
+After adding the account, shunt automatically writes `~/.codex/auth.json` with the correct credentials. You can run `codex` immediately without logging in again.
+
+### Run Codex CLI
+
+```bash
+codex
+```
+
+Shunt keeps `~/.codex/auth.json` up to date whenever tokens are refreshed, so you never need to re-authenticate in the Codex CLI.
+
+### Route other OpenAI-compatible tools through Claude
+
+If you want to use Codex (or any OpenAI-compatible tool) against your **Claude** accounts instead of ChatGPT, point it at shunt's OpenAI-compat endpoint:
 
 ```bash
 export OPENAI_BASE_URL=http://127.0.0.1:8083
 export OPENAI_API_KEY=dummy   # any non-empty value; shunt ignores it
+codex
 ```
 
-Add these to your shell profile to make them permanent.
+Add these to your shell profile to make them permanent. Requests are translated from OpenAI format to Anthropic format and routed through your Claude pool.
 
-### Model mapping
+### Model mapping (Claude routing)
 
-OpenAI model names are mapped to Claude equivalents:
+When routing through Claude, OpenAI model names are mapped automatically:
 
 | OpenAI model | Claude model |
 |---|---|
@@ -173,13 +189,13 @@ OpenAI model names are mapped to Claude equivalents:
 | `gpt-4o-mini`, `o1-mini`, `o3-mini` | `claude-haiku-4-5-20251001` |
 | anything else | `claude-sonnet-4-6` |
 
-You can also pass Claude model names directly (e.g. `claude-sonnet-4-6`) and they pass through as-is.
+Claude model names (e.g. `claude-sonnet-4-6`) pass through as-is.
 
 ### What's supported
 
 - `POST /v1/chat/completions` — streaming and non-streaming, system messages, temperature, stop sequences
 - `GET /v1/models` — returns available Claude models in OpenAI format
-- Everything else is forwarded to the Codex/OpenAI upstream as-is
+- Everything else is forwarded to the ChatGPT upstream as-is
 
 ## Notes
 
