@@ -1188,12 +1188,25 @@ fn auto_write_shell_export(port: u16) {
 
 async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
     let mut config = crate::config::load_config(config_override.as_deref())?;
-    let proxy_url = format!("http://{}:{}", config.server.host, config.server.port);
-    let status_url = format!("{proxy_url}/status");
+    let primary_url = format!("http://{}:{}", config.server.host, config.server.port);
 
-    // Try to fetch live data from running proxy
-    let live: Option<serde_json::Value> = reqwest::get(&status_url).await.ok()
-        .and_then(|r| futures_executor_hack(r));
+    // Fetch live status from every provider's proxy (each runs on its own port).
+    // provider_label → serde_json::Value
+    let provider_urls = listener_addrs(&config.accounts, &config.server.host, config.server.port);
+    let mut live_by_provider: std::collections::HashMap<String, serde_json::Value> =
+        std::collections::HashMap::new();
+    for (label, url) in &provider_urls {
+        if let Some(v) = reqwest::get(format!("{url}/status")).await.ok()
+            .and_then(|r| futures_executor_hack(r))
+        {
+            live_by_provider.insert(label.clone(), v);
+        }
+    }
+
+    // Primary proxy (Anthropic) drives the overall running/stopped display.
+    let live: Option<&serde_json::Value> = live_by_provider
+        .get(&crate::provider::Provider::Anthropic.to_string())
+        .or_else(|| live_by_provider.values().next());
 
     // Back-fill missing emails (existing accounts set up before email support).
     // Fetch in parallel, persist any that are new.
@@ -1216,7 +1229,7 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
     }
 
     let proxy_line = if live.is_some() {
-        format!("{}  {}  {}", green(DOT), green_bold("running"), cyan(&proxy_url))
+        format!("{}  {}  {}", green(DOT), green_bold("running"), cyan(&primary_url))
     } else {
         {
             let log_hint = if log_path().exists() {
@@ -1234,8 +1247,8 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
         proxy_line,
     ]);
 
-    let pinned_account = live.as_ref().and_then(|v| v["pinned"].as_str()).map(|s| s.to_owned());
-    let last_used_account = live.as_ref().and_then(|v| v["last_used"].as_str()).map(|s| s.to_owned());
+    let pinned_account = live.and_then(|v| v["pinned"].as_str()).map(|s| s.to_owned());
+    let last_used_account = live.and_then(|v| v["last_used"].as_str()).map(|s| s.to_owned());
 
     // Pinned notice
     if let Some(ref pinned) = pinned_account {
@@ -1249,7 +1262,7 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
     let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs()).unwrap_or(0);
 
     for acc in &config.accounts {
-        let live_acc = live.as_ref()
+        let live_acc = live_by_provider.get(&acc.provider.to_string())
             .and_then(|v| v["accounts"].as_array())
             .and_then(|arr| arr.iter().find(|a| a["name"] == acc.name));
 
@@ -1267,10 +1280,19 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
             },
         };
 
-        let plan_label = match acc.plan_type.to_lowercase().as_str() {
-            "max" | "claude_max" => "Claude Max",
-            "team"               => "Claude Team",
-            _                    => "Claude Pro",
+        let plan_label = if acc.provider == crate::provider::Provider::OpenAI {
+            match acc.plan_type.to_lowercase().as_str() {
+                "plus"  => "ChatGPT Plus",
+                "pro"   => "ChatGPT Pro",
+                "team"  => "ChatGPT Team",
+                _       => "ChatGPT",
+            }
+        } else {
+            match acc.plan_type.to_lowercase().as_str() {
+                "max" | "claude_max" => "Claude Max",
+                "team"               => "Claude Team",
+                _                    => "Claude Pro",
+            }
         };
         let email_str = acc.credential.as_ref().and_then(|c| c.email.as_deref()).unwrap_or("");
         let tokens_str = live_acc

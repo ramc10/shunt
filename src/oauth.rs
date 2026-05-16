@@ -22,9 +22,9 @@ pub const OAUTH_TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
 // ---------------------------------------------------------------------------
 
 pub const OPENAI_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
-pub const OPENAI_OAUTH_AUTHORIZE_URL: &str = "https://auth.openai.com/authorize";
 pub const OPENAI_OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
-pub const OPENAI_OAUTH_REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
+pub const OPENAI_DEVICE_CODE_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/usercode";
+pub const OPENAI_DEVICE_TOKEN_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/token";
 
 // ---------------------------------------------------------------------------
 // Credential type
@@ -566,137 +566,133 @@ pub async fn refresh_openai_token(cred: &OAuthCredential) -> Result<OAuthCredent
 }
 
 // ---------------------------------------------------------------------------
-// OpenAI PKCE browser OAuth flow (for adding additional Codex accounts)
+// OpenAI / Codex device code flow (custom 3-step, not RFC 8628)
 // ---------------------------------------------------------------------------
+//
+// Codex uses its own device auth protocol:
+//   1. POST /deviceauth/usercode  {"client_id"} → {device_auth_id, user_code, interval}
+//   2. Poll  POST /deviceauth/token  {"device_auth_id","user_code"} until 200
+//            → {authorization_code, code_verifier, code_challenge}
+//   3. POST /oauth/token  PKCE exchange → {access_token, refresh_token, id_token}
+//
+// Verification URI where the user enters the code: https://auth.openai.com/codex/device
 
-/// Run the PKCE OAuth flow for OpenAI / Codex.
+/// Run the Codex device authorization flow. No local HTTP server required.
 ///
-/// Opens the browser to OpenAI's auth page. A local HTTP server on port 1455
-/// captures the redirect callback automatically — no manual code paste needed.
+/// Displays a short user_code; the user visits `https://auth.openai.com/codex/device`
+/// and enters it. We poll until authorized, then exchange for tokens.
 pub async fn run_openai_oauth_flow() -> Result<OAuthCredential> {
-    let pkce = generate_pkce();
-    let state = random_state();
+    const VERIFY_URI: &str = "https://auth.openai.com/codex/device";
+    const TIMEOUT_SECS: u64 = 15 * 60;
 
-    let scope = urlencoding::encode("openid email profile offline_access");
-    let auth_url = format!(
-        "{base}?response_type=code\
-         &client_id={client_id}\
-         &redirect_uri={redirect}\
-         &scope={scope}\
-         &state={state}\
-         &code_challenge={challenge}\
-         &code_challenge_method=S256\
-         &id_token_add_organizations=true\
-         &codex_cli_simplified_flow=true",
-        base = OPENAI_OAUTH_AUTHORIZE_URL,
-        client_id = OPENAI_OAUTH_CLIENT_ID,
-        redirect = urlencoding::encode(OPENAI_OAUTH_REDIRECT_URI),
-        scope = scope,
-        state = state,
-        challenge = pkce.challenge,
-    );
-
-    println!("\nOpening browser for OpenAI / Codex login...");
-    println!("If it does not open automatically, visit:\n  {auth_url}\n");
-    open_browser(&auth_url);
-
-    println!("Waiting for authorization (listening on port 1455)...");
-    let code = listen_for_oauth_callback(1455).await
-        .context("failed to receive OAuth callback on localhost:1455")?;
-
-    let cred = exchange_openai_code(&code, &state, &pkce.verifier).await?;
-    Ok(cred)
-}
-
-/// Spin up a minimal HTTP server on `port`, wait for the first GET request to
-/// `/auth/callback?code=...`, extract the code, and send a success page.
-async fn listen_for_oauth_callback(port: u16) -> Result<String> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
-        .await
-        .with_context(|| format!("cannot bind to 127.0.0.1:{port} for OAuth callback"))?;
-
-    // Accept exactly one connection — the browser redirect.
-    let (mut stream, _) = tokio::time::timeout(
-        std::time::Duration::from_secs(120),
-        listener.accept(),
-    )
-    .await
-    .context("timed out waiting for OAuth callback (120s)")?
-    .context("accept failed")?;
-
-    let mut buf = vec![0u8; 8192];
-    let n = stream.read(&mut buf).await.context("callback read failed")?;
-    let request = String::from_utf8_lossy(&buf[..n]);
-
-    // Parse: "GET /auth/callback?code=XXXX&state=YYYY HTTP/1.1"
-    let first_line = request.lines().next().unwrap_or("");
-    let path = first_line.split_whitespace().nth(1).unwrap_or("");
-    let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
-
-    let code = query
-        .split('&')
-        .find_map(|kv| {
-            let (k, v) = kv.split_once('=')?;
-            if k == "code" { Some(urlencoding::decode(v).ok()?.into_owned()) } else { None }
-        })
-        .context("OAuth callback did not contain a 'code' parameter")?;
-
-    let html = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n\
-        <html><body style='font-family:sans-serif;padding:2em'>\
-        <h2>Authorization successful</h2>\
-        <p>You can close this tab and return to the terminal.</p>\
-        </body></html>";
-    stream.write_all(html.as_bytes()).await.ok();
-
-    Ok(code)
-}
-
-async fn exchange_openai_code(code: &str, _state: &str, verifier: &str) -> Result<OAuthCredential> {
     let client = reqwest::Client::new();
 
-    let body = format!(
-        "grant_type=authorization_code&code={}&redirect_uri={}&client_id={}&code_verifier={}",
-        urlencoding::encode(code),
-        urlencoding::encode(OPENAI_OAUTH_REDIRECT_URI),
-        OPENAI_OAUTH_CLIENT_ID,
-        urlencoding::encode(verifier),
-    );
-
+    // Step 1: request user code
     let resp = client
-        .post(OPENAI_OAUTH_TOKEN_URL)
-        .header("content-type", "application/x-www-form-urlencoded")
-        .body(body)
+        .post(OPENAI_DEVICE_CODE_URL)
+        .header("content-type", "application/json")
+        .json(&serde_json::json!({"client_id": OPENAI_OAUTH_CLIENT_ID}))
         .send()
         .await
-        .context("OpenAI code exchange request failed")?;
+        .context("Codex device code request failed")?;
 
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        bail!("OpenAI code exchange failed ({status}): {body}");
+        bail!("Codex device code request failed ({status}): {body}");
     }
 
-    let body: serde_json::Value = resp.json().await.context("OpenAI code exchange: invalid JSON")?;
+    let info: serde_json::Value = resp.json().await.context("device code: invalid JSON")?;
+    let device_auth_id = info["device_auth_id"].as_str().context("missing device_auth_id")?.to_owned();
+    let user_code = info["user_code"].as_str().context("missing user_code")?.to_owned();
+    let interval_secs = info["interval"].as_u64().unwrap_or(5);
 
+    println!();
+    println!("  Visit:  {VERIFY_URI}");
+    println!("  Code:   \x1b[1;33m{user_code}\x1b[0m");
+    println!();
+    println!("  Waiting for authorization...");
+
+    open_browser(VERIFY_URI);
+
+    // Step 2: poll until code is approved
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(TIMEOUT_SECS);
+    let poll_interval = std::time::Duration::from_secs(interval_secs);
+    let poll_body = serde_json::json!({
+        "device_auth_id": device_auth_id,
+        "user_code": user_code,
+    });
+
+    let (authorization_code, code_verifier) = loop {
+        tokio::time::sleep(poll_interval).await;
+
+        if std::time::Instant::now() > deadline {
+            bail!("Device code expired (15 min). Run `shunt add-account` again.");
+        }
+
+        let resp = client
+            .post(OPENAI_DEVICE_TOKEN_URL)
+            .header("content-type", "application/json")
+            .json(&poll_body)
+            .send()
+            .await
+            .context("Codex device poll request failed")?;
+
+        let status = resp.status();
+        // 403/404 = still pending; any 2xx = authorized
+        if status.as_u16() == 403 || status.as_u16() == 404 {
+            continue;
+        }
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Codex device poll error ({status}): {body}");
+        }
+
+        let body: serde_json::Value = resp.json().await.context("device poll: invalid JSON")?;
+        let code = body["authorization_code"].as_str().context("missing authorization_code")?.to_owned();
+        let verifier = body["code_verifier"].as_str().context("missing code_verifier")?.to_owned();
+        break (code, verifier);
+    };
+
+    // Step 3: exchange authorization_code for tokens
+    let redirect_uri = format!("https://auth.openai.com/deviceauth/callback");
+    let token_body = format!(
+        "grant_type=authorization_code&code={}&redirect_uri={}&client_id={}&code_verifier={}",
+        urlencoding::encode(&authorization_code),
+        urlencoding::encode(&redirect_uri),
+        OPENAI_OAUTH_CLIENT_ID,
+        urlencoding::encode(&code_verifier),
+    );
+    let resp = client
+        .post(OPENAI_OAUTH_TOKEN_URL)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(token_body)
+        .send()
+        .await
+        .context("Codex token exchange failed")?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        bail!("Codex token exchange failed ({status}): {body}");
+    }
+
+    let body: serde_json::Value = resp.json().await.context("token exchange: invalid JSON")?;
     let access_token = body["access_token"]
         .as_str()
-        .context("OpenAI code exchange: missing access_token")?
+        .or_else(|| body["id_token"].as_str())
+        .context("token exchange: missing access_token")?
         .to_owned();
     let refresh_token = body["refresh_token"].as_str().unwrap_or("").to_owned();
-    let expires_in = body["expires_in"].as_u64().unwrap_or(3600);
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
+    let expires_at = jwt_exp_ms(&access_token).unwrap_or_else(|| {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        now_ms + body["expires_in"].as_u64().unwrap_or(3600) * 1000
+    });
 
-    Ok(OAuthCredential {
-        access_token,
-        refresh_token,
-        expires_at: now_ms + expires_in * 1000,
-        email: None,
-    })
+    Ok(OAuthCredential { access_token, refresh_token, expires_at, email: None })
 }
 
 // ---------------------------------------------------------------------------
