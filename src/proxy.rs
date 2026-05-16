@@ -4,7 +4,7 @@ use std::sync::Arc;
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, get, post};
+use axum::routing::{get, post};
 use axum::Router;
 use bytes::Bytes;
 use serde_json::json;
@@ -85,7 +85,7 @@ pub fn create_app_with_state(
         Provider::OpenAI => Router::new()
             .route("/v1/chat/completions", post(openai_compat_handler))
             .route("/v1/models", get(openai_models_handler))
-            .route("/*path", any(proxy_handler)),
+            .fallback(proxy_handler),
     };
 
     let app = Router::new()
@@ -813,7 +813,9 @@ async fn openai_compat_handler(
     let resp = client
         .post(format!("{anthropic_url}/v1/messages"))
         .header("content-type", "application/json")
-        .header("x-shunt-compat", "openai")   // let Anthropic proxy pass through without re-auth
+        .header("anthropic-version", "2023-06-01")
+        .header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20")
+        .header("x-shunt-compat", "openai")
         .json(&anthropic_body)
         .send()
         .await
