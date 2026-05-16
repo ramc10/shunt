@@ -320,7 +320,9 @@ async fn cmd_add_account(
         let in_config = existing_config.contains(&format!("name = \"{n}\""));
         let has_cred  = store.accounts.contains_key(&n);
         let is_expired = store.accounts.get(&n).map(|c| c.needs_refresh()).unwrap_or(false);
-        if in_config && has_cred && !is_expired {
+        let is_auth_failed = crate::state::StateStore::load(&crate::config::state_path())
+            .account_states().get(&n).map(|s| s.auth_failed).unwrap_or(false);
+        if in_config && has_cred && !is_expired && !is_auth_failed {
             bail!("Account '{}' already has a valid credential.", n);
         }
         (n, in_config)
