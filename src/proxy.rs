@@ -602,6 +602,58 @@ async fn auth_probe_get(
 }
 
 // ---------------------------------------------------------------------------
+// Proactive OpenAI token refresh loop
+// ---------------------------------------------------------------------------
+
+/// Keeps OpenAI `id_token`s perpetually fresh by refreshing every 50 minutes.
+///
+/// The `id_token` inside `~/.codex/auth.json` has a 1-hour TTL. If it expires
+/// the codex CLI tries to refresh it directly against OpenAI's OAuth endpoint,
+/// which often fails because the refresh token has rotated. By refreshing here
+/// before expiry we ensure codex CLI never needs to do its own refresh.
+pub async fn openai_token_refresh_loop(config: Arc<Config>, state: StateStore) {
+    // Wait a bit after startup so the initial auth probe (prefetch) completes first.
+    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+
+    loop {
+        for account in config.accounts.iter()
+            .filter(|a| a.provider == crate::provider::Provider::OpenAI)
+        {
+            let creds = match account.credential.clone() {
+                Some(c) => c,
+                None => continue,
+            };
+
+            // Skip accounts already marked as needing reauth.
+            if state.account_states().get(&account.name).map(|s| s.auth_failed).unwrap_or(false) {
+                continue;
+            }
+
+            tracing::info!(account = %account.name, "proactive OpenAI token refresh");
+            match account.provider.refresh_token(&creds).await {
+                Ok(fresh) => {
+                    tracing::info!(account = %account.name, "proactive refresh ok — auth.json updated");
+                    let mut store = crate::config::CredentialsStore::load();
+                    store.accounts.insert(account.name.clone(), fresh.clone());
+                    store.save().ok();
+                    if fresh.id_token.is_some() {
+                        crate::oauth::write_codex_auth_file(&fresh);
+                    }
+                    state.clear_auth_failed(&account.name);
+                }
+                Err(e) => {
+                    tracing::warn!(account = %account.name, "proactive refresh failed: {e}");
+                    state.set_auth_failed(&account.name);
+                }
+            }
+        }
+
+        // Refresh every 50 minutes — well before the 60-minute id_token TTL.
+        tokio::time::sleep(std::time::Duration::from_secs(50 * 60)).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Error type
 // ---------------------------------------------------------------------------
 

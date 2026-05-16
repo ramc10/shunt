@@ -1780,6 +1780,7 @@ async fn serve_all_providers(
 
         let cfg_arc = std::sync::Arc::new(provider_config);
         tokio::spawn(crate::proxy::prefetch_rate_limits(cfg_arc.clone(), state.clone()));
+        tokio::spawn(crate::proxy::openai_token_refresh_loop(cfg_arc.clone(), state.clone()));
         tokio::spawn(crate::proxy::recovery_watcher(cfg_arc, state.clone(), live_creds));
         handles.push(tokio::spawn(async move {
             axum::serve(listener, app).await
