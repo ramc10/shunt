@@ -1384,7 +1384,7 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
         } else if status == "reauth_required" {
             println!("{}", card_row(&format!("{}  run {}",
                 dim("·"), cyan(&format!("shunt add-account {}", acc.name)))));
-        } else if live.is_some() && live_acc.is_some() {
+        } else if live.is_some() && live_acc.is_some() && acc.provider == crate::provider::Provider::Anthropic {
             println!("{}", card_row(&dim("· quota data will appear after first request")));
         }
 

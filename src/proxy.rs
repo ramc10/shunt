@@ -442,6 +442,7 @@ pub async fn prefetch_rate_limits(config: Arc<Config>, state: StateStore) {
             Some(c) => c,
             None => continue,
         };
+
         let Some((path, body)) = account.provider.prefetch_request() else { continue };
         let url = format!("{}{}", config.server.upstream_url, path);
 

@@ -128,7 +128,7 @@ impl Provider {
                     "messages": [{"role": "user", "content": "hi"}]
                 }),
             )),
-            // Codex uses chatgpt.com/backend-api — no cheap probe endpoint available yet.
+            // chatgpt.com does not return x-ratelimit-* headers on any endpoint — no probe possible.
             Provider::OpenAI => None,
         }
     }
