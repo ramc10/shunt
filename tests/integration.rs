@@ -145,8 +145,8 @@ fn test_credential() -> OAuthCredential {
         email: None,
         access_token: TEST_TOKEN.into(),
         refresh_token: "test-refresh-token".into(),
-        // Far future — never needs refresh
         expires_at: u64::MAX / 2,
+        id_token: None,
     }
 }
 
@@ -367,6 +367,7 @@ fn test_account2() -> AccountConfig {
             access_token: TEST_TOKEN_2.into(),
             refresh_token: "test-refresh-2".into(),
             expires_at: u64::MAX / 2,
+            id_token: None,
         }),
     }
 }
@@ -738,6 +739,7 @@ async fn test_live_api() {
         access_token: if is_bearer { token.clone() } else { token.clone() },
         refresh_token: String::new(),
         expires_at: u64::MAX / 2,
+        id_token: None,
     };
 
     let cfg = Config {
