@@ -662,106 +662,51 @@ async fn do_proactive_refresh(
     }
 }
 
-/// Compute how many seconds to sleep until 15 minutes before the soonest
-/// OpenAI id_token expiry. Capped at 45 minutes; at least 60 seconds.
-async fn secs_until_next_refresh(config: &Config, live_creds: &LiveCredentials) -> u64 {
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-    const WAKE_BEFORE_MS: u64 = 15 * 60 * 1_000; // wake 15 min before expiry
-    const MAX_SLEEP_SECS: u64 = 45 * 60;
-    const MIN_SLEEP_SECS: u64 = 60;
 
-    let mut min_sleep_secs = MAX_SLEEP_SECS;
-
-    for account in config.accounts.iter()
-        .filter(|a| a.provider == crate::provider::Provider::OpenAI)
-    {
-        let creds = live_creds.read().await.get(&account.name).cloned();
-        let Some(creds) = creds else { continue };
-        let Some(ref id_tok) = creds.id_token else { continue };
-        let Some(exp_ms) = crate::oauth::jwt_exp_ms(id_tok) else { continue };
-
-        // How many ms until we want to wake (15 min before expiry)?
-        let wake_ms = exp_ms.saturating_sub(WAKE_BEFORE_MS);
-        let sleep_ms = wake_ms.saturating_sub(now_ms);
-        let sleep_secs = (sleep_ms / 1_000).clamp(MIN_SLEEP_SECS, MAX_SLEEP_SECS);
-        min_sleep_secs = min_sleep_secs.min(sleep_secs);
-    }
-
-    min_sleep_secs
-}
-
-/// Keeps OpenAI `id_token`s perpetually fresh.
+/// Keeps shunt's live credentials in sync with Codex CLI's auth.json.
 ///
-/// Strategy:
-/// - At startup: only refresh if the id_token is already expired (< 2 min left).
-///   If the token is fresh, we skip — codex CLI does its own startup refresh and
-///   rotating the token from two places simultaneously causes "invalid_grant".
-/// - Dynamically scheduled: sleep until 15 min before the id_token expires,
-///   then re-sync from auth.json (codex may have refreshed it) and refresh.
-///
-/// This avoids racing with codex CLI's startup refresh while still ensuring
-/// the token is always fresh when codex needs it.
+/// Strategy: never proactively rotate the refresh_token — that races with
+/// Codex CLI's own refresh logic and causes "invalid_grant" errors. Instead,
+/// just periodically sync from auth.json so shunt picks up whatever Codex wrote.
+/// On-demand refresh (401 handler) covers the case where Codex isn't running
+/// and the token has actually expired.
 pub async fn openai_token_refresh_loop(
     config: Arc<Config>,
     state: StateStore,
     live_creds: LiveCredentials,
 ) {
-    // Startup pass: only refresh if token is already expired.
+    // Startup: sync from auth.json first (Codex may have refreshed since shunt last ran).
     for account in config.accounts.iter()
         .filter(|a| a.provider == crate::provider::Provider::OpenAI)
     {
         if state.account_states().get(&account.name).map(|s| s.auth_failed).unwrap_or(false) {
             continue;
         }
+        sync_live_creds_from_auth_json(&account.name, &live_creds).await;
+
         let creds = {
             let map = live_creds.read().await;
             map.get(&account.name).cloned().or_else(|| account.credential.clone())
         };
         if let Some(creds) = creds {
             if id_token_expires_soon(&creds, 2) {
-                // Token already expired (or expiring within 2 min) at startup — refresh now.
+                // Token is already dead — refresh now so shunt can serve requests immediately.
+                // (Codex is unlikely to be running at the exact same moment with a dead token.)
                 do_proactive_refresh(account, &creds, &live_creds, &state).await;
             } else {
-                tracing::info!(account = %account.name, "id_token fresh at startup — skipping immediate refresh");
+                tracing::info!(account = %account.name, "id_token fresh at startup");
             }
         }
     }
 
+    // Periodic sync every 5 minutes — picks up any token Codex CLI has written.
+    // No proactive refresh: Codex owns the refresh lifecycle; shunt uses what Codex produces.
     loop {
-        // Sleep until ~15 min before the soonest id_token expiry (max 45 min).
-        // This ensures we always refresh before codex CLI needs to, regardless
-        // of when shunt started relative to the last token refresh.
-        let sleep_secs = secs_until_next_refresh(&config, &live_creds).await;
-        tracing::debug!("next OpenAI token refresh check in {}m {}s",
-            sleep_secs / 60, sleep_secs % 60);
-        tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)).await;
-
+        tokio::time::sleep(std::time::Duration::from_secs(5 * 60)).await;
         for account in config.accounts.iter()
             .filter(|a| a.provider == crate::provider::Provider::OpenAI)
         {
-            if state.account_states().get(&account.name).map(|s| s.auth_failed).unwrap_or(false) {
-                continue;
-            }
-
-            // Pull in any token rotation codex CLI has done since our last refresh.
             sync_live_creds_from_auth_json(&account.name, &live_creds).await;
-
-            let creds = {
-                let map = live_creds.read().await;
-                map.get(&account.name).cloned().or_else(|| account.credential.clone())
-            };
-            let Some(creds) = creds else { continue };
-
-            // Only refresh if id_token has < 15 minutes left.
-            if !id_token_expires_soon(&creds, 15) {
-                tracing::debug!(account = %account.name, "id_token still fresh, skipping refresh");
-                continue;
-            }
-
-            do_proactive_refresh(account, &creds, &live_creds, &state).await;
         }
     }
 }
