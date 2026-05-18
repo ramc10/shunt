@@ -355,6 +355,33 @@ impl StateStore {
         rl.utilization_5h.unwrap_or(0.0)
     }
 
+    /// 7-day utilization 0.0–1.0 from the last upstream response headers.
+    /// Returns 0.0 for fresh accounts or when the reset window has already passed.
+    pub fn utilization_7d(&self, name: &str) -> f64 {
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let data = self.inner.lock().unwrap();
+        let Some(rl) = data.rate_limits.get(name) else { return 0.0 };
+        if rl.reset_7d.map(|t| t <= now_secs).unwrap_or(false) {
+            return 0.0;
+        }
+        rl.utilization_7d.unwrap_or(0.0)
+    }
+
+    /// Unix epoch seconds when this account's 7d window resets.
+    /// Returns None if unknown or already past.
+    pub fn reset_7d_secs(&self, name: &str) -> Option<u64> {
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let data = self.inner.lock().unwrap();
+        let reset = data.rate_limits.get(name)?.reset_7d?;
+        if reset > now_secs { Some(reset) } else { None }
+    }
+
     /// Record token usage from a completed request.
     /// Lazily resets the window if the 5-hour period has elapsed.
     pub fn record_usage(&self, name: &str, input_tokens: u64, output_tokens: u64) {

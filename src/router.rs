@@ -66,6 +66,26 @@ fn canonical_tools(v: &serde_json::Value) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Account selection helpers
+// ---------------------------------------------------------------------------
+
+/// Return the (utilization, reset_secs) pair for whichever window expires sooner.
+/// If only one window has data, return that. If neither, return (0.0, None).
+fn most_urgent_window(
+    util_5h: f64, reset_5h: Option<u64>,
+    util_7d: f64, reset_7d: Option<u64>,
+) -> (f64, Option<u64>) {
+    match (reset_5h, reset_7d) {
+        (Some(r5), Some(r7)) => {
+            if r5 <= r7 { (util_5h, Some(r5)) } else { (util_7d, Some(r7)) }
+        }
+        (Some(r5), None) => (util_5h, Some(r5)),
+        (None, Some(r7)) => (util_7d, Some(r7)),
+        (None, None)     => (util_5h.max(util_7d), None),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Account selection
 // ---------------------------------------------------------------------------
 
@@ -113,7 +133,8 @@ pub fn pick_account<'a>(
     // Pick the best account:
     // - "Expiring soon" (reset within 30 min, not exhausted) → use it or lose it;
     //   among those, prefer the most urgent (soonest reset).
-    // - Otherwise → least-utilized-first so load spreads evenly across accounts.
+    // - Otherwise → drain most-utilized-first within the same reset window so tokens
+    //   aren't wasted; across different windows, prefer the soonest-expiring window.
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -123,10 +144,16 @@ pub fn pick_account<'a>(
         .iter()
         .filter(|a| !tried.contains(&a.name) && state.is_available(&a.name))
         .min_by(|a, b| {
-            let ua = state.utilization_5h(&a.name);
-            let ub = state.utilization_5h(&b.name);
-            let ra = state.reset_5h_secs(&a.name);
-            let rb = state.reset_5h_secs(&b.name);
+            // Use the most-urgent (soonest-resetting) window for each account.
+            // If both windows are active, the one expiring sooner is the binding constraint.
+            let (ua, ra) = most_urgent_window(
+                state.utilization_5h(&a.name), state.reset_5h_secs(&a.name),
+                state.utilization_7d(&a.name), state.reset_7d_secs(&a.name),
+            );
+            let (ub, rb) = most_urgent_window(
+                state.utilization_5h(&b.name), state.reset_5h_secs(&b.name),
+                state.utilization_7d(&b.name), state.reset_7d_secs(&b.name),
+            );
 
             let a_expiring = ra.map(|r| r.saturating_sub(now_secs) <= expiry_soon_secs).unwrap_or(false) && ua < 1.0;
             let b_expiring = rb.map(|r| r.saturating_sub(now_secs) <= expiry_soon_secs).unwrap_or(false) && ub < 1.0;
