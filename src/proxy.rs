@@ -243,6 +243,8 @@ async fn proxy_handler(
     let mut tried: HashSet<String> = HashSet::new();
     // Track accounts we've already attempted a token refresh for this request.
     let mut refreshed: HashSet<String> = HashSet::new();
+    // Total wait budget: up to 5 hours (Claude's rate-limit reset window).
+    let wait_deadline_ms = now_ms() + 5 * 60 * 60 * 1_000;
 
     loop {
         let account = match router::pick_account(
@@ -250,7 +252,31 @@ async fn proxy_handler(
             s.config.server.sticky_ttl_ms, s.config.server.expiry_soon_secs,
         ) {
             Some(a) => a,
-            None => return Err(ProxyError::AllAccountsUnavailable),
+            None => {
+                // Check whether any accounts are just temporarily cooling down
+                // (429/529 backoff) rather than permanently disabled / auth_failed.
+                // If so, wait for the soonest one to recover and retry.
+                let account_states = s.state.account_states();
+                let now = now_ms();
+                let soonest_ms = s.config.accounts.iter()
+                    .filter_map(|a| {
+                        let st = account_states.get(&a.name)?;
+                        if st.disabled { return None; } // auth_failed or permanently off
+                        if st.cooldown_until_ms > now { Some(st.cooldown_until_ms) } else { None }
+                    })
+                    .min();
+
+                match soonest_ms {
+                    Some(wake_ms) if wake_ms <= wait_deadline_ms => {
+                        let wait_ms = wake_ms.saturating_sub(now_ms()) + 50; // +50 ms buffer
+                        warn!(wait_ms, "all accounts cooling — waiting for next available account");
+                        tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+                        tried.clear(); // accounts may have recovered; try them again
+                    }
+                    _ => return Err(ProxyError::AllAccountsUnavailable),
+                }
+                continue;
+            }
         };
 
         let account_name = account.name.clone();
@@ -289,11 +315,21 @@ async fn proxy_handler(
                 return Ok(tap_usage(response, &s.state, &account_name, &model, req_start_ms).await);
             }
             429 => {
-                warn!(account = %account_name, "429 rate-limited — cooling 60s");
-                if let Some(info) = account.provider.parse_rate_limits(response.headers()) {
+                let info = account.provider.parse_rate_limits(response.headers());
+                // Sleep until the actual reset time if the headers tell us when that is;
+                // otherwise fall back to 60s so we don't hammer the API.
+                let cooldown_ms = info.as_ref()
+                    .and_then(|i| i.reset_5h.or(i.reset_7d))
+                    .map(|reset_secs| {
+                        let reset_ms = reset_secs.saturating_mul(1_000);
+                        reset_ms.saturating_sub(now_ms()).saturating_add(500) // +500ms buffer
+                    })
+                    .unwrap_or(60_000);
+                warn!(account = %account_name, cooldown_ms, "429 rate-limited — cooling until reset");
+                if let Some(info) = info {
                     s.state.update_rate_limits(&account_name, info);
                 }
-                s.state.set_cooldown(&account_name, 60_000);
+                s.state.set_cooldown(&account_name, cooldown_ms);
                 tried.insert(account_name);
             }
             529 => {
