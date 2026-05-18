@@ -290,9 +290,6 @@ async fn proxy_handler(
                 .cloned()
                 .or_else(|| account.credential.clone());
             match cred {
-                Some(c) if account.provider == crate::provider::Provider::OpenAI => {
-                    c.id_token.unwrap_or(c.access_token)
-                }
                 Some(c) => c.access_token,
                 None => String::new(),
             }
@@ -592,8 +589,7 @@ async fn auth_probe_get(
         client.get(&url).headers(headers)
     };
 
-    // Use id_token for chatgpt.com (same as the proxy handler).
-    let probe_token = creds.id_token.as_deref().unwrap_or(&creds.access_token);
+    let probe_token = &creds.access_token;
     let resp = match do_get(probe_token).send().await {
         Ok(r) => r,
         Err(e) => { tracing::warn!(account = %account.name, "auth probe failed: {e}"); return; }
@@ -637,15 +633,15 @@ async fn auth_probe_get(
 // Proactive OpenAI token refresh loop
 // ---------------------------------------------------------------------------
 
-/// Returns true if the id_token inside `cred` has fewer than `threshold_mins`
-/// minutes remaining, or if there is no id_token / it cannot be parsed.
-fn id_token_expires_soon(cred: &crate::oauth::OAuthCredential, threshold_mins: u64) -> bool {
-    let Some(ref id_tok) = cred.id_token else { return true };
-    let Some(exp_ms) = crate::oauth::jwt_exp_ms(id_tok) else { return true };
+/// Returns true if the access_token inside `cred` has fewer than `threshold_mins`
+/// minutes remaining. Falls back to the stored `expires_at` if the JWT cannot be decoded.
+fn access_token_expires_soon(cred: &crate::oauth::OAuthCredential, threshold_mins: u64) -> bool {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
+    let exp_ms = crate::oauth::jwt_exp_ms(&cred.access_token)
+        .unwrap_or(cred.expires_at);
     exp_ms < now_ms + threshold_mins * 60 * 1_000
 }
 
@@ -725,12 +721,11 @@ pub async fn openai_token_refresh_loop(
             map.get(&account.name).cloned().or_else(|| account.credential.clone())
         };
         if let Some(creds) = creds {
-            if id_token_expires_soon(&creds, 2) {
-                // Token is already dead — refresh now so shunt can serve requests immediately.
-                // (Codex is unlikely to be running at the exact same moment with a dead token.)
+            if access_token_expires_soon(&creds, 30) {
+                // access_token is nearly expired — refresh now so shunt can serve requests immediately.
                 do_proactive_refresh(account, &creds, &live_creds, &state).await;
             } else {
-                tracing::info!(account = %account.name, "id_token fresh at startup");
+                tracing::info!(account = %account.name, "access_token fresh at startup");
             }
         }
     }
