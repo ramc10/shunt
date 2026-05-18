@@ -14,6 +14,7 @@ Claude's rate limits are per-account. If you hit your 5-hour or weekly limit on 
 
 - **Least-utilization routing** — tracks live `anthropic-ratelimit-unified-*` headers and always picks the account with the most headroom
 - **Auto-failover** — if one account is rate-limited, the next request goes to another
+- **Auto-resume** — if all accounts are exhausted, requests are held and automatically retried the moment the first account's limit resets (up to 5 hours), so your tools never see a hard failure mid-session
 - **Transparent** — drop-in replacement for `api.anthropic.com`; works with Claude Code, the SDK, or any tool that speaks the Anthropic API
 - **Account management** — add or remove accounts without restarting manually
 
@@ -102,7 +103,9 @@ shunt setup              # First-time setup
 
 Every response from the Anthropic API includes `anthropic-ratelimit-unified-5h-utilization` headers (a float from 0–1). Shunt captures these and always routes the next request to the account with the **lowest 5-hour utilization**. Fresh accounts (no data yet) are treated as 0% utilized and get highest priority.
 
-If a request returns 429 or 529, shunt marks that account as cooling and retries with the next-best account automatically.
+If a request returns 429 or 529, shunt reads the `reset_5h` timestamp from the response headers and sets that account's cooldown to exactly when the window resets — no polling. It then retries with the next-best account automatically.
+
+If every account is exhausted at once, shunt holds the request open and waits until the soonest account recovers (sleeping directly until the reset time), then retries transparently. Requests will wait up to 5 hours before giving up with a 503.
 
 ## Configuration
 
