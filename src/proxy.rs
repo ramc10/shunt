@@ -327,6 +327,14 @@ async fn proxy_handler(
                     s.state.update_rate_limits(&account_name, info);
                 }
                 s.state.set_cooldown(&account_name, cooldown_ms);
+                if cooldown_ms >= 5 * 60_000 {
+                    let mins = cooldown_ms / 60_000;
+                    notify(
+                        "shunt: Rate Limited",
+                        &format!("Account '{account_name}' hit quota limit — cooling {mins}m."),
+                        "Ping",
+                    );
+                }
                 tried.insert(account_name);
             }
             529 => {
@@ -391,6 +399,11 @@ async fn proxy_handler(
                 // Forbidden — subscription lapsed or org restriction; refreshing won't help.
                 error!(account = %account_name, "403 forbidden — cooling 30min");
                 s.state.set_cooldown(&account_name, 30 * 60_000);
+                notify(
+                    "shunt: Account Forbidden",
+                    &format!("Account '{account_name}' got 403 — subscription may have lapsed (cooling 30m)."),
+                    "Basso",
+                );
                 tried.insert(account_name);
             }
             _ => {
@@ -849,9 +862,19 @@ pub async fn recovery_watcher(
                 }
                 Ok(Err(e)) => {
                     tracing::error!(account = %name, error = %e, "recovery: token refresh failed");
+                    notify(
+                        "shunt: Reauth Required",
+                        &format!("Account '{name}' needs re-authorization. Run `shunt add-account`."),
+                        "Basso",
+                    );
                 }
                 Err(_) => {
                     tracing::error!(account = %name, "recovery: token refresh timed out");
+                    notify(
+                        "shunt: Reauth Required",
+                        &format!("Account '{name}' token refresh timed out. Run `shunt add-account`."),
+                        "Basso",
+                    );
                 }
             }
         }
@@ -872,7 +895,11 @@ pub async fn recovery_watcher(
                     "ALL accounts are offline (auth failed). \
                      Run `shunt add-account` to re-authorize."
                 );
-                notify_all_accounts_offline();
+                notify(
+                    "shunt: All Accounts Offline",
+                    "All accounts need re-authorization. Run `shunt add-account`.",
+                    "Basso",
+                );
                 last_notified = Some(Instant::now());
             }
         }
@@ -926,6 +953,8 @@ pub async fn cooldown_watcher(
     // In-memory: the cooldown_until_ms value we already ran a post-resume for.
     // Prevents re-triggering on every poll after expiry.
     let mut last_resumed: HashMap<String, u64> = HashMap::new();
+    // Accounts whose cooldown was long enough (≥5 min) to deserve a "back online" notification.
+    let mut notify_on_resume: HashSet<String> = HashSet::new();
 
     loop {
         let states = state.account_states();
@@ -953,10 +982,21 @@ pub async fn cooldown_watcher(
                             &config.server.upstream_url,
                         ).await;
                     }
+                    if notify_on_resume.remove(&account.name) {
+                        notify(
+                            "shunt: Account Resumed",
+                            &format!("Account '{}' is back online.", account.name),
+                            "Glass",
+                        );
+                    }
                     last_resumed.insert(account.name.clone(), cdl);
                 }
             } else {
-                // Still cooling — schedule wake at expiry
+                // Still cooling — schedule wake at expiry; flag for notification if long
+                let remaining = cdl - now;
+                if remaining >= 5 * 60_000 {
+                    notify_on_resume.insert(account.name.clone());
+                }
                 next_wake_ms = Some(next_wake_ms.map(|m| m.min(cdl)).unwrap_or(cdl));
             }
         }
@@ -969,17 +1009,20 @@ pub async fn cooldown_watcher(
     }
 }
 
-fn notify_all_accounts_offline() {
+/// Fire a macOS system notification. No-op on other platforms.
+/// `sound` is a macOS alert sound name ("Basso", "Ping", "Glass", etc.)
+fn notify(title: &str, body: &str, sound: &str) {
     #[cfg(target_os = "macos")]
     {
+        let script = format!(
+            "display notification {body:?} with title {title:?} sound name {sound:?}"
+        );
         let _ = std::process::Command::new("osascript")
-            .args(["-e", concat!(
-                r#"display notification "#,
-                r#""All accounts have lost authentication. Run `shunt add-account` to re-authorize." "#,
-                r#"with title "shunt: All Accounts Offline" sound name "Basso""#
-            )])
+            .args(["-e", &script])
             .status();
     }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (title, body, sound);
 }
 
 // ---------------------------------------------------------------------------
