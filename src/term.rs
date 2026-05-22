@@ -82,6 +82,17 @@ pub const DIAMOND: &str = "◆";
 // ---------------------------------------------------------------------------
 
 /// Horizontal rule, dimmed
+/// Simple [y/N] confirmation prompt. Returns true if the user confirms.
+/// Defaults to NO on empty input.
+pub fn confirm(prompt: &str) -> bool {
+    use std::io::Write;
+    print!("  {} {} [y/N]: ", crate::term::dim("·"), prompt);
+    std::io::stdout().flush().ok();
+    let mut buf = String::new();
+    std::io::stdin().read_line(&mut buf).ok();
+    matches!(buf.trim().to_lowercase().as_str(), "y" | "yes")
+}
+
 pub fn rule(width: usize) -> String {
     dim(&"─".repeat(width))
 }

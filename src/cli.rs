@@ -443,6 +443,12 @@ async fn cmd_remove_account(config_override: Option<PathBuf>, name: Option<Strin
         bail!("Account '{name}' not found.");
     }
 
+    if !term::confirm(&format!("Remove account '{name}'? This cannot be undone.")) {
+        println!("  {} Cancelled.", dim("·"));
+        println!();
+        return Ok(());
+    }
+
     print_splash(&[
         format!("{}  {}", brand_green("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
         format!("Removing account {}", bold(&format!("'{name}'"))),
@@ -525,6 +531,15 @@ async fn cmd_logout(config_override: Option<PathBuf>, name: Option<String>, all:
     } else {
         format!("{} accounts", bold(&names.len().to_string()))
     };
+
+    // Reconfirm for --all or multi-account logout
+    if names.len() > 1 {
+        if !term::confirm(&format!("Log out all {} accounts? You will need to re-authorize each one.", names.len())) {
+            println!("  {} Cancelled.", dim("·"));
+            println!();
+            return Ok(());
+        }
+    }
 
     print_splash(&[
         format!("{}  {}", brand_green("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
@@ -1871,7 +1886,48 @@ async fn cmd_share(config_override: Option<PathBuf>, tunnel: bool, stop: bool) -
 
     let mut text = std::fs::read_to_string(&config_p)?;
 
+    // If no flags given, show interactive menu
+    let (tunnel, stop) = if !tunnel && !stop {
+        print_splash(&[
+            format!("{}  {}", brand_green("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
+            dim("Remote sharing").to_string(),
+            String::new(),
+        ]);
+        let items = vec![
+            term::SelectItem {
+                label: format!("{}  {}", bold("Local network (LAN)"),
+                    dim("— same Wi-Fi only, no internet required")),
+                value: "lan".into(),
+            },
+            term::SelectItem {
+                label: format!("{}  {}", bold("Online (Cloudflare tunnel)"),
+                    dim("— any network, internet required")),
+                value: "tunnel".into(),
+            },
+            term::SelectItem {
+                label: format!("{}  {}", bold("Stop sharing"),
+                    dim("— revert to localhost-only")),
+                value: "stop".into(),
+            },
+        ];
+        match term::select("How do you want to share?", &items, 0).as_deref() {
+            Some("lan")    => (false, false),
+            Some("tunnel") => (true,  false),
+            Some("stop")   => (false, true),
+            _ => return Ok(()), // cancelled
+        }
+    } else {
+        (tunnel, stop)
+    };
+
     if stop {
+        // Reconfirm before disabling
+        if !term::confirm("Stop sharing and revert to localhost-only?") {
+            println!("  {} Cancelled.", dim("·"));
+            println!();
+            return Ok(());
+        }
+
         text = text.lines()
             .filter(|l| !l.trim_start().starts_with("remote_key"))
             .collect::<Vec<_>>()
