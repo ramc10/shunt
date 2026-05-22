@@ -1,6 +1,6 @@
 [package]
 name = "shunt-proxy"
-version = "0.1.50"
+version = "0.1.51"
 edition = "2021"
 authors = ["Ramcharan <sairamcharansudagoni@gmail.com>"]
 description = "A local proxy that pools multiple Claude accounts behind a single endpoint, routing requests to maximise rate limits"
@@ -28,7 +28,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 clap = { version = "4", features = ["derive"] }
-clap_complete = "4"
 dirs = "5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

@@ -311,15 +311,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "clap_complete"
-version = "4.6.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "660c0520455b1013b9bcb0393d5f643d7e4454fb69c915b8d6d2aa0e9a45acc3"
-dependencies = [
- "clap",
-]
-
-[[package]]
 name = "clap_derive"
 version = "4.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1792,7 +1783,7 @@ checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
 name = "shunt-proxy"
-version = "0.1.50"
+version = "0.1.51"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1801,7 +1792,6 @@ dependencies = [
  "base64",
  "bytes",
  "clap",
- "clap_complete",
  "crossterm 0.27.0",
  "dirs",
  "flate2",

@@ -113,6 +113,55 @@ export default {
     }
 
     // ---------------------------------------------------------------------------
+    // PUT /share/:code — host pushes {base_url, api_key} for one-time pickup
+    // ---------------------------------------------------------------------------
+    const putShareMatch = pathname.match(/^\/share\/(SC-[0-9a-f]{18})$/);
+    if (method === "PUT" && putShareMatch) {
+      const code = putShareMatch[1];
+      let body: { base_url?: string; api_key?: string };
+      try {
+        body = await request.json();
+      } catch {
+        return err(400, "Invalid JSON body.");
+      }
+      const { base_url, api_key } = body;
+      if (!base_url || typeof base_url !== "string") {
+        return err(400, "Missing 'base_url'.");
+      }
+      if (!api_key || typeof api_key !== "string") {
+        return err(400, "Missing 'api_key'.");
+      }
+      await env.BUNDLES.put(
+        `share:${code}`,
+        JSON.stringify({ base_url, api_key }),
+        { expirationTtl: 600 }, // 10 minutes
+      );
+      const expiresAt = Math.floor(Date.now() / 1000) + 600;
+      return json({ ok: true, expires_at: expiresAt }, 201);
+    }
+
+    // ---------------------------------------------------------------------------
+    // GET /share/:code — client fetches {base_url, api_key}, then delete (one-time)
+    // ---------------------------------------------------------------------------
+    const getShareMatch = pathname.match(/^\/share\/(SC-[0-9a-f]{18})$/);
+    if (method === "GET" && getShareMatch) {
+      const code = getShareMatch[1];
+      const raw = await env.BUNDLES.get(`share:${code}`);
+      if (!raw) {
+        return err(404, "Code not found, expired, or already used.");
+      }
+      // One-time use — delete immediately
+      await env.BUNDLES.delete(`share:${code}`);
+      let stored: { base_url: string; api_key: string };
+      try {
+        stored = JSON.parse(raw);
+      } catch {
+        return err(500, "Corrupted share entry.");
+      }
+      return json({ base_url: stored.base_url, api_key: stored.api_key });
+    }
+
+    // ---------------------------------------------------------------------------
     // PUT /watch/:code — host pushes encrypted state snapshot (persistent, TTL refreshed)
     // ---------------------------------------------------------------------------
     const putWatchMatch = pathname.match(/^\/watch\/(RM-[0-9a-f]{18})$/);

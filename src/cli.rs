@@ -127,6 +127,18 @@ enum Command {
         /// Watch code from `shunt remote` on the host. Omit to start hosting.
         code: Option<String>,
     },
+    /// Connect this device to a remote shunt instance
+    ///
+    /// Fetches the proxy URL and API key for the given share code (printed by
+    /// `shunt share` on the host) and writes them to your shell profile so
+    /// Claude Code routes through the shared proxy automatically.
+    ///
+    /// Examples:
+    ///   shunt connect SC-a3f2b1c4d5e6f7a8b9
+    Connect {
+        /// Share code printed by `shunt share` on the host
+        code: String,
+    },
     /// Update shunt to the latest release
     Update,
     /// Pin routing to a specific account, or restore automatic routing
@@ -140,32 +152,6 @@ enum Command {
         config: Option<PathBuf>,
         /// Account name to pin to, or "auto". Omit to pick interactively.
         account: Option<String>,
-    },
-    /// Upload credentials to the relay for transfer to another device
-    ///
-    /// Examples:
-    ///   shunt push              — encrypt and upload, prints a transfer code
-    Push {
-        #[arg(long)]
-        config: Option<PathBuf>,
-    },
-    /// Set up this device using a transfer code from `shunt push`
-    ///
-    /// Examples:
-    ///   shunt login SH-a3f2b1c4d5e6f7a8b9
-    Login {
-        /// Transfer code printed by `shunt push` on another device
-        code: String,
-    },
-    /// Print shell completion script
-    ///
-    /// Examples:
-    ///   shunt completions zsh  >> ~/.zshrc
-    ///   shunt completions bash >> ~/.bashrc
-    ///   shunt completions fish > ~/.config/fish/completions/shunt.fish
-    Completions {
-        /// Shell to generate completions for
-        shell: clap_complete::Shell,
     },
 }
 
@@ -183,12 +169,10 @@ pub async fn run() -> Result<()> {
         Command::Logout { config, name, all } => cmd_logout(config, name, all).await,
         Command::Monitor { config } => cmd_monitor(config).await,
         Command::Remote { code } => cmd_remote(code).await,
+        Command::Connect { code } => cmd_connect(code).await,
         Command::Update => cmd_update().await,
         Command::Share { config, tunnel, stop } => cmd_share(config, tunnel, stop).await,
         Command::Use { config, account } => cmd_use(config, account).await,
-        Command::Push { config } => cmd_push(config).await,
-        Command::Login { code } => cmd_login(code).await,
-        Command::Completions { shell } => { cmd_completions(shell); Ok(()) }
     }
 }
 
@@ -938,168 +922,6 @@ async fn cmd_logs(_config_override: Option<PathBuf>, follow: bool, lines: usize)
     }
 }
 
-// ---------------------------------------------------------------------------
-// push
-// ---------------------------------------------------------------------------
-
-async fn cmd_push(config_override: Option<PathBuf>) -> Result<()> {
-    use crate::sync::{encrypt_bundle, generate_code, push_to_relay, SyncBundle};
-
-    let config_p = config_override.clone().unwrap_or_else(config_path);
-    if !config_p.exists() {
-        bail!("No config found. Run `shunt setup` first.");
-    }
-
-    print_splash(&[
-        format!("{}  {}", brand_green("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
-        dim("Push credentials to relay").to_string(),
-        String::new(),
-    ]);
-
-    let config = crate::config::load_config(config_override.as_deref())?;
-    let relay_url = &config.server.relay_url;
-
-    // Load raw config text + credentials
-    let config_toml = std::fs::read_to_string(&config_p)?;
-    let store = crate::config::CredentialsStore::load();
-
-    if store.accounts.is_empty() {
-        bail!("No credentials found. Run `shunt setup` or `shunt add-account` first.");
-    }
-
-    let n = store.accounts.len();
-    let names: Vec<_> = store.accounts.keys().cloned().collect();
-    println!("  {} Encrypting {} account{}…",
-        dim("·"), bold(&n.to_string()),
-        if n == 1 { "" } else { "s" });
-
-    let bundle = SyncBundle { config_toml, accounts: store.accounts };
-    let code = generate_code();
-    let payload = encrypt_bundle(&bundle, &code)?;
-
-    print!("  {} Uploading to relay… ", dim("↑"));
-    use std::io::Write as _;
-    std::io::stdout().flush().ok();
-
-    push_to_relay(&code, &payload, relay_url).await?;
-    println!("{}", green("done"));
-
-    println!();
-    println!("  {} Transfer code:", green(CHECK));
-    println!();
-    println!("      {}", bold_white(&code));
-    println!();
-    println!("  {} Accounts: {}", dim("·"), dim(&names.join(", ")));
-    println!("  {} Expires in 24h — one-time use", dim("·"));
-    println!();
-    println!("  On the new device, run:");
-    println!("    {}", cyan(&format!("shunt login {code}")));
-    println!();
-
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// login
-// ---------------------------------------------------------------------------
-
-async fn cmd_login(code: String) -> Result<()> {
-    use crate::sync::{decrypt_bundle, pull_from_relay, validate_code};
-
-    validate_code(&code)?;
-
-    print_splash(&[
-        format!("{}  {}", brand_green("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
-        dim("Login — applying credentials from relay").to_string(),
-        String::new(),
-    ]);
-
-    // Resolve relay URL: use existing config if present, else env var or default
-    let relay_url = crate::config::load_config(None)
-        .map(|c| c.server.relay_url.clone())
-        .unwrap_or_else(|_| {
-            std::env::var("SHUNT_RELAY_URL")
-                .unwrap_or_else(|_| "https://relay.ramcharan.shop".into())
-        });
-
-    print!("  {} Downloading from relay… ", dim("↓"));
-    use std::io::Write as _;
-    std::io::stdout().flush().ok();
-
-    let payload = pull_from_relay(&code, &relay_url).await?;
-    println!("{}", green("done"));
-
-    print!("  {} Decrypting… ", dim("·"));
-    std::io::stdout().flush().ok();
-    let bundle = decrypt_bundle(&payload, &code)?;
-    println!("{}", green("done"));
-
-    let config_p = config_path();
-    let account_names: Vec<_> = bundle.accounts.keys().cloned().collect();
-
-    // Strip sharing settings — remote_key and host=0.0.0.0 are tied to the
-    // source device and must not carry over to a new local install.
-    let config_toml: String = bundle.config_toml
-        .lines()
-        .filter(|l| !l.trim_start().starts_with("remote_key"))
-        .map(|l| if l.trim() == "host = \"0.0.0.0\"" { "host = \"127.0.0.1\"" } else { l })
-        .collect::<Vec<_>>()
-        .join("\n") + "\n";
-
-    // If config already exists, confirm overwrite
-    if config_p.exists() {
-        use std::io::{self, Write};
-        print!("  {} Config already exists — overwrite? [y/N]: ", yellow("!"));
-        io::stdout().flush()?;
-        let mut buf = String::new();
-        io::stdin().read_line(&mut buf)?;
-        if !matches!(buf.trim().to_lowercase().as_str(), "y" | "yes") {
-            println!("  {} Cancelled.", dim("·"));
-            println!();
-            return Ok(());
-        }
-    }
-
-    // Write config
-    if let Some(parent) = config_p.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&config_p, &config_toml)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&config_p, std::fs::Permissions::from_mode(0o600))?;
-    }
-    println!("  {} Config written", green(CHECK));
-
-    // Merge credentials (bundle wins; keeps any extra local accounts)
-    let mut store = crate::config::CredentialsStore::load();
-    for (name, cred) in bundle.accounts {
-        store.accounts.insert(name, cred);
-    }
-    store.save()?;
-    println!("  {} Credentials saved ({} accounts: {})",
-        green(CHECK),
-        account_names.len(),
-        account_names.join(", "));
-
-    offer_shell_export()?;
-
-    println!();
-    println!("  {} Run {} to start.", green(CHECK), cyan("shunt start"));
-    println!();
-
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// completions
-// ---------------------------------------------------------------------------
-
-fn cmd_completions(shell: clap_complete::Shell) {
-    use clap::CommandFactory;
-    clap_complete::generate(shell, &mut Cli::command(), "shunt", &mut std::io::stdout());
-}
 
 /// Non-interactive setup called from `cmd_start`.
 /// Imports the existing Claude Code session silently.
@@ -2085,9 +1907,15 @@ async fn cmd_share(config_override: Option<PathBuf>, tunnel: bool, stop: bool) -
 
     std::fs::write(&config_p, &text)?;
 
-    let port = crate::config::load_config(Some(&config_p))
-        .map(|c| c.server.port)
-        .unwrap_or(8082);
+    let (port, relay_url) = match crate::config::load_config(Some(&config_p)) {
+        Ok(cfg) => {
+            let relay = std::env::var("SHUNT_RELAY_URL")
+                .unwrap_or_else(|_| cfg.server.relay_url.clone());
+            (cfg.server.port, relay)
+        }
+        Err(_) => (8082u16, std::env::var("SHUNT_RELAY_URL")
+            .unwrap_or_else(|_| "https://relay.ramcharan.shop".to_string())),
+    };
 
     if tunnel {
         // Cloudflare quick tunnel — works over any network, no account needed
@@ -2102,41 +1930,85 @@ async fn cmd_share(config_override: Option<PathBuf>, tunnel: bool, stop: bool) -
 
         let url = start_cloudflare_tunnel(port)?;
 
-        println!("  {}  Set on the remote device:\n", green(CHECK));
-        println!("    {}{}",
-            dim("export ANTHROPIC_BASE_URL="),
-            cyan(&url),
-        );
-        println!("    {}{}", dim("export ANTHROPIC_API_KEY="), cyan(&key));
-        println!();
-        println!("  {} Tunnel is active — keep this terminal open.", dim("·"));
-        println!("  {} Press Ctrl+C to stop.", dim("·"));
-        println!();
+        // Push share code to relay
+        let share_code = crate::sync::generate_share_code();
+        match crate::sync::push_share(&share_code, &url, &key, &relay_url).await {
+            Ok(()) => {
+                print_splash(&[
+                    format!("{}  {}", brand_green("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
+                    dim("Tunnel active — share code ready").to_string(),
+                    String::new(),
+                ]);
+                println!("  {}  Share code:\n", green(CHECK));
+                println!("      {}\n", cyan(&share_code));
+                println!("  {} On the other device, run:", dim("·"));
+                println!("       {}", cyan(&format!("shunt connect {share_code}")));
+                println!();
+                println!("  {} Code expires in 10 minutes — one-time use", dim("·"));
+                println!("  {} Tunnel is active — keep this terminal open.", dim("·"));
+                println!("  {} Press Ctrl+C to stop.", dim("·"));
+                println!();
+            }
+            Err(e) => {
+                // Fall back to manual instructions if relay is unavailable
+                println!("  {}  Set on the remote device:\n", green(CHECK));
+                println!("    {}{}", dim("export ANTHROPIC_BASE_URL="), cyan(&url));
+                println!("    {}{}", dim("export ANTHROPIC_API_KEY="), cyan(&key));
+                println!();
+                println!("  {} (share code unavailable: {e})", dim("·"));
+                println!("  {} Tunnel is active — keep this terminal open.", dim("·"));
+                println!("  {} Press Ctrl+C to stop.", dim("·"));
+                println!();
+            }
+        }
 
         // Block until the user kills it
         tokio::signal::ctrl_c().await.ok();
         println!("\n  {} Tunnel closed.", dim("·"));
     } else {
         let ip = local_ip().unwrap_or_else(|| "<your-ip>".to_string());
+        let base_url = format!("http://{ip}:{port}");
 
-        print_splash(&[
-            format!("{}  {}", brand_green("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
-            dim("Remote sharing enabled (LAN)").to_string(),
-            String::new(),
-        ]);
-
-        println!("  Set on the remote device:\n");
-        println!("    {}{}",
-            dim("export ANTHROPIC_BASE_URL="),
-            cyan(&format!("http://{ip}:{port}")),
-        );
-        println!("    {}{}", dim("export ANTHROPIC_API_KEY="), cyan(&key));
-        println!();
-        println!("  {} Both devices must be on the same network.", dim("·"));
-        println!("  {} For any network: {}", dim("·"), cyan("shunt share --tunnel"));
-        println!("  {} Restart to apply: {}", dim("·"), cyan("shunt start"));
-        println!("  {} To stop sharing:  {}", dim("·"), cyan("shunt share --stop"));
-        println!();
+        // Push share code to relay
+        let share_code = crate::sync::generate_share_code();
+        match crate::sync::push_share(&share_code, &base_url, &key, &relay_url).await {
+            Ok(()) => {
+                print_splash(&[
+                    format!("{}  {}", brand_green("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
+                    dim("Remote sharing enabled (LAN)").to_string(),
+                    String::new(),
+                ]);
+                println!("  {}  Share code:\n", green(CHECK));
+                println!("      {}\n", cyan(&share_code));
+                println!("  {} On the other device, run:", dim("·"));
+                println!("       {}", cyan(&format!("shunt connect {share_code}")));
+                println!();
+                println!("  {} Code expires in 10 minutes — one-time use", dim("·"));
+                println!("  {} Both devices must be on the same network.", dim("·"));
+                println!("  {} For any network: {}", dim("·"), cyan("shunt share --tunnel"));
+                println!("  {} Restart to apply: {}", dim("·"), cyan("shunt start"));
+                println!("  {} To stop sharing:  {}", dim("·"), cyan("shunt share --stop"));
+                println!();
+            }
+            Err(e) => {
+                // Fall back to manual instructions
+                print_splash(&[
+                    format!("{}  {}", brand_green("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
+                    dim("Remote sharing enabled (LAN)").to_string(),
+                    String::new(),
+                ]);
+                println!("  Set on the remote device:\n");
+                println!("    {}{}", dim("export ANTHROPIC_BASE_URL="), cyan(&base_url));
+                println!("    {}{}", dim("export ANTHROPIC_API_KEY="), cyan(&key));
+                println!();
+                println!("  {} (share code unavailable: {e})", dim("·"));
+                println!("  {} Both devices must be on the same network.", dim("·"));
+                println!("  {} For any network: {}", dim("·"), cyan("shunt share --tunnel"));
+                println!("  {} Restart to apply: {}", dim("·"), cyan("shunt start"));
+                println!("  {} To stop sharing:  {}", dim("·"), cyan("shunt share --stop"));
+                println!();
+            }
+        }
     }
 
     Ok(())
@@ -2248,6 +2120,157 @@ async fn offer_restart(config_override: Option<PathBuf>) {
     if let Err(e) = cmd_restart(config_override).await {
         println!("  {} Restart failed: {e}", red(CROSS));
     }
+}
+
+// ---------------------------------------------------------------------------
+// connect
+// ---------------------------------------------------------------------------
+
+async fn cmd_connect(code: String) -> Result<()> {
+    use std::io::{self, Write};
+
+    crate::sync::validate_share_code(&code)?;
+
+    let relay_url = std::env::var("SHUNT_RELAY_URL")
+        .unwrap_or_else(|_| "https://relay.ramcharan.shop".to_string());
+
+    print_splash(&[
+        format!("{}  {}", brand_green("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
+        dim("Connecting to remote shunt…").to_string(),
+        String::new(),
+    ]);
+
+    println!("  {} Fetching credentials for {}…", dim("·"), cyan(&code));
+    println!();
+
+    let (base_url, api_key) = crate::sync::pull_share(&code, &relay_url).await?;
+
+    println!("  {}  Retrieved:", green(CHECK));
+    println!("      {} {}", dim("ANTHROPIC_BASE_URL ="), cyan(&base_url));
+    println!("      {} {}", dim("ANTHROPIC_API_KEY  ="), cyan(&format!("{}…", &api_key[..api_key.len().min(12)])));
+    println!();
+
+    // --- Offer to write to shell profile ---
+    let profile = detect_shell_profile();
+    let prompt = match &profile {
+        Some(p) => format!("  Write to {}? [Y/n]: ", dim(&p.display().to_string())),
+        None => "  Write to shell profile? [Y/n]: ".into(),
+    };
+    print!("{prompt}");
+    io::stdout().flush()?;
+    let mut buf = String::new();
+    io::stdin().read_line(&mut buf)?;
+
+    if !matches!(buf.trim().to_lowercase().as_str(), "n" | "no") {
+        match profile {
+            Some(p) => {
+                write_connect_vars_to_profile(&p, &base_url, &api_key)?;
+            }
+            None => {
+                println!("  {} Could not detect shell profile. Set manually:", dim("·"));
+                println!("      export ANTHROPIC_BASE_URL={base_url}");
+                println!("      export ANTHROPIC_API_KEY={api_key}");
+            }
+        }
+    }
+
+    // --- Write to Claude Code settings.json ---
+    if let Err(e) = write_claude_settings(&base_url, &api_key) {
+        println!("  {} Could not write ~/.claude/settings.json: {e}", dim("·"));
+    } else {
+        println!("  {} Written to {}", green(CHECK), dim("~/.claude/settings.json"));
+    }
+
+    println!();
+    println!("  {} Done! Restart shell or run: {}", green(CHECK),
+        cyan(detect_shell_profile()
+            .map(|p| format!("source {}", p.display()))
+            .unwrap_or_else(|| "source ~/.zshrc".to_string()).as_str()));
+    println!();
+
+    Ok(())
+}
+
+/// Write ANTHROPIC_BASE_URL and ANTHROPIC_API_KEY to a shell profile, replacing
+/// existing entries in-place or appending if absent.
+fn write_connect_vars_to_profile(profile: &std::path::Path, base_url: &str, api_key: &str) -> Result<()> {
+    use std::io::Write as _;
+
+    let url_line = format!("export ANTHROPIC_BASE_URL={base_url}");
+    let key_line = format!("export ANTHROPIC_API_KEY={api_key}");
+
+    if profile.exists() {
+        let contents = std::fs::read_to_string(profile)?;
+        let has_url = contents.contains("ANTHROPIC_BASE_URL");
+        let has_key = contents.contains("ANTHROPIC_API_KEY");
+
+        if has_url || has_key {
+            // Replace in-place
+            let updated: String = contents
+                .lines()
+                .map(|l| {
+                    if l.contains("ANTHROPIC_BASE_URL") {
+                        url_line.as_str()
+                    } else if l.contains("ANTHROPIC_API_KEY") {
+                        key_line.as_str()
+                    } else {
+                        l
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n";
+            // Append any var that wasn't already there
+            let mut final_content = updated;
+            if !has_url {
+                final_content.push_str(&format!("{url_line}\n"));
+            }
+            if !has_key {
+                final_content.push_str(&format!("{key_line}\n"));
+            }
+            std::fs::write(profile, &final_content)?;
+            println!("  {} Updated {} — {}", green(CHECK),
+                dim(&profile.display().to_string()),
+                cyan("ANTHROPIC_BASE_URL + ANTHROPIC_API_KEY"));
+            return Ok(());
+        }
+    }
+
+    // Append both vars
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(profile)?;
+    writeln!(f, "\n# Added by shunt connect")?;
+    writeln!(f, "{url_line}")?;
+    writeln!(f, "{key_line}")?;
+    println!("  {} Added to {} — {}", green(CHECK),
+        dim(&profile.display().to_string()),
+        cyan("ANTHROPIC_BASE_URL + ANTHROPIC_API_KEY"));
+    Ok(())
+}
+
+/// Write ANTHROPIC_BASE_URL and ANTHROPIC_API_KEY into ~/.claude/settings.json
+/// under the `env` key, creating the file if absent.
+fn write_claude_settings(base_url: &str, api_key: &str) -> Result<()> {
+    let home = dirs::home_dir().context("Cannot find home directory")?;
+    let settings_path = home.join(".claude").join("settings.json");
+
+    let mut root: serde_json::Value = if settings_path.exists() {
+        let text = std::fs::read_to_string(&settings_path)?;
+        serde_json::from_str(&text).unwrap_or(serde_json::Value::Object(Default::default()))
+    } else {
+        serde_json::Value::Object(Default::default())
+    };
+
+    let obj = root.as_object_mut().context("settings.json root is not an object")?;
+    let env = obj.entry("env").or_insert(serde_json::Value::Object(Default::default()));
+    let env_obj = env.as_object_mut().context("settings.json 'env' is not an object")?;
+    env_obj.insert("ANTHROPIC_BASE_URL".to_string(), serde_json::Value::String(base_url.to_string()));
+    env_obj.insert("ANTHROPIC_API_KEY".to_string(), serde_json::Value::String(api_key.to_string()));
+
+    if let Some(parent) = settings_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&settings_path, serde_json::to_string_pretty(&root)?)?;
+    Ok(())
 }
 
 fn offer_shell_export() -> Result<()> {

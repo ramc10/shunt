@@ -423,6 +423,10 @@ fn draw_footer(f: &mut Frame, area: Rect, picker_open: bool, refresh_ms: u64) {
     f.render_widget(Paragraph::new(hint), area);
 }
 
+fn is_remote_url(base_url: &str) -> bool {
+    !base_url.contains("127.0.0.1") && !base_url.contains("localhost")
+}
+
 fn draw_connecting(
     f: &mut Frame,
     area: Rect,
@@ -430,25 +434,42 @@ fn draw_connecting(
     base_url: &str,
     start_time: Instant,
 ) {
-    let msg = match error {
+    let remote = is_remote_url(base_url);
+
+    let lines: Vec<Line> = match error {
+        Some(FetchError::NotRunning) if remote => vec![
+            Line::from(vec![
+                Span::styled("✗ ", style_red()),
+                Span::styled("Lost connection to host", style_white()),
+            ]),
+            Line::from(vec![
+                Span::styled(format!("  {base_url}"), style_dim()),
+            ]),
+            Line::from(vec![]),
+            Line::from(vec![
+                Span::styled("  Is the host still running shunt?", style_dim()),
+            ]),
+            Line::from(vec![
+                Span::styled("  Run ", style_dim()),
+                Span::styled("shunt connect <new-code>", style_cyan()),
+                Span::styled(" to reconnect.", style_dim()),
+            ]),
+        ],
         Some(FetchError::NotRunning) => {
             let frame = (start_time.elapsed().as_millis() / 120) as usize % SPINNER.len();
-            Line::from(vec![
+            vec![Line::from(vec![
                 Span::styled(SPINNER[frame], style_dim()),
-                Span::styled(
-                    format!("  waiting for proxy  ·  run shunt start"),
-                    style_dim(),
-                ),
-            ])
+                Span::styled("  waiting for proxy  ·  run shunt start", style_dim()),
+            ])]
         }
-        Some(FetchError::Other(msg)) => Line::from(vec![
+        Some(FetchError::Other(msg)) => vec![Line::from(vec![
             Span::styled("✗ ", style_red()),
             Span::styled(format!("cannot reach {base_url}  ·  {msg}"), style_dim()),
-        ]),
-        None => Line::from(Span::styled("connecting…", style_dim())),
+        ])],
+        None => vec![Line::from(Span::styled("connecting…", style_dim()))],
     };
 
-    let p = Paragraph::new(msg)
+    let p = Paragraph::new(lines)
         .alignment(Alignment::Center)
         .block(Block::default());
     f.render_widget(p, area);

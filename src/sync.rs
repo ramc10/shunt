@@ -1,44 +1,17 @@
-//! Credential bundle encryption and relay upload/download for `shunt push` / `shunt login`.
-//!
-//! Security model:
-//! - Transfer code = 9 random bytes encoded as 18 hex chars, prefixed with "SH-"
-//! - Encryption key = SHA-256(code) — 32 bytes, never sent to the relay
-//! - Cipher: AES-256-GCM with a random 12-byte nonce
-//! - Wire payload = base64(nonce_12B ‖ ciphertext_with_tag)
-//! - Relay stores only ciphertext; bundle is deleted after first download
-
-use std::collections::HashMap;
+//! Encryption helpers used by the `remote` command for device-to-device notification relay.
 
 use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Key, Nonce,
 };
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-
-use crate::oauth::OAuthCredential;
-
-// ---------------------------------------------------------------------------
-// Bundle
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct SyncBundle {
-    pub config_toml: String,
-    pub accounts: HashMap<String, OAuthCredential>,
-}
+use serde_json;
 
 // ---------------------------------------------------------------------------
 // Code generation
 // ---------------------------------------------------------------------------
-
-/// Generate a random transfer code like `SH-a3f2b1c4d5e6f7a8b9`.
-pub fn generate_code() -> String {
-    let bytes = crate::oauth::rand_bytes::<9>();
-    format!("SH-{}", hex::encode(bytes))
-}
 
 /// Generate a random remote-watch code like `RM-a3f2b1c4d5e6f7a8b9`.
 pub fn generate_remote_code() -> String {
@@ -57,17 +30,6 @@ pub fn validate_remote_code(code: &str) -> Result<()> {
     Ok(())
 }
 
-/// Validate that a code looks like what we generated.
-pub fn validate_code(code: &str) -> Result<()> {
-    if !code.starts_with("SH-") || code.len() != 21 {
-        bail!("Invalid transfer code format. Expected SH-<18 hex chars> (e.g. SH-a3f2b1c4d5e6f7a8b9).");
-    }
-    if !code[3..].chars().all(|c| c.is_ascii_hexdigit()) {
-        bail!("Invalid transfer code — must be hex characters after 'SH-'.");
-    }
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // Encryption / decryption
 // ---------------------------------------------------------------------------
@@ -77,83 +39,7 @@ fn derive_key(code: &str) -> [u8; 32] {
     hash.into()
 }
 
-/// Encrypt a `SyncBundle` and return a base64-encoded payload string.
-pub fn encrypt_bundle(bundle: &SyncBundle, code: &str) -> Result<String> {
-    let json = serde_json::to_vec(bundle).context("failed to serialize bundle")?;
-
-    let key_bytes = derive_key(code);
-    let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
-    let cipher = Aes256Gcm::new(key);
-
-    let nonce_bytes = crate::oauth::rand_bytes::<12>();
-    let nonce = Nonce::from_slice(&nonce_bytes);
-
-    let ciphertext = cipher
-        .encrypt(nonce, json.as_slice())
-        .map_err(|e| anyhow::anyhow!("encryption failed: {e}"))?;
-
-    // wire: nonce(12) ‖ ciphertext
-    let mut wire = Vec::with_capacity(12 + ciphertext.len());
-    wire.extend_from_slice(&nonce_bytes);
-    wire.extend_from_slice(&ciphertext);
-
-    Ok(B64.encode(wire))
-}
-
-/// Decrypt a base64-encoded payload into a `SyncBundle`.
-pub fn decrypt_bundle(payload_b64: &str, code: &str) -> Result<SyncBundle> {
-    let wire = B64
-        .decode(payload_b64)
-        .context("invalid base64 in payload")?;
-
-    if wire.len() < 12 {
-        bail!("payload too short");
-    }
-
-    let (nonce_bytes, ciphertext) = wire.split_at(12);
-
-    let key_bytes = derive_key(code);
-    let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
-    let cipher = Aes256Gcm::new(key);
-    let nonce = Nonce::from_slice(nonce_bytes);
-
-    let plaintext = cipher
-        .decrypt(nonce, ciphertext)
-        .map_err(|_| anyhow::anyhow!("decryption failed — wrong code or corrupted payload"))?;
-
-    serde_json::from_slice::<SyncBundle>(&plaintext).context("failed to deserialize bundle")
-}
-
-// ---------------------------------------------------------------------------
-// Relay HTTP
-// ---------------------------------------------------------------------------
-
-/// Upload an encrypted payload to the relay under the given code.
-pub async fn push_to_relay(code: &str, payload: &str, relay_url: &str) -> Result<()> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()?;
-
-    let body = serde_json::json!({ "code": code, "payload": payload });
-
-    let resp = client
-        .post(format!("{relay_url}/bundle"))
-        .json(&body)
-        .send()
-        .await
-        .context("failed to reach relay")?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        bail!("relay returned {status}: {text}");
-    }
-
-    Ok(())
-}
-
 /// Encrypt arbitrary bytes with the given code; returns a base64 payload string.
-/// Uses the same AES-256-GCM scheme as `encrypt_bundle`.
 pub fn encrypt_bytes(data: &[u8], code: &str) -> Result<String> {
     let key_bytes = derive_key(code);
     let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
@@ -169,10 +55,72 @@ pub fn encrypt_bytes(data: &[u8], code: &str) -> Result<String> {
     Ok(B64.encode(wire))
 }
 
+// ---------------------------------------------------------------------------
+// Share code helpers (SC- prefix — one-time relay handshake for shunt connect)
+// ---------------------------------------------------------------------------
+
+/// Generate a random share code like `SC-a3f2b1c4d5e6f7a8b9`.
+pub fn generate_share_code() -> String {
+    let bytes = crate::oauth::rand_bytes::<9>();
+    format!("SC-{}", hex::encode(bytes))
+}
+
+/// Validate that a share code has the expected format.
+pub fn validate_share_code(code: &str) -> Result<()> {
+    if !code.starts_with("SC-") || code.len() != 21 {
+        anyhow::bail!("Invalid share code format. Expected SC-<18 hex chars>.");
+    }
+    if !code[3..].chars().all(|c| c.is_ascii_hexdigit()) {
+        anyhow::bail!("Invalid share code — must be hex characters after 'SC-'.");
+    }
+    Ok(())
+}
+
+/// Push {base_url, api_key} to the relay under `code`. TTL 10 minutes, one-time read.
+pub async fn push_share(code: &str, base_url: &str, api_key: &str, relay_url: &str) -> Result<()> {
+    let client = reqwest::Client::new();
+    let url = format!("{relay_url}/share/{code}");
+    let res = client
+        .put(&url)
+        .json(&serde_json::json!({ "base_url": base_url, "api_key": api_key }))
+        .send()
+        .await
+        .context("Failed to reach relay")?;
+    if !res.status().is_success() {
+        let body = res.text().await.unwrap_or_default();
+        anyhow::bail!("Relay rejected share push ({}): {}", url, body);
+    }
+    Ok(())
+}
+
+/// Pull {base_url, api_key} from the relay for `code`. Deletes the entry on success.
+pub async fn pull_share(code: &str, relay_url: &str) -> Result<(String, String)> {
+    let client = reqwest::Client::new();
+    let url = format!("{relay_url}/share/{code}");
+    let res = client
+        .get(&url)
+        .send()
+        .await
+        .context("Failed to reach relay")?;
+    if res.status() == reqwest::StatusCode::NOT_FOUND {
+        anyhow::bail!("Share code not found, expired, or already used. Ask the host to run `shunt share` again.");
+    }
+    if !res.status().is_success() {
+        let body = res.text().await.unwrap_or_default();
+        anyhow::bail!("Relay error: {body}");
+    }
+    let json: serde_json::Value = res.json().await.context("Invalid JSON from relay")?;
+    let base_url = json["base_url"].as_str().context("Missing base_url")?.to_owned();
+    let api_key = json["api_key"].as_str().context("Missing api_key")?.to_owned();
+    Ok((base_url, api_key))
+}
+
 /// Decrypt a base64 payload into bytes using the given code.
 pub fn decrypt_bytes(payload_b64: &str, code: &str) -> Result<Vec<u8>> {
     let wire = B64.decode(payload_b64).context("invalid base64 in payload")?;
-    if wire.len() < 12 { anyhow::bail!("payload too short"); }
+    if wire.len() < 12 {
+        anyhow::bail!("payload too short");
+    }
     let (nonce_bytes, ciphertext) = wire.split_at(12);
     let key_bytes = derive_key(code);
     let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
@@ -181,34 +129,4 @@ pub fn decrypt_bytes(payload_b64: &str, code: &str) -> Result<Vec<u8>> {
     cipher
         .decrypt(nonce, ciphertext)
         .map_err(|_| anyhow::anyhow!("decryption failed — wrong code or corrupted payload"))
-}
-
-/// Download and delete the encrypted payload for the given code from the relay.
-/// Returns the base64 payload string.
-pub async fn pull_from_relay(code: &str, relay_url: &str) -> Result<String> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()?;
-
-    let resp = client
-        .get(format!("{relay_url}/bundle/{code}"))
-        .send()
-        .await
-        .context("failed to reach relay")?;
-
-    if resp.status() == reqwest::StatusCode::NOT_FOUND {
-        bail!("Code not found or already used. Codes are one-time use — run `shunt push` again to get a new one.");
-    }
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        bail!("relay returned {status}: {text}");
-    }
-
-    let json: serde_json::Value = resp.json().await.context("invalid response from relay")?;
-    json["payload"]
-        .as_str()
-        .map(|s| s.to_owned())
-        .context("relay response missing 'payload' field")
 }
