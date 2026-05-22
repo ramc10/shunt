@@ -38,27 +38,28 @@ fn is_client_auth(name: &str) -> bool {
 
 pub struct Forwarder {
     client: Client,
-    base_url: String,
 }
 
 impl Forwarder {
-    pub fn new(base_url: impl Into<String>, timeout_secs: u64) -> Result<Self> {
+    pub fn new(_base_url: impl Into<String>, timeout_secs: u64) -> Result<Self> {
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(timeout_secs))
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .context("Failed to build HTTP client")?;
 
-        Ok(Self { client, base_url: base_url.into() })
+        Ok(Self { client })
     }
 
     /// Forward a request to the upstream using the given account's OAuth credential.
     ///
+    /// - `upstream` overrides the base URL for this account (per-provider routing).
     /// - Strips `Authorization` and `x-api-key` from the client request.
     /// - Injects `Authorization: Bearer <token>` (live token, may differ from account.credential).
     /// - Keeps the upstream TCP connection alive for streaming responses.
     pub async fn forward(
         &self,
+        upstream: &str,
         method: &str,
         path: &str,
         body: Bytes,
@@ -67,7 +68,7 @@ impl Forwarder {
         token: &str,
     ) -> Result<Response<Body>> {
         let request_id = &Uuid::new_v4().to_string()[..8];
-        let url = format!("{}{}", self.base_url, path);
+        let url = format!("{}{}", upstream, path);
 
         let mut upstream_headers = reqwest::header::HeaderMap::new();
 
