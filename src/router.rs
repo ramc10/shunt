@@ -203,6 +203,7 @@ mod tests {
             plan_type: "pro".to_owned(),
             provider: crate::provider::Provider::Anthropic,
             credential: None,
+            upstream_url: None,
         }
     }
 

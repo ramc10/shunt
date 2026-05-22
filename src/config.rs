@@ -204,6 +204,11 @@ pub struct AccountConfig {
     /// `None` when the account is in config but has no credential yet.
     /// These accounts are shown in status but skipped during proxying.
     pub credential: Option<OAuthCredential>,
+    /// Override the upstream base URL for this account.
+    /// Used in tests and for custom per-account routing.
+    /// `None` means use `config.server.upstream_url` (same-protocol) or
+    /// `provider.default_upstream_url()` (cross-protocol translation).
+    pub upstream_url: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -274,6 +279,12 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
 
     let store = CredentialsStore::load();
 
+    // Determine the primary provider (first account) so we know which accounts
+    // use config.server.upstream_url and which need the provider's default URL.
+    let primary_provider = raw.accounts.first()
+        .map(|a| a.provider.as_deref().map(Provider::from_str).unwrap_or_default())
+        .unwrap_or_default();
+
     let mut accounts = Vec::new();
     for a in &raw.accounts {
         let provider = a.provider.as_deref().map(Provider::from_str).unwrap_or_default();
@@ -285,11 +296,20 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
             .cloned()
             .or_else(|| provider.read_local_credentials());
 
+        // Non-primary-provider accounts get the provider's real upstream URL pre-populated.
+        // Primary-provider accounts leave it None so proxy falls back to config.server.upstream_url.
+        let acct_upstream = if provider != primary_provider {
+            Some(provider.default_upstream_url().to_owned())
+        } else {
+            None
+        };
+
         accounts.push(AccountConfig {
             name: a.name.clone(),
             plan_type: a.plan_type.clone(),
             provider,
             credential: cred,
+            upstream_url: acct_upstream,
         });
     }
 

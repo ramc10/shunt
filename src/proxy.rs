@@ -329,7 +329,10 @@ async fn proxy_handler(
             )
         };
 
-        let upstream = account.provider.default_upstream_url();
+        // Resolve upstream URL: per-account override (set at load time for non-primary
+        // providers, or explicitly in tests) → config server URL.
+        let upstream = account.upstream_url.as_deref()
+            .unwrap_or(&s.config.server.upstream_url);
         let response = s.forwarder
             .forward(upstream, &method, &fwd_path, fwd_body, &fwd_headers, account, &token)
             .await
@@ -1538,10 +1541,20 @@ fn translate_anthropic_stream(
 // Cross-protocol translation: Anthropic ↔ OpenAI
 // ---------------------------------------------------------------------------
 
+/// Map Claude model names → OpenAI model names (mirror of `map_model`).
+fn map_model_to_openai(claude_model: &str) -> &str {
+    match claude_model {
+        m if m.contains("opus")  => "gpt-4o",
+        m if m.contains("haiku") => "gpt-4o-mini",
+        _                        => "gpt-4o", // sonnet and everything else
+    }
+}
+
 /// Translate an Anthropic `/v1/messages` request body to OpenAI `/v1/chat/completions` format.
 /// Used when routing an Anthropic-protocol request to an OpenAI/Codex account.
 fn translate_anthropic_req_to_openai(body: serde_json::Value) -> serde_json::Value {
-    let model = body["model"].as_str().unwrap_or("claude-sonnet-4-6");
+    let claude_model = body["model"].as_str().unwrap_or("claude-sonnet-4-6");
+    let model = map_model_to_openai(claude_model);
     let stream = body["stream"].as_bool().unwrap_or(false);
     let max_tokens = body["max_tokens"].as_u64().unwrap_or(8096);
 

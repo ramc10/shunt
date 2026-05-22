@@ -93,10 +93,21 @@ async fn handle_request(req: Request, caps: Captures, streaming: bool, status: u
     });
 
     if status != 200 {
-        return (
-            axum::http::StatusCode::from_u16(status).unwrap(),
-            axum::Json(json!({"type":"error","error":{"type":"rate_limit_error","message":"slow down"}})),
-        ).into_response();
+        // Include a rate-limit reset header far in the future (>5h) so the proxy's
+        // wait_deadline_ms is immediately exceeded and it returns 503 without looping.
+        let far_future = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() + 10 * 3600;
+        return Response::builder()
+            .status(status)
+            .header("content-type", "application/json")
+            .header("anthropic-ratelimit-unified-5h-utilization", "1.0")
+            .header("anthropic-ratelimit-unified-5h-reset", far_future.to_string())
+            .body(Body::from(
+                serde_json::to_vec(&json!({"type":"error","error":{"type":"rate_limit_error","message":"slow down"}})).unwrap()
+            ))
+            .unwrap();
     }
 
     if streaming {
@@ -156,6 +167,7 @@ fn test_account() -> AccountConfig {
         plan_type: "pro".into(),
         provider: Provider::default(),
         credential: Some(test_credential()),
+        upstream_url: None,
     }
 }
 
@@ -369,6 +381,7 @@ fn test_account2() -> AccountConfig {
             expires_at: u64::MAX / 2,
             id_token: None,
         }),
+        upstream_url: None,
     }
 }
 
@@ -718,6 +731,279 @@ async fn test_use_unknown_account_returns_error() {
 }
 
 // ---------------------------------------------------------------------------
+// Cross-protocol interop tests
+// ---------------------------------------------------------------------------
+
+const OPENAI_TOKEN: &str = "openai-test-token-xyz";
+
+/// Mock upstream that speaks the OpenAI /v1/chat/completions protocol.
+fn make_openai_upstream(captures: Captures, streaming: bool) -> Router {
+    Router::new().route("/v1/chat/completions", post({
+        let caps = captures.clone();
+        move |req: Request| async move {
+            let (parts, body) = req.into_parts();
+            let body_bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+            caps.push(CapturedRequest { headers: to_reqwest_headers(&parts.headers), body: body_bytes });
+
+            if streaming {
+                let sse = b"data: {\"id\":\"chatcmpl-x\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hi\"},\"finish_reason\":null}]}\n\n\
+                            data: {\"id\":\"chatcmpl-x\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3,\"total_tokens\":8}}\n\n\
+                            data: [DONE]\n\n";
+                return Response::builder()
+                    .status(200)
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from(Bytes::from_static(sse)))
+                    .unwrap();
+            }
+
+            axum::Json(json!({
+                "id": "chatcmpl-test",
+                "object": "chat.completion",
+                "model": "gpt-4o",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hello from OpenAI"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+            })).into_response()
+        }
+    }))
+}
+
+fn openai_account(upstream_url: String) -> AccountConfig {
+    AccountConfig {
+        name: "codex".into(),
+        plan_type: "pro".into(),
+        provider: Provider::OpenAI,
+        credential: Some(OAuthCredential {
+            email: None,
+            access_token: OPENAI_TOKEN.into(),
+            refresh_token: "openai-refresh".into(),
+            expires_at: u64::MAX / 2,
+            id_token: None,
+        }),
+        upstream_url: Some(upstream_url),
+    }
+}
+
+/// Anthropic request routed to an OpenAI account — shunt translates A→O,
+/// forwards to OpenAI mock, translates response O→A back to client.
+#[tokio::test]
+async fn test_interop_anthropic_request_to_openai_account() {
+    let caps = Captures::default();
+    let openai_up = TestServer::start(make_openai_upstream(caps.clone(), false)).await;
+
+    let cfg = Config {
+        server: ServerConfig {
+            upstream_url: "http://unused-anthropic".into(),
+            host: "127.0.0.1".into(),
+            port: 0,
+            log_level: "error".into(),
+            ..ServerConfig::default()
+        },
+        accounts: vec![openai_account(openai_up.url())],
+        config_file: std::path::PathBuf::from("/dev/null"),
+    };
+    let (app, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
+    let proxy = TestServer::start(app).await;
+    let client = Client::new();
+
+    let resp = client
+        .post(format!("{}/v1/messages", proxy.url()))
+        .header("content-type", "application/json")
+        .header("anthropic-version", "2023-06-01")
+        .json(&json!({
+            "model": "claude-opus-4-6",
+            "max_tokens": 64,
+            "system": "You are helpful.",
+            "messages": [{"role": "user", "content": "Hello"}]
+        }))
+        .send().await.unwrap();
+
+    assert_eq!(resp.status(), 200, "cross-protocol proxy must return 200");
+
+    // Upstream (OpenAI mock) must have received an OpenAI-format body.
+    let upstream_req: serde_json::Value = serde_json::from_slice(&caps.get(0).body).unwrap();
+    assert!(upstream_req.get("messages").is_some(), "must have messages array");
+    assert!(upstream_req.get("max_tokens").is_some(), "must have max_tokens");
+    // model must be mapped to an OpenAI model
+    let sent_model = upstream_req["model"].as_str().unwrap();
+    assert!(!sent_model.starts_with("claude-"), "claude-* model must be mapped to OpenAI model, got: {sent_model}");
+    // system must be prepended as system message
+    let first_msg = &upstream_req["messages"][0];
+    assert_eq!(first_msg["role"], "system");
+    assert_eq!(first_msg["content"], "You are helpful.");
+    // Anthropic-specific headers must be stripped
+    assert!(caps.get(0).headers.get("anthropic-version").is_none(), "anthropic-version must not be forwarded to OpenAI");
+
+    // Client must receive Anthropic-format response.
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["type"], "message", "response must be Anthropic message type");
+    assert!(body["content"].as_array().is_some(), "must have content array");
+    assert!(body["stop_reason"].is_string(), "must have stop_reason");
+    assert!(body["usage"]["input_tokens"].is_number(), "must have input_tokens");
+}
+
+/// Anthropic streaming request routed to an OpenAI account — OpenAI SSE → Anthropic SSE.
+#[tokio::test]
+async fn test_interop_anthropic_streaming_to_openai_account() {
+    let caps = Captures::default();
+    let openai_up = TestServer::start(make_openai_upstream(caps.clone(), true)).await;
+
+    let cfg = Config {
+        server: ServerConfig {
+            upstream_url: "http://unused-anthropic".into(),
+            host: "127.0.0.1".into(),
+            port: 0,
+            log_level: "error".into(),
+            ..ServerConfig::default()
+        },
+        accounts: vec![openai_account(openai_up.url())],
+        config_file: std::path::PathBuf::from("/dev/null"),
+    };
+    let (app, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
+    let proxy = TestServer::start(app).await;
+    let client = Client::new();
+
+    let resp = client
+        .post(format!("{}/v1/messages", proxy.url()))
+        .header("content-type", "application/json")
+        .json(&json!({
+            "model": "claude-opus-4-6",
+            "max_tokens": 32,
+            "stream": true,
+            "messages": [{"role": "user", "content": "Hi"}]
+        }))
+        .send().await.unwrap();
+
+    assert_eq!(resp.status(), 200);
+    assert!(resp.headers()["content-type"].to_str().unwrap().contains("text/event-stream"),
+        "response must be SSE");
+
+    let body = resp.bytes().await.unwrap();
+    let text = String::from_utf8_lossy(&body);
+    // Must contain Anthropic SSE event types
+    assert!(text.contains("message_start"), "must emit message_start: {text}");
+    assert!(text.contains("content_block_delta"), "must emit content_block_delta: {text}");
+    assert!(text.contains("message_stop"), "must emit message_stop: {text}");
+    // Must NOT contain raw OpenAI chunk format
+    assert!(!text.contains("chat.completion.chunk"), "must not expose raw OpenAI format");
+}
+
+/// OpenAI request routed to an Anthropic account — shunt translates O→A,
+/// forwards to Anthropic mock, translates response A→O back to client.
+#[tokio::test]
+async fn test_interop_openai_request_to_anthropic_account() {
+    let caps = Captures::default();
+    let anthropic_up = TestServer::start(make_mock_upstream(caps.clone(), false, 200)).await;
+
+    let cfg = Config {
+        server: ServerConfig {
+            upstream_url: anthropic_up.url(),
+            host: "127.0.0.1".into(),
+            port: 0,
+            log_level: "error".into(),
+            ..ServerConfig::default()
+        },
+        accounts: vec![AccountConfig {
+            name: "claude".into(),
+            plan_type: "pro".into(),
+            provider: Provider::default(), // Anthropic
+            credential: Some(test_credential()),
+            upstream_url: None,
+        }],
+        config_file: std::path::PathBuf::from("/dev/null"),
+    };
+    let (app, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
+    let proxy = TestServer::start(app).await;
+    let client = Client::new();
+
+    let resp = client
+        .post(format!("{}/v1/chat/completions", proxy.url()))
+        .header("content-type", "application/json")
+        .json(&json!({
+            "model": "gpt-4o",
+            "messages": [
+                {"role": "system", "content": "Be concise."},
+                {"role": "user", "content": "Say hi"}
+            ]
+        }))
+        .send().await.unwrap();
+
+    assert_eq!(resp.status(), 200, "cross-protocol proxy must return 200");
+
+    // Upstream (Anthropic mock) must have received Anthropic-format body.
+    let upstream_req: serde_json::Value = serde_json::from_slice(&caps.get(0).body).unwrap();
+    assert!(upstream_req.get("messages").is_some());
+    // system must be extracted from messages and put in top-level field
+    assert!(upstream_req.get("system").is_some(), "system must be extracted: {upstream_req}");
+    // model must be mapped to claude-*
+    let sent_model = upstream_req["model"].as_str().unwrap();
+    assert!(sent_model.starts_with("claude-"), "gpt-4o must map to claude-*, got: {sent_model}");
+
+    // Client must receive OpenAI-format response.
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["choices"].as_array().is_some(), "response must have choices");
+    assert!(body["choices"][0]["message"]["content"].is_string(), "message content must be string");
+    assert!(body["choices"][0]["finish_reason"].is_string(), "must have finish_reason");
+}
+
+/// Mixed accounts: Anthropic account rate-limited → failover to OpenAI account with translation.
+#[tokio::test]
+async fn test_interop_failover_anthropic_to_openai() {
+    let anthro_caps = Captures::default();
+    let openai_caps = Captures::default();
+
+    // Anthropic mock always returns 429
+    let anthropic_up = TestServer::start(make_mock_upstream(anthro_caps.clone(), false, 429)).await;
+    // OpenAI mock always returns 200
+    let openai_up = TestServer::start(make_openai_upstream(openai_caps.clone(), false)).await;
+
+    let cfg = Config {
+        server: ServerConfig {
+            upstream_url: anthropic_up.url(),
+            host: "127.0.0.1".into(),
+            port: 0,
+            log_level: "error".into(),
+            ..ServerConfig::default()
+        },
+        accounts: vec![
+            AccountConfig {
+                name: "claude-account".into(),
+                plan_type: "pro".into(),
+                provider: Provider::default(), // Anthropic
+                credential: Some(test_credential()),
+                upstream_url: None,
+            },
+            openai_account(openai_up.url()),
+        ],
+        config_file: std::path::PathBuf::from("/dev/null"),
+    };
+    let (app, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
+    let proxy = TestServer::start(app).await;
+    let client = Client::new();
+
+    let resp = client
+        .post(format!("{}/v1/messages", proxy.url()))
+        .header("content-type", "application/json")
+        .json(&json!({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 32,
+            "messages": [{"role": "user", "content": "Fallback test"}]
+        }))
+        .send().await.unwrap();
+
+    assert_eq!(resp.status(), 200, "must succeed via OpenAI fallback");
+    // Anthropic account was tried (and 429'd)
+    assert_eq!(anthro_caps.len(), 1, "Anthropic account must have been tried");
+    // OpenAI account was then used
+    assert_eq!(openai_caps.len(), 1, "OpenAI account must have been used as fallback");
+    // OpenAI received OpenAI-format body
+    let openai_req: serde_json::Value = serde_json::from_slice(&openai_caps.get(0).body).unwrap();
+    assert!(openai_req.get("messages").is_some());
+    // Client got Anthropic-format response
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["type"], "message", "client must receive Anthropic-format response");
+}
+
+// ---------------------------------------------------------------------------
 // Live test — skipped unless ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN set
 // ---------------------------------------------------------------------------
 
@@ -750,7 +1036,7 @@ async fn test_live_api() {
             log_level: "error".into(),
             ..ServerConfig::default()
         },
-        accounts: vec![AccountConfig { name: "live".into(), plan_type: "pro".into(), provider: Provider::default(), credential: Some(credential) }],
+        accounts: vec![AccountConfig { name: "live".into(), plan_type: "pro".into(), provider: Provider::default(), credential: Some(credential), upstream_url: None }],
         config_file: std::path::PathBuf::from("/dev/null"),
     };
 
