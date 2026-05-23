@@ -1233,12 +1233,37 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
             dim("·"), dim(&today_tok), dim(&cost_str), dim("·"), dim(&all_str)))
     });
 
+    // Build per-provider account counts for the splash right panel.
+    let mut provider_lines: Vec<String> = {
+        let mut counts: Vec<(String, usize)> = vec![];
+        for acc in &config.accounts {
+            let label = match &acc.provider {
+                crate::provider::Provider::Anthropic   => "Claude Code".to_string(),
+                crate::provider::Provider::OpenAI      => "Codex".to_string(),
+                crate::provider::Provider::OpenAIApi   => "OpenAI".to_string(),
+                crate::provider::Provider::OllamaCloud => "Ollama".to_string(),
+                crate::provider::Provider::Groq        => "Groq".to_string(),
+                crate::provider::Provider::Mistral     => "Mistral".to_string(),
+                crate::provider::Provider::Together    => "Together".to_string(),
+                crate::provider::Provider::OpenRouter  => "OpenRouter".to_string(),
+                crate::provider::Provider::DeepSeek    => "DeepSeek".to_string(),
+                crate::provider::Provider::Fireworks   => "Fireworks".to_string(),
+                crate::provider::Provider::Gemini      => "Gemini".to_string(),
+                crate::provider::Provider::Local       => "Local".to_string(),
+            };
+            if let Some(entry) = counts.iter_mut().find(|(l, _)| l == &label) {
+                entry.1 += 1;
+            } else {
+                counts.push((label, 1));
+            }
+        }
+        counts.iter().map(|(label, n)| format!("{n}  {label}")).collect()
+    };
+    // Pad to 4 lines to fill the splash panel height.
+    while provider_lines.len() < 4 { provider_lines.push(String::new()); }
+
     let title = format!("shunt  v{}", env!("CARGO_PKG_VERSION"));
-    let mut right: Vec<String> = vec![proxy_line];
-    if let Some(ref s) = savings_line { right.push(s.clone()); }
-    // Pad to 4 lines so the right side always fills the splash box height.
-    while right.len() < 4 { right.push(String::new()); }
-    print_status_splash(&title, right);
+    print_status_splash(&title, provider_lines);
     println!();
 
     let pinned_account = live.as_ref().and_then(|v| v["pinned"].as_str()).map(|s| s.to_owned());
