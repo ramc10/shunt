@@ -1384,10 +1384,12 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
             println!("{}", card_row(&format!("{}  run {}",
                 dim("·"), cyan(&format!("shunt add-account {}", acc.name)))));
         } else if live.is_some() && live_acc.is_some() {
-            if acc.provider == crate::provider::Provider::Anthropic {
-                println!("{}", card_row(&dim("· quota data will appear after first request")));
-            } else {
-                println!("{}", card_row(&dim("· quota tracking unavailable (OpenAI doesn't report utilization)")));
+            match &acc.provider {
+                crate::provider::Provider::Anthropic =>
+                    println!("{}", card_row(&dim("· quota data will appear after first request"))),
+                crate::provider::Provider::Local => {}  // local has no quota
+                _ =>
+                    println!("{}", card_row(&dim("· quota tracking unavailable (provider doesn't report utilization)"))),
             }
         }
 

@@ -359,6 +359,10 @@ async fn proxy_handler(
         // All other OpenAI-compat providers (OpenAIApi, Groq, Mistral, …) use /v1/chat/completions.
         let acct_is_chatgpt = matches!(account.provider, Provider::OpenAI);
 
+        // log_model: what we actually send to the upstream (after resolve_model).
+        // Defaults to the incoming model; overridden in the OpenAI-compat branch.
+        let mut log_model = model.clone();
+
         let (fwd_path, fwd_body, mut fwd_headers) = if req_is_anthropic == acct_is_anthropic {
             // Same wire protocol — pass through unchanged.
             (path.clone(), body_bytes.clone(), headers.clone())
@@ -380,6 +384,7 @@ async fn proxy_handler(
             let val = serde_json::from_slice::<serde_json::Value>(&body_bytes).unwrap_or(json!({}));
             // Resolve the target model: account pin → global mapping → provider default.
             let target_model = resolve_model(&model, account, &s.config.model_mapping);
+            log_model = target_model.clone();
             let translated = translate_anthropic_req_to_openai(val, &target_model);
             let mut h = headers.clone();
             for name in &["anthropic-version", "anthropic-beta", "anthropic-dangerous-direct-browser-access"] {
@@ -480,7 +485,7 @@ async fn proxy_handler(
                     // Got Anthropic response; client expects OpenAI.
                     translate_response_anthropic_to_openai(response).await
                 };
-                return Ok(tap_usage(response, &s.state, &account_name, &model, req_start_ms).await);
+                return Ok(tap_usage(response, &s.state, &account_name, &log_model, req_start_ms).await);
             }
             429 => {
                 let info = account.provider.parse_rate_limits(response.headers());
