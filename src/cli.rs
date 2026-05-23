@@ -305,18 +305,203 @@ async fn cmd_config(config_override: Option<PathBuf>) -> Result<()> {
     }
 
     let items = vec![
-        term::SelectItem { label: format!("{}  {}", bold("Add account"),    dim("connect a new account to the pool")), value: "add".into() },
-        term::SelectItem { label: format!("{}  {}", bold("Remove account"), dim("delete an account from the pool")),   value: "remove".into() },
-        term::SelectItem { label: format!("{}  {}", bold("Log out"),        dim("clear credentials for an account")), value: "logout".into() },
+        term::SelectItem { label: format!("{}  {}", bold("Add account"),     dim("connect a new account to the pool")),        value: "add".into() },
+        term::SelectItem { label: format!("{}  {}", bold("Manage accounts"), dim("reauth, update config, or fix issues")),     value: "manage".into() },
+        term::SelectItem { label: format!("{}  {}", bold("Remove account"),  dim("delete an account from the pool")),          value: "remove".into() },
+        term::SelectItem { label: format!("{}  {}", bold("Log out"),         dim("clear credentials for an account")),         value: "logout".into() },
     ];
 
     println!();
     match term::select("Account management", &items, 0) {
         Some(v) if v == "add"    => cmd_add_account(config_override, None, None).await,
+        Some(v) if v == "manage" => cmd_manage_account(config_override).await,
         Some(v) if v == "remove" => cmd_remove_account(config_override, None).await,
         Some(v) if v == "logout" => cmd_logout(config_override, None, false).await,
         _ => Ok(()),
     }
+}
+
+// ---------------------------------------------------------------------------
+// manage-account  (per-account edit / reauth)
+// ---------------------------------------------------------------------------
+
+async fn cmd_manage_account(config_override: Option<PathBuf>) -> Result<()> {
+    use crate::provider::AuthKind;
+
+    let config = crate::config::load_config(config_override.as_deref())?;
+    if config.accounts.is_empty() {
+        bail!("No accounts configured. Run `shunt config` → Add account.");
+    }
+
+    // ── Step 1: pick account ─────────────────────────────────────────────────
+    let items: Vec<term::SelectItem> = config.accounts.iter().map(|a| {
+        let tag = match a.provider.auth_kind() {
+            AuthKind::OAuth  => {
+                let ok = a.credential.as_ref().map(|c| !c.needs_refresh()).unwrap_or(false);
+                if ok { dim("  oauth  ✓") } else { yellow("  oauth  !") }
+            }
+            AuthKind::ApiKey => dim("  api-key"),
+            AuthKind::None   => dim("  local"),
+        };
+        term::SelectItem {
+            label: format!("{}  {}{}", bold(&pad(&a.name, 14)), dim(&pad(a.credential.as_ref().and_then(|c| c.email()).unwrap_or(""), 32)), tag),
+            value: a.name.clone(),
+        }
+    }).collect();
+
+    println!();
+    let name = match term::select("Which account?", &items, 0) {
+        Some(v) => v,
+        None => return Ok(()),
+    };
+
+    let account = config.accounts.iter().find(|a| a.name == name).unwrap();
+    let provider = account.provider.clone();
+
+    // ── Step 2: pick action ──────────────────────────────────────────────────
+    let mut actions: Vec<term::SelectItem> = Vec::new();
+    match provider.auth_kind() {
+        AuthKind::OAuth => {
+            actions.push(term::SelectItem { label: format!("{}  {}", bold("Re-authenticate"), dim("start a new OAuth session")),          value: "reauth".into() });
+            actions.push(term::SelectItem { label: format!("{}  {}", bold("Log out"),         dim("clear stored credentials")),            value: "logout".into() });
+        }
+        AuthKind::ApiKey => {
+            actions.push(term::SelectItem { label: format!("{}  {}", bold("Update API key"),  dim("replace stored key")),                  value: "apikey".into() });
+        }
+        AuthKind::None => {
+            actions.push(term::SelectItem { label: format!("{}  {}", bold("Update upstream URL"), dim("change the local endpoint")),       value: "upstream".into() });
+            actions.push(term::SelectItem { label: format!("{}  {}", bold("Update model"),        dim("set default model for this account")), value: "model".into() });
+        }
+    }
+    actions.push(term::SelectItem { label: format!("{}  {}", bold("Remove account"), dim("delete from pool permanently")),                value: "remove".into() });
+
+    println!();
+    let action = match term::select(&format!("Manage  '{name}'"), &actions, 0) {
+        Some(v) => v,
+        None => return Ok(()),
+    };
+
+    println!();
+
+    match action.as_str() {
+        // ── Re-authenticate (OAuth) ──────────────────────────────────────────
+        "reauth" => {
+            print_splash(&[
+                format!("{}  {}", brand_green("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
+                format!("Re-authenticating  '{name}'"),
+                String::new(),
+            ]);
+            use crate::oauth::{run_oauth_flow, run_openai_oauth_flow, fetch_account_email, fetch_openai_account_email};
+            use crate::provider::Provider;
+            let mut cred = match provider {
+                Provider::Anthropic => run_oauth_flow().await?,
+                Provider::OpenAI    => run_openai_oauth_flow().await?,
+                _ => unreachable!(),
+            };
+            let email = match provider {
+                Provider::Anthropic => fetch_account_email(&cred.access_token).await,
+                Provider::OpenAI    => fetch_openai_account_email(&cred.access_token).await,
+                _ => None,
+            };
+            if let Some(ref e) = email { println!("  {} Signed in as {}", green(CHECK), bold(e)); }
+            cred.email = email;
+            if cred.id_token.is_some() { crate::oauth::write_codex_auth_file(&cred); }
+            // Clear auth_failed state
+            let state_p = crate::config::state_path();
+            let state = crate::state::StateStore::load(&state_p);
+            state.clear_auth_failed(&name);
+            // Save credential
+            let mut store = CredentialsStore::load();
+            store.accounts.insert(name.clone(), Credential::Oauth(cred));
+            store.save()?;
+            println!();
+            println!("  {} Account '{}' re-authenticated.", green(CHECK), bold(&name));
+            offer_restart(config_override).await;
+        }
+
+        // ── Update API key ───────────────────────────────────────────────────
+        "apikey" => {
+            let env_hint = provider.api_key_env_var()
+                .map(|v| format!(" (or set {} in your environment)", v))
+                .unwrap_or_default();
+            print!("  {} New API key{}: ", dim("·"), dim(&env_hint));
+            use std::io::Write; std::io::stdout().flush().ok();
+            let key = read_secret_line()?;
+            if key.is_empty() { bail!("API key cannot be empty."); }
+            let mut store = CredentialsStore::load();
+            store.accounts.insert(name.clone(), Credential::Apikey { key });
+            store.save()?;
+            // Clear any auth_failed state
+            let state_p = crate::config::state_path();
+            let state = crate::state::StateStore::load(&state_p);
+            state.clear_auth_failed(&name);
+            println!("  {} API key updated for '{}'.", green(CHECK), bold(&name));
+            offer_restart(config_override).await;
+        }
+
+        // ── Update upstream URL (Local) ──────────────────────────────────────
+        "upstream" => {
+            let current = account.upstream_url.as_deref().unwrap_or("(not set)");
+            print!("  {} Upstream URL [{}]: ", dim("·"), dim(current));
+            use std::io::{BufRead, Write}; std::io::stdout().flush().ok();
+            let mut input = String::new();
+            std::io::stdin().lock().read_line(&mut input)?;
+            let url = input.trim().to_string();
+            if url.is_empty() { bail!("URL cannot be empty."); }
+            update_account_toml_field(config_override.as_deref(), &name, "upstream_url", &url)?;
+            println!("  {} Upstream URL updated for '{}'.", green(CHECK), bold(&name));
+            offer_restart(config_override).await;
+        }
+
+        // ── Update model (Local / any) ───────────────────────────────────────
+        "model" => {
+            let current = account.model.as_deref().unwrap_or("(not set)");
+            print!("  {} Model [{}]: ", dim("·"), dim(current));
+            use std::io::{BufRead, Write}; std::io::stdout().flush().ok();
+            let mut input = String::new();
+            std::io::stdin().lock().read_line(&mut input)?;
+            let model = input.trim().to_string();
+            if model.is_empty() { bail!("Model cannot be empty."); }
+            update_account_toml_field(config_override.as_deref(), &name, "model", &model)?;
+            println!("  {} Model updated for '{}'.", green(CHECK), bold(&name));
+            offer_restart(config_override).await;
+        }
+
+        // ── Log out (OAuth) ──────────────────────────────────────────────────
+        "logout" => {
+            return cmd_logout(config_override, Some(name), false).await;
+        }
+
+        // ── Remove account ───────────────────────────────────────────────────
+        "remove" => {
+            return cmd_remove_account(config_override, Some(name)).await;
+        }
+
+        _ => {}
+    }
+
+    println!();
+    Ok(())
+}
+
+/// Update a single string field inside the `[[accounts]]` block for `account_name`
+/// in the TOML config file (using toml_edit for safe structured editing).
+fn update_account_toml_field(config_override: Option<&std::path::Path>, account_name: &str, field: &str, value: &str) -> Result<()> {
+    let config_p = config_override.map(|p| p.to_path_buf()).unwrap_or_else(config_path);
+    let text = std::fs::read_to_string(&config_p)?;
+    let mut doc = text.parse::<toml_edit::DocumentMut>()
+        .context("Failed to parse config TOML")?;
+    if let Some(item) = doc.get_mut("accounts") {
+        if let Some(arr) = item.as_array_of_tables_mut() {
+            for table in arr.iter_mut() {
+                if table.get("name").and_then(|v| v.as_str()) == Some(account_name) {
+                    table.insert(field, toml_edit::value(value));
+                }
+            }
+        }
+    }
+    std::fs::write(&config_p, doc.to_string())?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
