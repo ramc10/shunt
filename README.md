@@ -1,11 +1,6 @@
 <div align="center">
 
-```
-              ██████
-            ███    ███
-              ██████
-               █  █
-```
+<img src="logo.svg" alt="shunt logo" width="160">
 
 # shunt
 
