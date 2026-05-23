@@ -750,7 +750,10 @@ async fn cmd_start(
     }
 
     // ── Auto-setup on first run ───────────────────────────────────────────────
-    if !config_p.exists() {
+    // Skip interactive setup when stdin is not a TTY (e.g. curl | sh) to
+    // avoid blocking on macOS Keychain or OAuth prompts.
+    let stdin_is_tty = unsafe { libc::isatty(libc::STDIN_FILENO) != 0 };
+    if !config_p.exists() && stdin_is_tty {
         cmd_setup_auto(config_override.clone()).await?;
     }
 

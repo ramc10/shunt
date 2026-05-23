@@ -28,10 +28,10 @@ case "$OS" in
   *) echo "Unsupported OS: $OS" >&2; exit 1 ;;
 esac
 
-# Fetch latest release version
+# Fetch latest release version via redirect (avoids JSON parsing and CDN caching)
 echo "Fetching latest release..."
-VERSION="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
-  | grep '"tag_name"' | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')"
+LATEST_URL="$(curl -fsSL -o /dev/null -w '%{url_effective}' "https://github.com/$REPO/releases/latest")"
+VERSION="$(echo "$LATEST_URL" | sed 's|.*/tag/||')"
 
 if [ -z "$VERSION" ]; then
   echo "Could not determine latest version." >&2
@@ -69,6 +69,65 @@ case ":$PATH:" in
   *) export PATH="$INSTALL_DIR:$PATH" ;;
 esac
 
-# Configure shunt: import credentials, register login service, start proxy
-echo "Configuring shunt..."
-"$INSTALL_DIR/$BIN" service install < /dev/null
+EXE="$INSTALL_DIR/$BIN"
+
+# ── Write login-service file (no launchctl/systemctl — avoids SSH hangs) ─────
+if [ "$OS" = "Darwin" ]; then
+  PLIST_DIR="$HOME/Library/LaunchAgents"
+  mkdir -p "$PLIST_DIR"
+  cat > "$PLIST_DIR/sh.shunt.proxy.plist" << ENDPLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>sh.shunt.proxy</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$EXE</string>
+    <string>start</string>
+    <string>--foreground</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>$HOME/Library/Logs/shunt.log</string>
+  <key>StandardErrorPath</key>
+  <string>$HOME/Library/Logs/shunt.log</string>
+</dict>
+</plist>
+ENDPLIST
+elif [ "$OS" = "Linux" ]; then
+  UNIT_DIR="$HOME/.config/systemd/user"
+  mkdir -p "$UNIT_DIR"
+  cat > "$UNIT_DIR/shunt.service" << ENDUNIT
+[Unit]
+Description=shunt Claude Code proxy
+After=network.target
+
+[Service]
+ExecStart=$EXE start --foreground
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+ENDUNIT
+fi
+
+# ── Start proxy now ───────────────────────────────────────────────────────────
+echo "Starting shunt..."
+"$EXE" start < /dev/null
+
+# ── Write ANTHROPIC_BASE_URL to shell profile (belt-and-suspenders) ───────────
+for PROFILE in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.bash_profile"; do
+  if [ -f "$PROFILE" ]; then
+    if ! grep -q "ANTHROPIC_BASE_URL" "$PROFILE" 2>/dev/null; then
+      printf '\n# Added by shunt\nexport ANTHROPIC_BASE_URL=http://127.0.0.1:8082\n' >> "$PROFILE"
+    fi
+    break
+  fi
+done
