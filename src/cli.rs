@@ -317,19 +317,17 @@ async fn cmd_add_account(
         Provider::from_str(p)
     } else {
         let items = vec![
-            term::SelectItem {
-                label: format!("{}  {}",
-                    bold("Claude Code"),
-                    dim("(claude.ai — Anthropic)")),
-                value: "anthropic".into(),
-            },
-            term::SelectItem {
-                label: format!("{}  {}  {}",
-                    bold("Codex"),
-                    yellow("[beta]"),
-                    dim("(chatgpt.com — OpenAI)")),
-                value: "openai".into(),
-            },
+            term::SelectItem { label: format!("{}  {}", bold("Claude Code"), dim("(claude.ai — Anthropic)")), value: "anthropic".into() },
+            term::SelectItem { label: format!("{}  {}  {}", bold("Codex"), yellow("[beta]"), dim("(chatgpt.com — OpenAI)")), value: "openai".into() },
+            term::SelectItem { label: format!("{}  {}", bold("Groq"),        dim("(api.groq.com — API key)")),               value: "groq".into() },
+            term::SelectItem { label: format!("{}  {}", bold("Mistral"),     dim("(api.mistral.ai — API key)")),             value: "mistral".into() },
+            term::SelectItem { label: format!("{}  {}", bold("Together AI"), dim("(api.together.xyz — API key)")),           value: "together".into() },
+            term::SelectItem { label: format!("{}  {}", bold("OpenRouter"),  dim("(openrouter.ai — API key)")),              value: "openrouter".into() },
+            term::SelectItem { label: format!("{}  {}", bold("DeepSeek"),    dim("(api.deepseek.com — API key)")),           value: "deepseek".into() },
+            term::SelectItem { label: format!("{}  {}", bold("Fireworks"),   dim("(api.fireworks.ai — API key)")),           value: "fireworks".into() },
+            term::SelectItem { label: format!("{}  {}", bold("Gemini"),      dim("(generativelanguage.googleapis.com — API key)")), value: "gemini".into() },
+            term::SelectItem { label: format!("{}  {}", bold("OpenAI API"),  dim("(api.openai.com — API key)")),             value: "openai-api".into() },
+            term::SelectItem { label: format!("{}  {}", bold("Local"),       dim("(Ollama, LM Studio, etc. — no auth)")),   value: "local".into() },
         ];
         match term::select("Which provider?", &items, 0) {
             Some(v) => Provider::from_str(&v),
@@ -354,22 +352,29 @@ async fn cmd_add_account(
         }
         (n, in_config)
     } else {
-        // Check for existing config entries that are missing credentials for this provider
-        let config = crate::config::load_config(config_override.as_deref())?;
-        let missing: Vec<_> = config.accounts.iter()
-            .filter(|a| a.provider == provider && a.credential.is_none())
-            .collect();
+        use crate::provider::AuthKind;
+        // For OAuth providers: offer to re-auth existing uncredentialed accounts.
+        // For API-key / Local: always prompt for a new name (credentials don't expire the same way).
+        let missing_oauth: Vec<_> = if provider.auth_kind() == AuthKind::OAuth {
+            let config = crate::config::load_config(config_override.as_deref())?;
+            config.accounts.iter()
+                .filter(|a| a.provider == provider && a.credential.is_none())
+                .map(|a| a.name.clone())
+                .collect()
+        } else {
+            vec![]
+        };
 
-        match missing.len() {
+        match missing_oauth.len() {
             1 => {
-                println!("  {} Authorizing account {}", yellow("↻"), bold(&format!("'{}'", missing[0].name)));
+                println!("  {} Authorizing account {}", yellow("↻"), bold(&format!("'{}'", missing_oauth[0])));
                 println!();
-                (missing[0].name.clone(), true)
+                (missing_oauth[0].clone(), true)
             }
             n if n > 1 => {
-                let items: Vec<term::SelectItem> = missing.iter().map(|a| term::SelectItem {
-                    label: bold(&a.name).to_string(),
-                    value: a.name.clone(),
+                let items: Vec<term::SelectItem> = missing_oauth.iter().map(|a| term::SelectItem {
+                    label: bold(a).to_string(),
+                    value: a.clone(),
                 }).collect();
                 match term::select("Which account to authorize?", &items, 0) {
                     Some(v) => (v, true),
@@ -377,8 +382,9 @@ async fn cmd_add_account(
                 }
             }
             _ => {
-                // All configured — prompt for a new name
-                print!("  {} Account name: ", dim("·"));
+                // Prompt for a new name
+                let hint = format!("({} account name, e.g. \"{}\")", provider, provider.to_string().to_lowercase().replace(' ', "-"));
+                print!("  {} Account name {}: ", dim("·"), dim(&hint));
                 use std::io::Write;
                 std::io::stdout().flush().ok();
                 let mut input = String::new();
@@ -390,45 +396,83 @@ async fn cmd_add_account(
         }
     };
 
-    // ── Step 3: OAuth flow ───────────────────────────────────────────────────
-    let mut cred = match provider {
-        Provider::Anthropic => run_oauth_flow().await?,
-        Provider::OpenAI    => crate::oauth::run_openai_oauth_flow().await?,
-        _ => anyhow::bail!("provider {} does not support OAuth login; use `api_key` in config instead", provider),
+    // ── Step 3: authenticate ─────────────────────────────────────────────────
+    use crate::provider::AuthKind;
+    let credential: Option<Credential> = match provider.auth_kind() {
+        AuthKind::OAuth => {
+            let mut cred = match provider {
+                Provider::Anthropic => run_oauth_flow().await?,
+                Provider::OpenAI    => crate::oauth::run_openai_oauth_flow().await?,
+                _ => unreachable!(),
+            };
+            // Fetch email (non-fatal)
+            let email = match provider {
+                Provider::Anthropic => crate::oauth::fetch_account_email(&cred.access_token).await,
+                Provider::OpenAI    => crate::oauth::fetch_openai_account_email(&cred.access_token).await,
+                _ => None,
+            };
+            if let Some(ref e) = email {
+                println!("  {} Signed in as {}", green(CHECK), bold(e));
+            }
+            cred.email = email;
+            // Keep ~/.codex/auth.json in sync so the Codex CLI works without re-login.
+            if cred.id_token.is_some() {
+                crate::oauth::write_codex_auth_file(&cred);
+            }
+            Some(Credential::Oauth(cred))
+        }
+        AuthKind::ApiKey => {
+            // Show env-var hint if available
+            let env_hint = provider.api_key_env_var()
+                .map(|v| format!(" (or set {} in your environment)", v))
+                .unwrap_or_default();
+            print!("  {} API key{}: ", dim("·"), dim(&env_hint));
+            use std::io::Write;
+            std::io::stdout().flush().ok();
+            // Read key — use rpassword for masked input if available, otherwise plain readline
+            let key = read_secret_line()?;
+            if key.is_empty() { bail!("API key cannot be empty."); }
+            println!("  {} API key saved.", green(CHECK));
+            Some(Credential::Apikey { key })
+        }
+        AuthKind::None => {
+            // Local provider — no credential needed, but we may need upstream_url
+            None
+        }
     };
 
-    // Fetch email (non-fatal)
-    let email = match provider {
-        Provider::Anthropic => crate::oauth::fetch_account_email(&cred.access_token).await,
-        Provider::OpenAI    => crate::oauth::fetch_openai_account_email(&cred.access_token).await,
-        _ => None,
+    // For Local provider, prompt for upstream URL
+    let upstream_url: Option<String> = if matches!(provider, Provider::Local) {
+        print!("  {} Upstream URL (e.g. http://localhost:11434): ", dim("·"));
+        use std::io::Write;
+        std::io::stdout().flush().ok();
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        let u = input.trim().to_string();
+        if u.is_empty() { bail!("Upstream URL cannot be empty for local provider."); }
+        Some(u)
+    } else {
+        None
     };
-    if let Some(ref e) = email {
-        println!("  {} Signed in as {}", green(CHECK), bold(e));
-    }
-    cred.email = email;
 
     // ── Step 4: persist ──────────────────────────────────────────────────────
     if !already_in_config {
         let mut config_text = existing_config;
-        match provider {
-            Provider::Anthropic => config_text.push_str(&format!(
-                "\n[[accounts]]\nname = \"{name}\"\nplan_type = \"pro\"\n"
-            )),
-            _ => config_text.push_str(&format!(
-                "\n[[accounts]]\nname = \"{name}\"\nplan_type = \"pro\"\nprovider = \"{provider}\"\n"
-            )),
+        let mut block = format!("\n[[accounts]]\nname = \"{name}\"\n");
+        if !matches!(provider, Provider::Anthropic) {
+            block.push_str(&format!("provider = \"{provider}\"\n"));
         }
+        if let Some(ref url) = upstream_url {
+            block.push_str(&format!("upstream_url = \"{url}\"\n"));
+        }
+        config_text.push_str(&block);
         std::fs::write(&config_p, &config_text)?;
     }
 
-    let mut store = CredentialsStore::load();
-    store.accounts.insert(name.clone(), Credential::Oauth(cred.clone()));
-    store.save()?;
-
-    // Keep ~/.codex/auth.json in sync so the Codex CLI works without re-login.
-    if cred.id_token.is_some() {
-        crate::oauth::write_codex_auth_file(&cred);
+    if let Some(cred) = credential {
+        let mut store = CredentialsStore::load();
+        store.accounts.insert(name.clone(), cred);
+        store.save()?;
     }
 
     println!();
@@ -436,6 +480,37 @@ async fn cmd_add_account(
     offer_restart(config_override).await;
     println!();
     Ok(())
+}
+
+/// Read a line from stdin without echoing (for API keys). Falls back to
+/// plain readline if the terminal doesn't support it.
+fn read_secret_line() -> Result<String> {
+    // Try rpassword-style: disable echo via termios, then restore.
+    #[cfg(unix)]
+    {
+        use std::io::{BufRead, Write};
+        // Disable echo
+        let _ = std::process::Command::new("stty").arg("-echo").status();
+        let mut out = std::io::stdout();
+        let _ = out.flush();
+        let stdin = std::io::stdin();
+        let mut line = String::new();
+        stdin.lock().read_line(&mut line)?;
+        // Re-enable echo and print newline
+        let _ = std::process::Command::new("stty").arg("echo").status();
+        println!();
+        return Ok(line.trim().to_string());
+    }
+    #[cfg(not(unix))]
+    {
+        use std::io::{BufRead, Write};
+        let mut out = std::io::stdout();
+        let _ = out.flush();
+        let stdin = std::io::stdin();
+        let mut line = String::new();
+        stdin.lock().read_line(&mut line)?;
+        return Ok(line.trim().to_string());
+    }
 }
 
 // ---------------------------------------------------------------------------

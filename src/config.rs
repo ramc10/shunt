@@ -4,7 +4,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::credential::{deserialize_credential_map, Credential};
-use crate::oauth::OAuthCredential;
 use crate::provider::Provider;
 
 pub const APP_NAME: &str = "shunt";
