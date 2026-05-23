@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="logo.svg" alt="shunt" width="120"><br>
+<img src="https://raw.githubusercontent.com/ramc10/shunt/main/logo.svg" alt="shunt" width="120"><br>
 
 # shunt
 
@@ -18,7 +18,7 @@
 Shunt sits between your coding agents and your AI providers. It pools multiple accounts behind a single local endpoint, always routing to whoever has the most capacity left — so you never hit a rate limit mid-session.
 
 <div align="center">
-<img src="diagram.svg" width="600">
+<img src="https://raw.githubusercontent.com/ramc10/shunt/main/diagram.svg" width="600">
 </div>
 
 **Works with:** Claude Code · Cursor · Codex CLI · Windsurf · any OpenAI or Anthropic SDK
