@@ -2836,7 +2836,11 @@ fn service_unit_path() -> PathBuf {
 }
 
 /// Write the platform service file and enable it to run at login.
-fn register_service() -> Result<()> {
+/// Write the platform service file and attempt to activate it.
+/// Returns `true` if the service was successfully loaded/started by the init
+/// system, `false` if the plist/unit was written but activation was skipped
+/// or timed out (e.g. SSH session without a GUI bootstrap context).
+fn register_service() -> Result<bool> {
     let exe = std::env::current_exe().context("cannot locate current executable")?;
     let exe_str = exe.display().to_string();
 
@@ -2875,19 +2879,30 @@ fn register_service() -> Result<()> {
         );
         std::fs::write(&plist_path, &plist)?;
 
-        // Unload first in case it was already loaded (avoids duplicate errors)
+        // Unload first (silent — ignore errors if not loaded)
         let _ = std::process::Command::new("launchctl")
             .args(["unload", &plist_path.display().to_string()])
             .output();
 
-        let out = std::process::Command::new("launchctl")
-            .args(["load", "-w", &plist_path.display().to_string()])
-            .output()
-            .context("failed to run launchctl")?;
-        if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            bail!("launchctl load failed: {}", stderr.trim());
-        }
+        // launchctl hangs in SSH sessions without a GUI bootstrap context.
+        // Run it in a thread with a 4-second timeout; if it times out or fails,
+        // the plist is still written and will auto-load on next GUI login.
+        let plist_str = plist_path.display().to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let ok = std::process::Command::new("launchctl")
+                .args(["load", "-w", &plist_str])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            let _ = tx.send(ok);
+        });
+
+        let loaded = rx
+            .recv_timeout(std::time::Duration::from_secs(4))
+            .unwrap_or(false);
+
+        return Ok(loaded);
     }
 
     #[cfg(target_os = "linux")]
@@ -2911,16 +2926,15 @@ fn register_service() -> Result<()> {
             .args(["--user", "enable", "--now", "shunt"])
             .output()
             .context("failed to run systemctl")?;
-        if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            bail!("systemctl enable failed: {}", stderr.trim());
-        }
+
+        return Ok(out.status.success());
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     bail!("Service management is only supported on macOS and Linux.");
 
-    Ok(())
+    #[allow(unreachable_code)]
+    Ok(false)
 }
 
 async fn cmd_service_install() -> Result<()> {
@@ -2942,13 +2956,25 @@ async fn cmd_service_install() -> Result<()> {
         .unwrap_or(8082);
 
     // 3. Register the platform service
-    register_service()?;
+    let service_loaded = register_service()?;
 
-    // 4. Write shell export silently
+    // 4. If launchd/systemd couldn't activate the service (e.g. SSH session
+    //    without a GUI bootstrap context), start the proxy directly.
+    if !service_loaded {
+        let exe = std::env::current_exe().context("cannot locate current executable")?;
+        let _ = std::process::Command::new(&exe)
+            .args(["start", "--daemon"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+
+    // 5. Write shell export silently
     auto_write_shell_export(port);
 
-    // 5. Wait a moment then check health
-    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    // 6. Wait for proxy to be healthy
+    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
     let config = crate::config::load_config(None).ok();
     let host = config.as_ref().map(|c| c.server.host.clone()).unwrap_or_else(|| "127.0.0.1".into());
     let running = wait_for_health(&host, port, 6).await;
@@ -2958,16 +2984,25 @@ async fn cmd_service_install() -> Result<()> {
         println!("  {}  {}  {}", green(DOT), green_bold("proxy running"),
             cyan(&format!("http://{host}:{port}")));
     } else {
-        println!("  {}  {} — service registered, proxy starting in background",
+        println!("  {}  {} — proxy starting in background",
             yellow(DOT), yellow("starting"));
     }
 
     #[cfg(target_os = "macos")]
-    println!("  {}  service registered (LaunchAgent — starts at login)",
-        green(CHECK));
+    if service_loaded {
+        println!("  {}  LaunchAgent registered — starts automatically at login", green(CHECK));
+    } else {
+        println!("  {}  LaunchAgent written — will activate on next login", yellow("·"));
+        println!("  {}  To activate now (in a GUI session): {}",
+            dim("·"), cyan("launchctl load -w ~/Library/LaunchAgents/sh.shunt.proxy.plist"));
+    }
     #[cfg(target_os = "linux")]
-    println!("  {}  service registered (systemd user unit — starts at login)",
-        green(CHECK));
+    if service_loaded {
+        println!("  {}  systemd user unit registered — starts automatically at login", green(CHECK));
+    } else {
+        println!("  {}  systemd unit written — run {} to activate",
+            yellow("·"), cyan("systemctl --user enable --now shunt"));
+    }
 
     println!();
     println!("  {} To unregister: {}", dim("·"), cyan("shunt service uninstall"));
