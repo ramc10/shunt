@@ -63,6 +63,8 @@ struct AccountStatus {
     name: String,
     #[serde(default)]
     email: Option<String>,
+    #[serde(default)]
+    provider: String,
     available: bool,
     #[serde(default)]
     disabled: bool,
@@ -524,10 +526,16 @@ fn draw_accounts(f: &mut Frame, area: Rect, s: &StatusResponse) {
             ("✓", style_green())
         };
 
+        let beta_tag = if acc.provider == "openai" {
+            Span::styled("  [beta]", Style::default().fg(YELLOW))
+        } else {
+            Span::raw("")
+        };
         lines.push(Line::from(vec![
             Span::styled(format!(" {status_sym} "), status_style),
             Span::styled(&acc.name, Style::default().fg(GREEN).add_modifier(Modifier::BOLD)),
             routing_tag,
+            beta_tag,
         ]));
 
         if let Some(email) = &acc.email {

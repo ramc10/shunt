@@ -114,6 +114,8 @@ struct RawServer {
     host: String,
     #[serde(default = "default_port")]
     port: u16,
+    #[serde(default = "default_control_port")]
+    control_port: u16,
     #[serde(default = "default_log_level")]
     log_level: String,
     upstream_url: Option<String>,
@@ -133,6 +135,7 @@ impl Default for RawServer {
         Self {
             host: default_host(),
             port: default_port(),
+            control_port: default_control_port(),
             log_level: default_log_level(),
             upstream_url: None,
             remote_key: None,
@@ -157,6 +160,7 @@ struct RawAccount {
 
 fn default_host() -> String { "127.0.0.1".into() }
 fn default_port() -> u16 { 8082 }
+fn default_control_port() -> u16 { 19081 }
 fn default_log_level() -> String { "info".into() }
 fn default_plan_type() -> String { "pro".into() }
 
@@ -168,6 +172,8 @@ fn default_plan_type() -> String { "pro".into() }
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
+    /// Port for the control plane (/status, /use, /health) — sees all accounts.
+    pub control_port: u16,
     pub log_level: String,
     pub upstream_url: String,
     /// When set, remote requests must supply this value as `x-api-key`.
@@ -189,6 +195,7 @@ impl Default for ServerConfig {
         Self {
             host: "127.0.0.1".into(),
             port: 8082,
+            control_port: 19081,
             log_level: "info".into(),
             upstream_url: "https://api.anthropic.com".into(),
             remote_key: None,
@@ -269,6 +276,7 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
     let server = ServerConfig {
         host: raw.server.host,
         port: raw.server.port,
+        control_port: raw.server.control_port,
         log_level: raw.server.log_level,
         upstream_url,
         remote_key: raw.server.remote_key,
@@ -328,7 +336,7 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
 
 pub fn config_template(accounts: &[(&str, &str)]) -> String {
     let mut out = String::from(
-        "[server]\nhost = \"127.0.0.1\"\nport = 8082\nlog_level = \"info\"\n",
+        "[server]\nhost = \"127.0.0.1\"\nport = 8082\ncontrol_port = 19081\nlog_level = \"info\"\n",
     );
     for (name, plan_type) in accounts {
         out.push_str(&format!(

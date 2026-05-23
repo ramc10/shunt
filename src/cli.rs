@@ -323,8 +323,9 @@ async fn cmd_add_account(
                 value: "anthropic".into(),
             },
             term::SelectItem {
-                label: format!("{}  {}",
+                label: format!("{}  {}  {}",
                     bold("Codex"),
+                    yellow("[beta]"),
                     dim("(chatgpt.com — OpenAI)")),
                 value: "openai".into(),
             },
@@ -805,6 +806,8 @@ async fn cmd_start(
         crate::logging::prune_old_logs(&lp, 7);
         let _log_guard = crate::logging::setup(&lp, log_level)?;
         let col = 13usize;
+        println!("  {}  {} {}", dim(&pad("listening", col)), dim("[control]"),
+            green_bold(&format!("http://{host}:{}", config.server.control_port)));
         for (p, addr) in listener_addrs(&config.accounts, &host, port) {
             println!("  {}  {} {}", dim(&pad("listening", col)), dim(&format!("[{p}]")), green_bold(&addr));
         }
@@ -830,17 +833,18 @@ async fn cmd_start(
        .spawn()
        .context("failed to start proxy in background")?;
 
-    // Wait until the proxy is accepting connections (up to 8 s)
-    let ready = wait_for_health(&host, port, 8).await;
+    // Wait until the control plane is accepting connections (up to 8 s)
+    let control_port = config.server.control_port;
+    let ready = wait_for_health(&host, control_port, 8).await;
 
     // Auto-write ANTHROPIC_BASE_URL to shell profile (silent if already there)
     auto_write_shell_export(port);
 
     let account_names: Vec<&str> = config.accounts.iter().map(|a| a.name.as_str()).collect();
     let status_line = if ready {
-        format!("{}  {}  {}", green(DOT), green_bold("running"), cyan(&format!("http://{host}:{port}")))
+        format!("{}  {}  {}", green(DOT), green_bold("running"), cyan(&format!("http://{host}:{control_port}")))
     } else {
-        format!("{}  {}  {}", yellow(DOT), yellow("starting"), dim(&format!("http://{host}:{port}")))
+        format!("{}  {}  {}", yellow(DOT), yellow("starting"), dim(&format!("http://{host}:{control_port}")))
     };
     print_routing_header(&account_names, &[
         format!("{}  {}", brand_green("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
@@ -1083,25 +1087,11 @@ fn auto_write_shell_export(port: u16) {
 
 async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
     let mut config = crate::config::load_config(config_override.as_deref())?;
-    let _primary_url = format!("http://{}:{}", config.server.host, config.server.port);
 
-    // Fetch live status from every provider's proxy (each runs on its own port).
-    // provider_label → serde_json::Value
-    let provider_urls = listener_addrs(&config.accounts, &config.server.host, config.server.port);
-    let mut live_by_provider: std::collections::HashMap<String, serde_json::Value> =
-        std::collections::HashMap::new();
-    for (label, url) in &provider_urls {
-        if let Some(v) = reqwest::get(format!("{url}/status")).await.ok()
-            .and_then(|r| futures_executor_hack(r))
-        {
-            live_by_provider.insert(label.clone(), v);
-        }
-    }
-
-    // Primary proxy (Anthropic) drives the overall running/stopped display.
-    let live: Option<&serde_json::Value> = live_by_provider
-        .get(&crate::provider::Provider::Anthropic.to_string())
-        .or_else(|| live_by_provider.values().next());
+    // Fetch live status from the control plane (sees all accounts).
+    let live: Option<serde_json::Value> = reqwest::get(
+        format!("http://{}:{}/status", config.server.host, config.server.control_port)
+    ).await.ok().and_then(|r| futures_executor_hack(r));
 
     // Back-fill missing emails (existing accounts set up before email support).
     // Fetch in parallel, persist any that are new.
@@ -1123,16 +1113,9 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
         store.save().ok();
     }
 
-    // Build running address list: ":8082" or ":8082 · :8083"
-    let addr_str = if !live_by_provider.is_empty() {
-        let parts: Vec<String> = provider_urls.iter()
-            .filter(|(label, _)| live_by_provider.contains_key(label.as_str()))
-            .map(|(_, url)| {
-                let port = url.rsplit(':').next().unwrap_or("?");
-                cyan(&format!(":{port}"))
-            })
-            .collect();
-        parts.join(&dim("  ·  "))
+    // Build running address: show the control port when alive.
+    let addr_str = if live.is_some() {
+        cyan(&format!(":{}", config.server.control_port))
     } else {
         String::new()
     };
@@ -1150,7 +1133,7 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
 
     let account_names: Vec<&str> = config.accounts.iter().map(|a| a.name.as_str()).collect();
     // Build savings summary if proxy is running and has data.
-    let savings_line: Option<String> = live.and_then(|v| {
+    let savings_line: Option<String> = live.as_ref().and_then(|v| {
         let s = v.get("savings")?;
         let today_in  = s["today_input"].as_u64().unwrap_or(0);
         let today_out = s["today_output"].as_u64().unwrap_or(0);
@@ -1174,8 +1157,8 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
         println!();
     }
 
-    let pinned_account = live.and_then(|v| v["pinned"].as_str()).map(|s| s.to_owned());
-    let last_used_account = live.and_then(|v| v["last_used"].as_str()).map(|s| s.to_owned());
+    let pinned_account = live.as_ref().and_then(|v| v["pinned"].as_str()).map(|s| s.to_owned());
+    let last_used_account = live.as_ref().and_then(|v| v["last_used"].as_str()).map(|s| s.to_owned());
 
     // Pinned notice
     if let Some(ref pinned) = pinned_account {
@@ -1189,7 +1172,7 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
     let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs()).unwrap_or(0);
 
     for acc in &config.accounts {
-        let live_acc = live_by_provider.get(&acc.provider.to_string())
+        let live_acc = live.as_ref()
             .and_then(|v| v["accounts"].as_array())
             .and_then(|arr| arr.iter().find(|a| a["name"] == acc.name));
 
@@ -1209,10 +1192,10 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
 
         let plan_label = if acc.provider == crate::provider::Provider::OpenAI {
             match acc.plan_type.to_lowercase().as_str() {
-                "plus"  => "ChatGPT Plus",
-                "pro"   => "ChatGPT Pro",
-                "team"  => "ChatGPT Team",
-                _       => "ChatGPT",
+                "plus"  => "ChatGPT Plus [beta]",
+                "pro"   => "ChatGPT Pro [beta]",
+                "team"  => "ChatGPT Team [beta]",
+                _       => "ChatGPT [beta]",
             }
         } else {
             match acc.plan_type.to_lowercase().as_str() {
@@ -1239,11 +1222,11 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
 
         // ── email + provider badge row ───────────────────────
         let is_openai = acc.provider == crate::provider::Provider::OpenAI;
-        let provider_badge = if is_openai { format!("  {}  {}", dim("·"), dim("openai")) } else { String::new() };
+        let provider_badge = if is_openai { format!("  {}  {}", dim("·"), dim("openai [beta]")) } else { String::new() };
         if !email_str.is_empty() {
             println!("{}", card_row(&format!("{}{}", dim(email_str), provider_badge)));
         } else if is_openai {
-            println!("{}", card_row(&dim("openai")));
+            println!("{}", card_row(&dim("openai [beta]")));
         }
 
         println!();
@@ -1322,11 +1305,11 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
 
 async fn cmd_use(config_override: Option<PathBuf>, account: Option<String>) -> Result<()> {
     let config = crate::config::load_config(config_override.as_deref())?;
-    let use_url = format!("http://{}:{}/use", config.server.host, config.server.port);
+    let use_url = format!("http://{}:{}/use", config.server.host, config.server.control_port);
 
     // Fetch live state for utilization info
     let live: Option<serde_json::Value> = reqwest::get(
-        &format!("http://{}:{}/status", config.server.host, config.server.port)
+        &format!("http://{}:{}/status", config.server.host, config.server.control_port)
     ).await.ok().and_then(|r| futures_executor_hack(r));
 
     let current_pinned = live.as_ref()
@@ -1812,6 +1795,10 @@ async fn serve_all_providers(
     use crate::provider::Provider;
     use std::collections::HashMap;
 
+    // Save all accounts for the control plane before the provider loop consumes them.
+    let all_accounts = config.accounts.clone();
+    let control_port = config.server.control_port;
+
     // Group accounts by provider.
     let mut by_provider: HashMap<String, Vec<crate::config::AccountConfig>> = HashMap::new();
     for account in config.accounts {
@@ -1827,8 +1814,17 @@ async fn serve_all_providers(
             ref other => other.default_port(),
         };
 
+        // The Anthropic proxy gets ALL accounts so non-Anthropic accounts (e.g. codex/chatgpt.com)
+        // act as fallback when Anthropic accounts are exhausted. Each non-Anthropic account already
+        // has upstream_url pre-populated (e.g. "https://chatgpt.com") by the config loader.
+        let proxy_accounts = if provider == Provider::Anthropic {
+            all_accounts.clone()
+        } else {
+            accounts
+        };
+
         let provider_config = Config {
-            accounts,
+            accounts: proxy_accounts,
             server: ServerConfig {
                 host: host.to_owned(),
                 port,
@@ -1843,7 +1839,7 @@ async fn serve_all_providers(
         } else {
             None
         };
-        let (app, live_creds) = crate::proxy::create_app_with_state(provider_config.clone(), state.clone(), anthropic_url)?;
+        let (app, live_creds) = crate::proxy::create_proxy_app(provider_config.clone(), state.clone(), anthropic_url)?;
         let listener = tokio::net::TcpListener::bind(format!("{host}:{port}"))
             .await
             .with_context(|| format!("cannot bind {host}:{port} for {provider_str} proxy"))?;
@@ -1857,6 +1853,25 @@ async fn serve_all_providers(
             axum::serve(listener, app).await
         }));
     }
+
+    // Spawn the control plane — management endpoints with visibility into ALL accounts.
+    let control_config = Config {
+        accounts: all_accounts,
+        server: ServerConfig {
+            host: host.to_owned(),
+            port: control_port,
+            upstream_url: "https://api.anthropic.com".to_owned(),
+            ..config.server.clone()
+        },
+        config_file: config.config_file.clone(),
+    };
+    let control_app = crate::proxy::create_control_app(control_config, state.clone())?;
+    let control_listener = tokio::net::TcpListener::bind(format!("{host}:{control_port}"))
+        .await
+        .with_context(|| format!("cannot bind {host}:{control_port} for control plane"))?;
+    handles.push(tokio::spawn(async move {
+        axum::serve(control_listener, control_app).await
+    }));
 
     if handles.is_empty() {
         return Ok(());
@@ -1934,7 +1949,7 @@ fn strip_ansi(s: &str) -> String {
 
 async fn cmd_monitor(config_override: Option<PathBuf>) -> Result<()> {
     let config = crate::config::load_config(config_override.as_deref())?;
-    let base_url = format!("http://{}:{}", config.server.host, config.server.port);
+    let base_url = format!("http://{}:{}", config.server.host, config.server.control_port);
 
     // Quick check: is the proxy running?
     if reqwest::get(format!("{base_url}/health")).await.is_err() {

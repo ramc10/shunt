@@ -49,15 +49,15 @@ pub fn create_app(config: Config) -> anyhow::Result<Router> {
 /// Shared live credentials map — can be written to without restarting the proxy.
 pub type LiveCredentials = Arc<RwLock<HashMap<String, OAuthCredential>>>;
 
-pub fn create_app_with_state(
+/// Create a pure proxy app (no management routes).
+/// Registers /v1/messages, /v1/chat/completions, /v1/models, and a fallback.
+pub fn create_proxy_app(
     config: Config,
     state: StateStore,
     anthropic_base_url: Option<String>,
 ) -> anyhow::Result<(Router, LiveCredentials)> {
     let forwarder = Forwarder::new(&config.server.upstream_url, config.server.request_timeout_secs)?;
 
-    // Accounts with no credential are shown in status but skipped during routing.
-    // Mark them disabled immediately so the router ignores them.
     for a in config.accounts.iter().filter(|a| a.credential.is_none()) {
         state.set_auth_failed(&a.name);
     }
@@ -78,24 +78,61 @@ pub fn create_app_with_state(
         anthropic_base_url,
     };
 
-    // Always register both Anthropic and OpenAI routes so a single shunt
-    // instance can serve clients of either protocol and route to accounts of
-    // either provider, translating on the fly when needed.
-    let proxy_routes = Router::new()
+    let app = Router::new()
         .route("/v1/messages", post(proxy_handler))
         .route("/v1/messages/count_tokens", post(proxy_handler))
         .route("/v1/chat/completions", post(openai_compat_handler))
         .route("/v1/models", get(openai_models_handler))
-        .fallback(proxy_handler);
+        .fallback(proxy_handler)
+        .with_state(app_state);
+
+    Ok((app, credentials))
+}
+
+/// Create a control plane app (management routes only — sees ALL accounts).
+/// Registers /health, /status, /use.
+pub fn create_control_app(
+    config: Config,
+    state: StateStore,
+) -> anyhow::Result<Router> {
+    let forwarder = Forwarder::new(&config.server.upstream_url, config.server.request_timeout_secs)?;
+
+    for a in config.accounts.iter().filter(|a| a.credential.is_none()) {
+        state.set_auth_failed(&a.name);
+    }
+
+    let credentials: LiveCredentials = Arc::new(RwLock::new(
+        config.accounts.iter()
+            .filter_map(|a| a.credential.as_ref().map(|c| (a.name.clone(), c.clone())))
+            .collect::<HashMap<_, _>>(),
+    ));
+
+    let app_state = AppState {
+        config: Arc::new(config),
+        forwarder: Arc::new(forwarder),
+        state,
+        credentials,
+        refresh_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        started_ms: now_ms(),
+        anthropic_base_url: None,
+    };
 
     let app = Router::new()
         .route("/health", get(health))
         .route("/status", get(status_handler))
         .route("/use", post(use_handler))
-        .merge(proxy_routes)
         .with_state(app_state);
 
-    Ok((app, credentials))
+    Ok(app)
+}
+
+/// Compat shim for tests — calls `create_proxy_app`.
+pub fn create_app_with_state(
+    config: Config,
+    state: StateStore,
+    anthropic_base_url: Option<String>,
+) -> anyhow::Result<(Router, LiveCredentials)> {
+    create_proxy_app(config, state, anthropic_base_url)
 }
 
 async fn health() -> impl IntoResponse {
@@ -155,6 +192,7 @@ async fn status_handler(State(s): State<AppState>) -> impl IntoResponse {
             "name": a.name,
             "email": email,
             "plan_type": a.plan_type,
+            "provider": a.provider.to_string(),
             "status": avail_status,
             "available": available,
             "disabled": disabled,
@@ -187,21 +225,21 @@ async fn status_handler(State(s): State<AppState>) -> impl IntoResponse {
 async fn use_handler(
     State(s): State<AppState>,
     axum::Json(body): axum::Json<serde_json::Value>,
-) -> impl IntoResponse {
+) -> Response {
     let account = body["account"].as_str().map(|s| s.to_owned());
     // Validate the account name exists (unless clearing to auto)
     if let Some(ref name) = account {
         if name != "auto" && !s.config.accounts.iter().any(|a| &a.name == name) {
-            return axum::Json(json!({
+            return (StatusCode::BAD_REQUEST, axum::Json(json!({
                 "error": format!("unknown account '{name}'")
-            }));
+            }))).into_response();
         }
         let pinned = if name == "auto" { None } else { Some(name.clone()) };
         s.state.set_pinned(pinned);
-        axum::Json(json!({ "pinned": name }))
+        axum::Json(json!({ "pinned": name })).into_response()
     } else {
         s.state.set_pinned(None);
-        axum::Json(json!({ "pinned": null }))
+        axum::Json(json!({ "pinned": null })).into_response()
     }
 }
 
@@ -303,18 +341,18 @@ async fn proxy_handler(
         let req_is_anthropic = path.starts_with("/v1/messages");
         let acct_is_anthropic = matches!(account.provider, Provider::Anthropic);
 
-        let (fwd_path, fwd_body, fwd_headers) = if req_is_anthropic == acct_is_anthropic {
+        let (fwd_path, fwd_body, mut fwd_headers) = if req_is_anthropic == acct_is_anthropic {
             (path.clone(), body_bytes.clone(), headers.clone())
         } else if req_is_anthropic {
-            // Anthropic client → OpenAI account: translate A→O, strip Anthropic headers.
+            // Anthropic client → chatgpt.com account: translate to backend-api format.
             let val = serde_json::from_slice::<serde_json::Value>(&body_bytes).unwrap_or(json!({}));
-            let translated = translate_anthropic_req_to_openai(val);
+            let translated = translate_anthropic_req_to_chatgpt(&val);
             let mut h = headers.clone();
             for name in &["anthropic-version", "anthropic-beta", "anthropic-dangerous-direct-browser-access"] {
                 h.remove(*name);
             }
             (
-                "/v1/chat/completions".to_owned(),
+                "/backend-api/conversation".to_owned(),
                 bytes::Bytes::from(serde_json::to_vec(&translated).unwrap_or_default()),
                 h,
             )
@@ -333,13 +371,62 @@ async fn proxy_handler(
         // providers, or explicitly in tests) → config server URL.
         let upstream = account.upstream_url.as_deref()
             .unwrap_or(&s.config.server.upstream_url);
-        let response = s.forwarder
-            .forward(upstream, &method, &fwd_path, fwd_body, &fwd_headers, account, &token)
-            .await
-            .map_err(|e| {
-                error!("Forward error: {:#}", e);
-                ProxyError::Upstream
-            })?;
+
+        // Inject chatgpt.com sentinel token for cross-protocol (Anthropic → chatgpt.com) requests.
+        // Wrap in tokio::time::timeout (3s) to guarantee we don't block on Cloudflare challenges.
+        if req_is_anthropic && !acct_is_anthropic {
+            tracing::info!(account = %account_name, upstream = %upstream, "routing to chatgpt.com — fetching sentinel");
+            let sentinel_client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(3))
+                .build()
+                .unwrap_or_default();
+            let sentinel_opt = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                fetch_sentinel_token(&sentinel_client, upstream, &token),
+            ).await.ok().flatten();
+            if let Some(sentinel) = sentinel_opt {
+                if let Ok(name) = axum::http::header::HeaderName::from_bytes(
+                    b"openai-sentinel-chat-requirements-token",
+                ) {
+                    if let Ok(val) = axum::http::HeaderValue::from_str(&sentinel) {
+                        fwd_headers.insert(name, val);
+                    }
+                }
+            }
+        }
+
+        // For non-Anthropic accounts (chatgpt.com), apply a hard 15s cap on the forward call.
+        // Cloudflare may hold the TCP connection open indefinitely for certain TLS fingerprints;
+        // without a cap the request would hang for the full 600s forwarder timeout.
+        let response = if !acct_is_anthropic {
+            tracing::info!(account = %account_name, path = %fwd_path, "forwarding to chatgpt.com (15s cap)");
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                s.forwarder.forward(upstream, &method, &fwd_path, fwd_body, &fwd_headers, account, &token),
+            ).await {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => {
+                    error!(account = %account_name, "chatgpt.com forward error: {:#}", e);
+                    s.state.set_cooldown(&account_name, 5 * 60_000);
+                    tried.insert(account_name);
+                    continue;
+                }
+                Err(_) => {
+                    warn!(account = %account_name, "chatgpt.com request timed out (Cloudflare) — cooling 5min");
+                    s.state.set_cooldown(&account_name, 5 * 60_000);
+                    tried.insert(account_name);
+                    continue;
+                }
+            }
+        } else {
+            s.forwarder
+                .forward(upstream, &method, &fwd_path, fwd_body, &fwd_headers, account, &token)
+                .await
+                .map_err(|e| {
+                    error!("Forward error: {:#}", e);
+                    ProxyError::Upstream
+                })?
+        };
 
         match response.status().as_u16() {
             200..=299 => {
@@ -351,8 +438,8 @@ async fn proxy_handler(
                 let response = if req_is_anthropic == acct_is_anthropic {
                     response
                 } else if req_is_anthropic {
-                    // Got OpenAI response; client expects Anthropic.
-                    translate_response_openai_to_anthropic(response, &model).await
+                    // Got chatgpt.com response; client expects Anthropic.
+                    translate_response_chatgpt_to_anthropic(response, &model).await
                 } else {
                     // Got Anthropic response; client expects OpenAI.
                     translate_response_anthropic_to_openai(response).await
@@ -476,14 +563,21 @@ async fn proxy_handler(
                 }
             }
             403 => {
-                // Forbidden — subscription lapsed or org restriction; refreshing won't help.
-                error!(account = %account_name, "403 forbidden — cooling 30min");
-                s.state.set_cooldown(&account_name, 30 * 60_000);
-                notify(
-                    "shunt: Account Forbidden",
-                    &format!("Account '{account_name}' got 403 — subscription may have lapsed (cooling 30m)."),
-                    "Basso",
-                );
+                // Forbidden — could be a Cloudflare challenge (non-Anthropic providers)
+                // or a genuine subscription/org block (Anthropic). Use a short cooldown
+                // for non-Anthropic accounts so a CF block doesn't lock them out for 30m.
+                if acct_is_anthropic {
+                    error!(account = %account_name, "403 forbidden — cooling 30min");
+                    s.state.set_cooldown(&account_name, 30 * 60_000);
+                    notify(
+                        "shunt: Account Forbidden",
+                        &format!("Account '{account_name}' got 403 — subscription may have lapsed (cooling 30m)."),
+                        "Basso",
+                    );
+                } else {
+                    warn!(account = %account_name, "403 from chatgpt.com (Cloudflare) — cooling 5min");
+                    s.state.set_cooldown(&account_name, 5 * 60_000);
+                }
                 tried.insert(account_name);
             }
             _ => {
@@ -1547,6 +1641,247 @@ fn map_model_to_openai(claude_model: &str) -> &str {
         m if m.contains("opus")  => "gpt-4o",
         m if m.contains("haiku") => "gpt-4o-mini",
         _                        => "gpt-4o", // sonnet and everything else
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ChatGPT backend API translation (chatgpt.com /backend-api/conversation)
+// ---------------------------------------------------------------------------
+
+/// Fetch the sentinel token required by chatgpt.com's backend API.
+/// Returns None if the request fails or proof-of-work is required.
+async fn fetch_sentinel_token(client: &reqwest::Client, upstream: &str, token: &str) -> Option<String> {
+    let url = format!("{}/backend-api/sentinel/chat-requirements", upstream);
+    let resp = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let json: serde_json::Value = resp.json().await.ok()?;
+    if json["proofofwork"]["required"].as_bool() == Some(true) {
+        return None;
+    }
+    json["token"].as_str().map(ToOwned::to_owned)
+}
+
+/// Map Claude model names → chatgpt.com model names.
+fn map_model_to_chatgpt(model: &str) -> &str {
+    if model.contains("opus") {
+        "gpt-4o"
+    } else if model.contains("haiku") {
+        "gpt-4o-mini"
+    } else {
+        "gpt-4o"
+    }
+}
+
+/// Extract flat text from an Anthropic content value (string or content block array).
+/// Tool-use blocks are rendered as `[Tool: name(args)]`; tool_result blocks are flattened.
+fn extract_text_from_anthropic_content(content: &serde_json::Value) -> String {
+    if let Some(s) = content.as_str() {
+        return s.to_owned();
+    }
+    if let Some(arr) = content.as_array() {
+        let mut text = String::new();
+        for block in arr {
+            match block["type"].as_str() {
+                Some("text") => text.push_str(block["text"].as_str().unwrap_or("")),
+                Some("tool_use") => {
+                    let name = block["name"].as_str().unwrap_or("tool");
+                    let args = serde_json::to_string(&block["input"]).unwrap_or_default();
+                    text.push_str(&format!("[Tool: {}({})]", name, args));
+                }
+                Some("tool_result") => {
+                    let result = block["content"].as_str()
+                        .map(|s| s.to_owned())
+                        .unwrap_or_else(|| serde_json::to_string(&block["content"]).unwrap_or_default());
+                    text.push_str(&result);
+                }
+                _ => {}
+            }
+        }
+        return text;
+    }
+    String::new()
+}
+
+/// Translate an Anthropic `/v1/messages` request body to chatgpt.com `/backend-api/conversation` format.
+/// Tools are stripped — chatgpt.com's backend API does not support tool use.
+fn translate_anthropic_req_to_chatgpt(body: &serde_json::Value) -> serde_json::Value {
+    let claude_model = body["model"].as_str().unwrap_or("claude-sonnet-4-6");
+    let model = map_model_to_chatgpt(claude_model);
+    let system_prompt = body["system"].as_str().unwrap_or("").to_owned();
+
+    let mut messages: Vec<serde_json::Value> = Vec::new();
+    if let Some(arr) = body["messages"].as_array() {
+        for msg in arr {
+            let role = msg["role"].as_str().unwrap_or("user");
+            let text = extract_text_from_anthropic_content(&msg["content"]);
+            messages.push(json!({
+                "id": uuid_v4(),
+                "author": {"role": role},
+                "content": {"content_type": "text", "parts": [text]},
+                "metadata": {}
+            }));
+        }
+    }
+
+    json!({
+        "action": "next",
+        "messages": messages,
+        "model": model,
+        "parent_message_id": uuid_v4(),
+        "system_prompt": system_prompt,
+        "history_and_training_disabled": true,
+        "supports_modapi": false,
+    })
+}
+
+/// Translate a chatgpt.com non-streaming response to Anthropic format.
+fn translate_chatgpt_resp_to_anthropic(body: serde_json::Value, model: &str) -> serde_json::Value {
+    let id = format!("msg_{}", &uuid_v4()[..8]);
+    let text = body["message"]["content"]["parts"][0]
+        .as_str()
+        .unwrap_or("")
+        .to_owned();
+    json!({
+        "id": id,
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": [{"type": "text", "text": text}],
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "usage": {"input_tokens": 0, "output_tokens": 0}
+    })
+}
+
+/// Translate the response back from chatgpt.com format to Anthropic format.
+/// Handles both streaming and non-streaming responses.
+async fn translate_response_chatgpt_to_anthropic(resp: Response, model: &str) -> Response {
+    use axum::body::Body;
+    let msg_id = format!("msg_{}", &uuid_v4()[..8]);
+    let model = model.to_owned();
+
+    if quota::is_streaming_response(&resp) {
+        let (mut parts, body) = resp.into_parts();
+        parts.headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("text/event-stream"),
+        );
+        let stream = translate_chatgpt_stream_to_anthropic(body, model, msg_id);
+        Response::from_parts(parts, Body::from_stream(stream))
+    } else {
+        let (mut parts, body) = resp.into_parts();
+        let bytes = axum::body::to_bytes(body, 64 * 1024 * 1024).await.unwrap_or_default();
+        let chatgpt_val: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or(json!({}));
+        let anthropic_val = translate_chatgpt_resp_to_anthropic(chatgpt_val, &model);
+        let out = serde_json::to_vec(&anthropic_val).unwrap_or_default();
+        parts.headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+        Response::from_parts(parts, Body::from(out))
+    }
+}
+
+/// Stream-translate a chatgpt.com SSE response body into Anthropic SSE events.
+///
+/// chatgpt.com sends the **full accumulated text** in each chunk (not a delta),
+/// so we track `prev_len` and compute deltas ourselves.
+fn translate_chatgpt_stream_to_anthropic(
+    body: axum::body::Body,
+    model: String,
+    msg_id: String,
+) -> impl futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> {
+    use futures_util::StreamExt;
+
+    async_stream::stream! {
+        let start_evt = format!(
+            "event: message_start\ndata: {}\n\nevent: ping\ndata: {{\"type\":\"ping\"}}\n\n",
+            serde_json::to_string(&json!({
+                "type": "message_start",
+                "message": {
+                    "id": msg_id, "type": "message", "role": "assistant",
+                    "content": [], "model": model, "stop_reason": null,
+                    "usage": {"input_tokens": 0, "output_tokens": 0}
+                }
+            })).unwrap()
+        );
+        yield Ok(bytes::Bytes::from(start_evt));
+
+        let mut buf = String::new();
+        let mut content_block_open = false;
+        let mut prev_len: usize = 0;
+        let byte_stream = body.into_data_stream();
+        futures_util::pin_mut!(byte_stream);
+
+        'outer: while let Some(chunk) = byte_stream.next().await {
+            let chunk = match chunk { Ok(c) => c, Err(_) => break };
+            buf.push_str(&String::from_utf8_lossy(&chunk));
+
+            while let Some(nl) = buf.find('\n') {
+                let line = buf[..nl].trim_end_matches('\r').to_owned();
+                buf = buf[nl + 1..].to_owned();
+                if !line.starts_with("data: ") { continue; }
+                let data = &line["data: ".len()..];
+                if data == "[DONE]" { break 'outer; }
+                let Ok(val) = serde_json::from_str::<serde_json::Value>(data) else { continue };
+
+                let text = match val["message"]["content"]["parts"][0].as_str() {
+                    Some(t) => t.to_owned(),
+                    None => continue,
+                };
+
+                let delta = text[prev_len..].to_owned();
+                if !delta.is_empty() {
+                    if !content_block_open {
+                        content_block_open = true;
+                        yield Ok(bytes::Bytes::from(format!(
+                            "event: content_block_start\ndata: {}\n\n",
+                            serde_json::to_string(&json!({
+                                "type": "content_block_start", "index": 0,
+                                "content_block": {"type": "text", "text": ""}
+                            })).unwrap()
+                        )));
+                    }
+                    yield Ok(bytes::Bytes::from(format!(
+                        "event: content_block_delta\ndata: {}\n\n",
+                        serde_json::to_string(&json!({
+                            "type": "content_block_delta", "index": 0,
+                            "delta": {"type": "text_delta", "text": delta}
+                        })).unwrap()
+                    )));
+                    prev_len = text.len();
+                }
+
+                if val["message"]["end_turn"].as_bool() == Some(true) {
+                    break 'outer;
+                }
+            }
+        }
+
+        if content_block_open {
+            yield Ok(bytes::Bytes::from(format!(
+                "event: content_block_stop\ndata: {}\n\n",
+                serde_json::to_string(&json!({"type": "content_block_stop", "index": 0})).unwrap()
+            )));
+        }
+        yield Ok(bytes::Bytes::from(format!(
+            "event: message_delta\ndata: {}\n\n",
+            serde_json::to_string(&json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn", "stop_sequence": null},
+                "usage": {"output_tokens": 0}
+            })).unwrap()
+        )));
+        yield Ok(bytes::Bytes::from(
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+        ));
     }
 }
 
