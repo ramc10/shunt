@@ -166,6 +166,19 @@ pub async fn run_monitor(base_url: &str) -> Result<()> {
     let status_url = format!("{}/status", base_url.trim_end_matches('/'));
     let use_url    = format!("{}/use",    base_url.trim_end_matches('/'));
 
+    // Install a panic hook that restores the terminal before printing the panic message,
+    // so the terminal isn't left in raw/alternate-screen mode on crash.
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = terminal::disable_raw_mode();
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            terminal::LeaveAlternateScreen,
+            crossterm::cursor::Show
+        );
+        original_hook(info);
+    }));
+
     // Setup terminal
     terminal::enable_raw_mode()?;
     let mut out = stdout();

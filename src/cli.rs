@@ -2364,8 +2364,14 @@ async fn cmd_monitor(config_override: Option<PathBuf>) -> Result<()> {
     let config = crate::config::load_config(config_override.as_deref())?;
     let base_url = format!("http://{}:{}", config.server.host, config.server.control_port);
 
-    // Quick check: is the proxy running?
-    if reqwest::get(format!("{base_url}/health")).await.is_err() {
+    // Quick check: is the proxy running? Hard 3-second timeout so we don't hang.
+    let running = reqwest::Client::new()
+        .get(format!("{base_url}/health"))
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+        .await
+        .is_ok();
+    if !running {
         println!();
         println!("  {} Proxy is not running.", red(CROSS));
         println!("  {} Start it first with {}.", dim("·"), cyan("shunt start"));
