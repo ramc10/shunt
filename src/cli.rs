@@ -1234,33 +1234,39 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
     });
 
     // Build per-provider account counts for the splash right panel.
-    let mut provider_lines: Vec<String> = {
+    let provider_lines: Vec<String> = {
         let mut counts: Vec<(String, usize)> = vec![];
         for acc in &config.accounts {
             let label = match &acc.provider {
-                crate::provider::Provider::Anthropic   => "Claude Code".to_string(),
-                crate::provider::Provider::OpenAI      => "Codex".to_string(),
-                crate::provider::Provider::OpenAIApi   => "OpenAI".to_string(),
-                crate::provider::Provider::OllamaCloud => "Ollama".to_string(),
-                crate::provider::Provider::Groq        => "Groq".to_string(),
-                crate::provider::Provider::Mistral     => "Mistral".to_string(),
-                crate::provider::Provider::Together    => "Together".to_string(),
-                crate::provider::Provider::OpenRouter  => "OpenRouter".to_string(),
-                crate::provider::Provider::DeepSeek    => "DeepSeek".to_string(),
-                crate::provider::Provider::Fireworks   => "Fireworks".to_string(),
-                crate::provider::Provider::Gemini      => "Gemini".to_string(),
-                crate::provider::Provider::Local       => "Local".to_string(),
+                crate::provider::Provider::Anthropic   => "Claude Code",
+                crate::provider::Provider::OpenAI      => "Codex",
+                crate::provider::Provider::OpenAIApi   => "OpenAI",
+                crate::provider::Provider::OllamaCloud => "Ollama",
+                crate::provider::Provider::Groq        => "Groq",
+                crate::provider::Provider::Mistral     => "Mistral",
+                crate::provider::Provider::Together    => "Together",
+                crate::provider::Provider::OpenRouter  => "OpenRouter",
+                crate::provider::Provider::DeepSeek    => "DeepSeek",
+                crate::provider::Provider::Fireworks   => "Fireworks",
+                crate::provider::Provider::Gemini      => "Gemini",
+                crate::provider::Provider::Local       => "Local",
             };
-            if let Some(entry) = counts.iter_mut().find(|(l, _)| l == &label) {
+            if let Some(entry) = counts.iter_mut().find(|(l, _)| l == label) {
                 entry.1 += 1;
             } else {
-                counts.push((label, 1));
+                counts.push((label.to_string(), 1));
             }
         }
-        counts.iter().map(|(label, n)| format!("{n}  {label}")).collect()
+        let mut lines = vec![
+            "accounts connected".to_string(),
+            String::new(),
+        ];
+        lines.extend(counts.iter().map(|(label, n)| {
+            let noun = if *n == 1 { "account" } else { "accounts" };
+            format!("{n} {label} {noun}")
+        }));
+        lines
     };
-    // Pad to 4 lines to fill the splash panel height.
-    while provider_lines.len() < 4 { provider_lines.push(String::new()); }
 
     let title = format!("shunt  v{}", env!("CARGO_PKG_VERSION"));
     print_status_splash(&title, provider_lines);
@@ -1707,14 +1713,18 @@ fn render_splash_frame(
         .collect();
     f.render_widget(Paragraph::new(sep_lines), sep_area);
 
-    // Right: custom lines (or static description if none provided), vertically centered.
+    // Right: custom lines (center-aligned) or static description (right-aligned).
     let static_desc: Vec<String> = vec![
         "Pool multiple Claude accounts".into(),
         "    behind a single endpoint.".into(),
         "  Maximise rate limits across".into(),
         "  all accounts automatically.".into(),
     ];
-    let desc_lines: &[String] = if right_lines.is_empty() { &static_desc } else { right_lines };
+    let (desc_lines, alignment) = if right_lines.is_empty() {
+        (static_desc.as_slice(), ratatui::layout::Alignment::Right)
+    } else {
+        (right_lines, ratatui::layout::Alignment::Center)
+    };
     let desc: Vec<Line> = desc_lines.iter()
         .map(|s| Line::styled(s.clone(), Style::default().fg(dim_col)))
         .collect();
@@ -1724,13 +1734,9 @@ fn render_splash_frame(
         Constraint::Length(desc_h),
         Constraint::Fill(1),
     ]).split(right_area);
-    let right_h = Layout::new(Direction::Horizontal, [
-        Constraint::Fill(1),
-        Constraint::Length(2),
-    ]).split(right_v[1]);
     f.render_widget(
-        Paragraph::new(desc).alignment(ratatui::layout::Alignment::Right),
-        right_h[0],
+        Paragraph::new(desc).alignment(alignment),
+        right_v[1],
     );
 }
 
