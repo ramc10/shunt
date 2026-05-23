@@ -2004,7 +2004,14 @@ async fn cmd_update() -> Result<()> {
     print_splash(&[
         format!("{}  {}", brand_green("shunt"), dim(&format!("v{current}"))),
     ]);
-    println!("  {} Checking for updates…", dim("·"));
+
+    // Each status line is prefixed with \r so it starts at column 0 regardless
+    // of where the cursor was left after the ratatui inline viewport.
+    macro_rules! status {
+        ($($arg:tt)*) => { println!("\r{}", format_args!($($arg)*)) };
+    }
+
+    status!("  {} Checking for updates…", dim("·"));
 
     // Fetch latest release from GitHub API
     let client = reqwest::Client::builder()
@@ -2025,13 +2032,15 @@ async fn cmd_update() -> Result<()> {
     let latest_tag = json["tag_name"].as_str().context("Missing tag_name in release")?;
     let latest = latest_tag.trim_start_matches('v');
 
-    if latest == current {
-        println!("  {} Already up to date ({})", green(CHECK), bold(&format!("v{current}")));
+    // Compare versions numerically to correctly handle both upgrades and the
+    // case where the installed build is newer than the latest GitHub release.
+    if parse_version(latest) <= parse_version(current) {
+        status!("  {} Already up to date ({})", green(CHECK), bold(&format!("v{current}")));
         println!();
         return Ok(());
     }
 
-    println!("  {} Update available: {}  →  {}", green("↑"),
+    status!("  {} Update available: {}  →  {}", green("↑"),
         dim(&format!("v{current}")), bold_white(&format!("v{latest}")));
     println!();
 
@@ -2042,7 +2051,7 @@ async fn cmd_update() -> Result<()> {
         "https://github.com/{REPO}/releases/download/v{latest}/{archive_name}"
     );
 
-    print!("  {} Downloading {}… ", dim("↓"), dim(&archive_name));
+    print!("\r  {} Downloading {}… ", dim("↓"), dim(&archive_name));
     use std::io::Write as _;
     std::io::stdout().flush().ok();
 
@@ -2090,9 +2099,19 @@ async fn cmd_update() -> Result<()> {
         std::process::Command::new("codesign").args(["--force", "--deep", "--sign", "-", &p]).status().ok();
     }
 
-    println!("  {} Updated to {}", green(CHECK), bold_white(&format!("v{latest}")));
+    status!("  {} Updated to {}", green(CHECK), bold_white(&format!("v{latest}")));
     println!();
     Ok(())
+}
+
+/// Parse a "major.minor.patch" version string into a comparable tuple.
+/// Missing components default to 0.
+fn parse_version(s: &str) -> (u32, u32, u32) {
+    let mut it = s.split('.');
+    let maj = it.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    let min = it.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    let pat = it.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    (maj, min, pat)
 }
 
 fn detect_update_target() -> Result<&'static str> {
