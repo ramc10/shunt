@@ -1233,15 +1233,13 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
             dim("·"), dim(&today_tok), dim(&cost_str), dim("·"), dim(&all_str)))
     });
 
-    print_routing_header(&account_names, &[
-        format!("{}  {}", brand_green("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
-        proxy_line,
-    ]);
-
-    if let Some(ref line) = savings_line {
-        println!("  {line}");
-        println!();
-    }
+    let title = format!("shunt  v{}", env!("CARGO_PKG_VERSION"));
+    let mut right: Vec<String> = vec![proxy_line];
+    if let Some(ref s) = savings_line { right.push(s.clone()); }
+    // Pad to 4 lines so the right side always fills the splash box height.
+    while right.len() < 4 { right.push(String::new()); }
+    print_status_splash(&title, right);
+    println!();
 
     let pinned_account = live.as_ref().and_then(|v| v["pinned"].as_str()).map(|s| s.to_owned());
     let last_used_account = live.as_ref().and_then(|v| v["last_used"].as_str()).map(|s| s.to_owned());
@@ -1607,6 +1605,7 @@ fn render_splash_frame(
     f: &mut ratatui::Frame,
     title_raw: &str,
     subtitle_raw: &str,
+    right_lines: &[String],
 ) {
     use ratatui::{
         layout::{Constraint, Direction, Layout},
@@ -1683,13 +1682,17 @@ fn render_splash_frame(
         .collect();
     f.render_widget(Paragraph::new(sep_lines), sep_area);
 
-    // Right: brief description, vertically centered, with left padding.
-    let desc: Vec<Line> = vec![
-        Line::styled("Pool multiple Claude accounts", Style::default().fg(dim_col)),
-        Line::styled("behind a single endpoint.", Style::default().fg(dim_col)),
-        Line::styled("Maximise rate limits across", Style::default().fg(dim_col)),
-        Line::styled("all accounts automatically.", Style::default().fg(dim_col)),
+    // Right: custom lines (or static description if none provided), vertically centered.
+    let static_desc: Vec<String> = vec![
+        "Pool multiple Claude accounts".into(),
+        "    behind a single endpoint.".into(),
+        "  Maximise rate limits across".into(),
+        "  all accounts automatically.".into(),
     ];
+    let desc_lines: &[String] = if right_lines.is_empty() { &static_desc } else { right_lines };
+    let desc: Vec<Line> = desc_lines.iter()
+        .map(|s| Line::styled(s.clone(), Style::default().fg(dim_col)))
+        .collect();
     let desc_h = desc.len() as u16;
     let right_v = Layout::new(Direction::Vertical, [
         Constraint::Fill(1),
@@ -1732,7 +1735,7 @@ fn print_splash(info: &[String]) {
     };
 
     let draw = |t: &mut Terminal<CrosstermBackend<std::io::Stdout>>| {
-        t.draw(|f| render_splash_frame(f, &title_raw, &subtitle_raw)).ok();
+        t.draw(|f| render_splash_frame(f, &title_raw, &subtitle_raw, &[])).ok();
     };
 
     draw(&mut terminal);
@@ -1754,6 +1757,50 @@ fn print_splash(info: &[String]) {
     let _ = terminal.show_cursor();
     // Ratatui leaves the cursor at the end of the inline viewport's last line.
     // \r resets to column 0 before \n moves down, so subsequent output is left-aligned.
+    print!("\r\n");
+}
+
+/// Like print_splash but with custom right-side lines (used by cmd_status).
+fn print_status_splash(title: &str, right_lines: Vec<String>) {
+    use ratatui::{backend::CrosstermBackend, Terminal, TerminalOptions, Viewport};
+    use crossterm::{event::{self, Event}, terminal as cterm};
+    use std::io::stdout;
+
+    let splash_h: u16 = 4 + 2 + 2; // content + border + padding (no subtitle)
+    let right = right_lines.clone();
+
+    let mut terminal = match Terminal::with_options(
+        CrosstermBackend::new(stdout()),
+        TerminalOptions { viewport: Viewport::Inline(splash_h) },
+    ) {
+        Ok(t) => t,
+        Err(_) => {
+            println!("\n  ◆  {title}\n");
+            for l in &right_lines { println!("     {l}"); }
+            return;
+        }
+    };
+
+    let draw = |t: &mut Terminal<CrosstermBackend<std::io::Stdout>>, r: &[String]| {
+        t.draw(|f| render_splash_frame(f, title, "", r)).ok();
+    };
+
+    draw(&mut terminal, &right);
+
+    let _ = cterm::enable_raw_mode();
+    let dl = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    loop {
+        let rem = dl.saturating_duration_since(std::time::Instant::now());
+        if rem.is_zero() { break; }
+        if event::poll(rem).unwrap_or(false) {
+            match event::read() {
+                Ok(Event::Resize(_, _)) => draw(&mut terminal, &right),
+                _ => break,
+            }
+        } else { break; }
+    }
+    let _ = cterm::disable_raw_mode();
+    let _ = terminal.show_cursor();
     print!("\r\n");
 }
 
