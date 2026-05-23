@@ -22,17 +22,17 @@ Shunt is a local proxy that sits between your AI coding agents and every major A
 <div align="center">
 
 ```
-  ✓ Claude Code ─┐          ██████           ┌─ Anthropic
-    Cursor      ─┤──────▶  ███    ███  ─────▶ ├─ OpenAI API
-    Codex CLI   ─┤          ██████            ├─ Gemini
-    Windsurf    ─┤           █  █             ├─ Groq
-    any SDK     ─┘                            ├─ Mistral
-                                              ├─ DeepSeek
-                                              ├─ OpenRouter
-                                              ├─ Together
-                                              ├─ Fireworks
-                                              ├─ Ollama
-                                              └─ local LLMs
+  ✓ Claude Code ─┐       ██████       ┌─ Anthropic
+    Cursor      ─┤──▶  ███    ███  ──▶├─ OpenAI API
+    Codex CLI   ─┤       ██████       ├─ Gemini
+    Windsurf    ─┤        █  █        ├─ Groq
+    any SDK     ─┘                    ├─ Mistral
+                                      ├─ DeepSeek
+                                      ├─ OpenRouter
+                                      ├─ Together
+                                      ├─ Fireworks
+                                      ├─ Ollama
+                                      └─ local LLMs
 ```
 
 </div>
