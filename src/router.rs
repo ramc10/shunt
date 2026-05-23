@@ -202,6 +202,7 @@ mod tests {
             provider: crate::provider::Provider::Anthropic,
             credential: None,
             upstream_url: None,
+            model: None,
         }
     }
 

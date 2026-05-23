@@ -126,6 +126,34 @@ impl Provider {
         }
     }
 
+    /// Default model name to use when the incoming request specifies a `claude-*`
+    /// model that doesn't exist on this provider.
+    ///
+    /// Returns `""` for `Local` — the model name is passed through unchanged so
+    /// the local server decides what to serve.
+    pub fn default_model(&self) -> &'static str {
+        match self {
+            Provider::Anthropic   => "claude-sonnet-4-6",
+            Provider::OpenAI      => "gpt-4o",
+            Provider::OpenAIApi   => "gpt-4o",
+            Provider::OllamaCloud => "llama3.3",
+            Provider::Groq        => "llama-3.3-70b-versatile",
+            Provider::Mistral     => "mistral-large-latest",
+            Provider::Together    => "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+            Provider::OpenRouter  => "meta-llama/llama-3.3-70b-instruct",
+            Provider::DeepSeek    => "deepseek-chat",
+            Provider::Fireworks   => "accounts/fireworks/models/llama-v3p3-70b-instruct",
+            Provider::Gemini      => "gemini-2.0-flash",
+            Provider::Local       => "", // pass through unchanged
+        }
+    }
+
+    /// True when this provider understands `claude-*` model names natively.
+    /// When false, incoming `claude-*` model names are remapped before forwarding.
+    pub fn accepts_claude_models(&self) -> bool {
+        matches!(self, Provider::Anthropic)
+    }
+
     /// Well-known environment variable that holds an API key for this provider.
     /// `None` for OAuth and Local providers.
     pub fn api_key_env_var(&self) -> Option<&'static str> {

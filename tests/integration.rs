@@ -168,7 +168,7 @@ fn test_account() -> AccountConfig {
         plan_type: "pro".into(),
         provider: Provider::default(),
         credential: Some(test_credential()),
-        upstream_url: None,
+        upstream_url: None, model: None,
     }
 }
 
@@ -186,6 +186,7 @@ async fn setup(streaming: bool, upstream_status: u16) -> (TestServer, TestServer
         },
         accounts: vec![test_account()],
         config_file: std::path::PathBuf::from("/dev/null"),
+        model_mapping: Default::default(),
     };
     let (app, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
     let proxy = TestServer::start(app).await;
@@ -382,7 +383,7 @@ fn test_account2() -> AccountConfig {
             expires_at: u64::MAX / 2,
             id_token: None,
         })),
-        upstream_url: None,
+        upstream_url: None, model: None,
     }
 }
 
@@ -427,6 +428,7 @@ async fn setup_multi() -> (TestServer, TestServer, Captures, Client) {
         },
         accounts: vec![test_account(), test_account2()],
         config_file: std::path::PathBuf::from("/dev/null"),
+        model_mapping: Default::default(),
     };
     let (app, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
     let proxy = TestServer::start(app).await;
@@ -477,6 +479,7 @@ async fn test_stickiness_same_conversation() {
         },
         accounts: vec![test_account(), test_account2()],
         config_file: std::path::PathBuf::from("/dev/null"),
+        model_mapping: Default::default(),
     };
     let (app, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
     let proxy = TestServer::start(app).await;
@@ -522,6 +525,7 @@ async fn test_all_accounts_exhausted_returns_503() {
         },
         accounts: vec![test_account(), test_account2()],
         config_file: std::path::PathBuf::from("/dev/null"),
+        model_mapping: Default::default(),
     };
     let (app, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
     let proxy = TestServer::start(app).await;
@@ -624,6 +628,7 @@ async fn test_remote_key_auth() {
         },
         accounts: vec![test_account()],
         config_file: std::path::PathBuf::from("/dev/null"),
+        model_mapping: Default::default(),
     };
     let (app, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
     let proxy = TestServer::start(app).await;
@@ -780,7 +785,7 @@ fn openai_account(upstream_url: String) -> AccountConfig {
             expires_at: u64::MAX / 2,
             id_token: None,
         })),
-        upstream_url: Some(upstream_url),
+        upstream_url: Some(upstream_url), model: None,
     }
 }
 
@@ -801,6 +806,7 @@ async fn test_interop_anthropic_request_to_openai_account() {
         },
         accounts: vec![openai_account(openai_up.url())],
         config_file: std::path::PathBuf::from("/dev/null"),
+        model_mapping: Default::default(),
     };
     let (app, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
     let proxy = TestServer::start(app).await;
@@ -858,6 +864,7 @@ async fn test_interop_anthropic_streaming_to_openai_account() {
         },
         accounts: vec![openai_account(openai_up.url())],
         config_file: std::path::PathBuf::from("/dev/null"),
+        model_mapping: Default::default(),
     };
     let (app, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
     let proxy = TestServer::start(app).await;
@@ -908,9 +915,10 @@ async fn test_interop_openai_request_to_anthropic_account() {
             plan_type: "pro".into(),
             provider: Provider::default(), // Anthropic
             credential: Some(test_credential()),
-            upstream_url: None,
+            upstream_url: None, model: None,
         }],
         config_file: std::path::PathBuf::from("/dev/null"),
+        model_mapping: Default::default(),
     };
     let (app, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
     let proxy = TestServer::start(app).await;
@@ -971,11 +979,12 @@ async fn test_interop_failover_anthropic_to_openai() {
                 plan_type: "pro".into(),
                 provider: Provider::default(), // Anthropic
                 credential: Some(test_credential()),
-                upstream_url: None,
+                upstream_url: None, model: None,
             },
             openai_account(openai_up.url()),
         ],
         config_file: std::path::PathBuf::from("/dev/null"),
+        model_mapping: Default::default(),
     };
     let (app, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
     let proxy = TestServer::start(app).await;
@@ -1037,8 +1046,9 @@ async fn test_live_api() {
             log_level: "error".into(),
             ..ServerConfig::default()
         },
-        accounts: vec![AccountConfig { name: "live".into(), plan_type: "pro".into(), provider: Provider::default(), credential: Some(credential), upstream_url: None }],
+        accounts: vec![AccountConfig { name: "live".into(), plan_type: "pro".into(), provider: Provider::default(), credential: Some(credential), upstream_url: None, model: None }],
         config_file: std::path::PathBuf::from("/dev/null"),
+        model_mapping: Default::default(),
     };
 
     let (app, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();

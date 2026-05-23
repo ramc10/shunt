@@ -373,7 +373,9 @@ async fn proxy_handler(
         } else if req_is_anthropic {
             // Anthropic client → standard OpenAI-compat account (OpenAIApi, Groq, Mistral, …).
             let val = serde_json::from_slice::<serde_json::Value>(&body_bytes).unwrap_or(json!({}));
-            let translated = translate_anthropic_req_to_openai(val);
+            // Resolve the target model: account pin → global mapping → provider default.
+            let target_model = resolve_model(&model, account, &s.config.model_mapping);
+            let translated = translate_anthropic_req_to_openai(val, &target_model);
             let mut h = headers.clone();
             for name in &["anthropic-version", "anthropic-beta", "anthropic-dangerous-direct-browser-access"] {
                 h.remove(*name);
@@ -1683,14 +1685,6 @@ fn translate_anthropic_stream(
 // Cross-protocol translation: Anthropic ↔ OpenAI
 // ---------------------------------------------------------------------------
 
-/// Map Claude model names → OpenAI model names (mirror of `map_model`).
-fn map_model_to_openai(claude_model: &str) -> &str {
-    match claude_model {
-        m if m.contains("opus")  => "gpt-4o",
-        m if m.contains("haiku") => "gpt-4o-mini",
-        _                        => "gpt-4o", // sonnet and everything else
-    }
-}
 
 // ---------------------------------------------------------------------------
 // ChatGPT backend API translation (chatgpt.com /backend-api/conversation)
@@ -1933,11 +1927,37 @@ fn translate_chatgpt_stream_to_anthropic(
     }
 }
 
+/// Resolve the target model name for a non-Anthropic account.
+///
+/// Priority: per-account `model` pin → global `model_mapping` → provider `default_model()`.
+/// If the provider is `Local` (default_model = ""), the incoming model name is passed through.
+fn resolve_model(
+    incoming: &str,
+    account: &crate::config::AccountConfig,
+    mapping: &std::collections::HashMap<String, String>,
+) -> String {
+    // 1. Per-account pin (highest priority).
+    if let Some(m) = &account.model {
+        return m.clone();
+    }
+    // 2. Global mapping for this specific incoming model name.
+    if let Some(m) = mapping.get(incoming) {
+        return m.clone();
+    }
+    // 3. Provider default.
+    let default = account.provider.default_model();
+    if !default.is_empty() {
+        return default.to_owned();
+    }
+    // 4. Pass through (Local provider — model name is server-defined).
+    incoming.to_owned()
+}
+
 /// Translate an Anthropic `/v1/messages` request body to OpenAI `/v1/chat/completions` format.
-/// Used when routing an Anthropic-protocol request to an OpenAI/Codex account.
-fn translate_anthropic_req_to_openai(body: serde_json::Value) -> serde_json::Value {
-    let claude_model = body["model"].as_str().unwrap_or("claude-sonnet-4-6");
-    let model = map_model_to_openai(claude_model);
+/// Used when routing an Anthropic-protocol request to an OpenAI-compat account.
+/// `target_model` is the already-resolved provider model name (e.g. "llama-3.3-70b-versatile").
+fn translate_anthropic_req_to_openai(body: serde_json::Value, target_model: &str) -> serde_json::Value {
+    let model = target_model;
     let stream = body["stream"].as_bool().unwrap_or(false);
     let max_tokens = body["max_tokens"].as_u64().unwrap_or(8096);
 

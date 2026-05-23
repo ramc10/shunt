@@ -108,6 +108,10 @@ struct RawConfig {
     server: RawServer,
     #[serde(default)]
     accounts: Vec<RawAccount>,
+    /// Global model-name mapping: `"claude-sonnet-4-6" = "llama-3.3-70b-versatile"`
+    /// Applied when routing Anthropic-format requests to non-Anthropic providers.
+    #[serde(default)]
+    model_mapping: HashMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -167,6 +171,10 @@ struct RawAccount {
     /// Per-account upstream URL override (required for Local provider).
     #[serde(default)]
     upstream_url: Option<String>,
+    /// Pin this account to a specific model, overriding global model_mapping
+    /// and the provider's default_model(). Useful for mixing model tiers.
+    #[serde(default)]
+    model: Option<String>,
 }
 
 fn default_host() -> String { "127.0.0.1".into() }
@@ -233,6 +241,9 @@ pub struct AccountConfig {
     /// `None` means use `config.server.upstream_url` (primary provider) or
     /// `provider.default_upstream_url()` (non-primary provider).
     pub upstream_url: Option<String>,
+    /// Pin this account to a specific model name.
+    /// Overrides both `model_mapping` and `provider.default_model()`.
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -240,6 +251,9 @@ pub struct Config {
     pub server: ServerConfig,
     pub accounts: Vec<AccountConfig>,
     pub config_file: PathBuf,
+    /// Global model-name overrides: claude model → provider model.
+    /// e.g. `"claude-sonnet-4-6" → "llama-3.3-70b-versatile"`
+    pub model_mapping: HashMap<String, String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -356,10 +370,11 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
             provider,
             credential: cred,
             upstream_url: acct_upstream,
+            model: a.model.clone(),
         });
     }
 
-    Ok(Config { server, accounts, config_file: p })
+    Ok(Config { server, accounts, config_file: p, model_mapping: raw.model_mapping })
 }
 
 // ---------------------------------------------------------------------------
