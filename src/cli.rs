@@ -1307,12 +1307,20 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
         println!("{}", card_header(&acc.name, &green_bold(&acc.name), &routing_tag, tag_vis_len, plan_label));
 
         // ── email + provider badge row ───────────────────────
-        let is_openai = acc.provider == crate::provider::Provider::OpenAI;
-        let provider_badge = if is_openai { format!("  {}  {}", dim("·"), dim("openai [beta]")) } else { String::new() };
+        let provider_label = match &acc.provider {
+            crate::provider::Provider::Anthropic => String::new(),
+            crate::provider::Provider::OpenAI    => "chatgpt".to_string(),
+            p                                    => p.to_string(),
+        };
+        let provider_badge = if provider_label.is_empty() {
+            String::new()
+        } else {
+            format!("  {}  {}", dim("·"), dim(&format!("[{provider_label}]")))
+        };
         if !email_str.is_empty() {
             println!("{}", card_row(&format!("{}{}", dim(email_str), provider_badge)));
-        } else if is_openai {
-            println!("{}", card_row(&dim("openai [beta]")));
+        } else if !provider_badge.is_empty() {
+            println!("{}", card_row(&dim(&format!("[{provider_label}]"))));
         }
 
         println!();

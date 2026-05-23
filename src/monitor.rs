@@ -526,16 +526,16 @@ fn draw_accounts(f: &mut Frame, area: Rect, s: &StatusResponse) {
             ("✓", style_green())
         };
 
-        let beta_tag = if acc.provider == "openai" {
-            Span::styled("  [beta]", Style::default().fg(YELLOW))
-        } else {
-            Span::raw("")
+        let provider_tag: Span<'static> = match acc.provider.as_str() {
+            "anthropic" | "" => Span::raw(""),
+            "openai"    => Span::styled("  [chatgpt]".to_string(), Style::default().fg(YELLOW)),
+            other       => Span::styled(format!("  [{other}]"), Style::default().fg(CYAN)),
         };
         lines.push(Line::from(vec![
             Span::styled(format!(" {status_sym} "), status_style),
-            Span::styled(&acc.name, Style::default().fg(GREEN).add_modifier(Modifier::BOLD)),
+            Span::styled(acc.name.clone(), Style::default().fg(GREEN).add_modifier(Modifier::BOLD)),
             routing_tag,
-            beta_tag,
+            provider_tag,
         ]));
 
         if let Some(email) = &acc.email {
