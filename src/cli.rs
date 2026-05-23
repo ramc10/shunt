@@ -1645,8 +1645,8 @@ fn render_splash_frame(
         widgets::{Block, Borders, Paragraph},
     };
 
-    let brand   = Color::Rgb(188, 255, 96);  // #bcff60
-    let dim_col = Color::Rgb(100, 160, 40);  // #bcff60 dimmed
+    let brand   = Color::Indexed(154);  // lime-green, consistent across all terminals
+    let dim_col = Color::Indexed(64);   // darker green for dimmed elements
 
     // Fixed-width box — does not stretch to fill the terminal.
     const BOX_W: u16 = 70;
