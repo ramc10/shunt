@@ -1859,9 +1859,9 @@ fn render_splash_frame(
         widgets::{Block, Borders, Paragraph},
     };
 
-    let brand    = Color::Rgb(34, 197, 94);   // matches monitor BRAND / GREEN
-    let dim_col  = Color::Rgb(120, 120, 120); // matches monitor DIM
-    let dk_green = Color::Rgb(22, 101, 52);   // matches monitor DK_GREEN (borders/sep)
+    let brand    = Color::Indexed(154); // #afd700 bright lime-green
+    let dim_col  = Color::Indexed(240); // #585858 gray
+    let dk_green = Color::Indexed(28);  // #008700 dark green
 
     // Fixed-width box — does not stretch to fill the terminal.
     const BOX_W: u16 = 70;

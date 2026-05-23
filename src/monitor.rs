@@ -98,14 +98,14 @@ struct ReqLog {
 // Colours
 // ---------------------------------------------------------------------------
 
-const GREEN:    Color = Color::Rgb(34, 197, 94);
-const DK_GREEN: Color = Color::Rgb(22, 101, 52);
-const BRAND:    Color = Color::Rgb(34, 197, 94);
-const DIM:      Color = Color::Rgb(120, 120, 120);
-const YELLOW:   Color = Color::Rgb(251, 191, 36);
-const RED:      Color = Color::Rgb(239, 68, 68);
-const WHITE:    Color = Color::Rgb(229, 229, 229);
-const CYAN:     Color = Color::Rgb(103, 190, 255);
+const GREEN:    Color = Color::Indexed(154); // #afd700 bright lime-green
+const DK_GREEN: Color = Color::Indexed(28);  // #008700 dark green
+const BRAND:    Color = Color::Indexed(154); // #afd700 bright lime-green
+const DIM:      Color = Color::Indexed(240); // #585858 gray
+const YELLOW:   Color = Color::Indexed(220); // #ffd700 yellow
+const RED:      Color = Color::Indexed(196); // #ff0000 red
+const WHITE:    Color = Color::Indexed(253); // #dadada light gray
+const CYAN:     Color = Color::Indexed(154); // #afd700 use green to stay on-theme
 
 fn style_brand()   -> Style { Style::default().fg(BRAND).add_modifier(Modifier::BOLD) }
 fn style_green()   -> Style { Style::default().fg(GREEN) }
