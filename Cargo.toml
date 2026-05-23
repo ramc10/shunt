@@ -10,7 +10,7 @@ homepage = "https://github.com/ramc10/shunt"
 readme = "README.md"
 keywords = ["claude", "anthropic", "proxy", "rate-limit", "llm"]
 categories = ["command-line-utilities", "network-programming"]
-exclude = [".github/", "tests/"]
+exclude = [".github/", "tests/", "relay/", "*.tar.gz"]
 
 [[bin]]
 name = "shunt"
