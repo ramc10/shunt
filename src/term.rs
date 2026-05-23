@@ -27,42 +27,42 @@ pub fn bold(s: &str) -> String {
 }
 
 pub fn dim(s: &str) -> String {
-    if is_tty() { format!("\x1b[38;2;120;120;120m{s}\x1b[0m") } else { s.to_owned() }
+    if is_tty() { format!("\x1b[2m{s}\x1b[0m") } else { s.to_owned() }
 }
 
 pub fn green(s: &str) -> String {
-    if is_tty() { format!("\x1b[38;2;34;197;94m{s}\x1b[0m") } else { s.to_owned() }
+    if is_tty() { format!("\x1b[32m{s}\x1b[0m") } else { s.to_owned() }
 }
 
 pub fn yellow(s: &str) -> String {
-    if is_tty() { format!("\x1b[38;2;251;191;36m{s}\x1b[0m") } else { s.to_owned() }
+    if is_tty() { format!("\x1b[33m{s}\x1b[0m") } else { s.to_owned() }
 }
 
 pub fn red(s: &str) -> String {
-    if is_tty() { format!("\x1b[38;2;239;68;68m{s}\x1b[0m") } else { s.to_owned() }
+    if is_tty() { format!("\x1b[31m{s}\x1b[0m") } else { s.to_owned() }
 }
 
 pub fn cyan(s: &str) -> String {
-    if is_tty() { format!("\x1b[38;2;103;190;255m{s}\x1b[0m") } else { s.to_owned() }
+    if is_tty() { format!("\x1b[36m{s}\x1b[0m") } else { s.to_owned() }
 }
 
 pub fn bold_white(s: &str) -> String {
-    if is_tty() { format!("\x1b[1;38;2;229;229;229m{s}\x1b[0m") } else { s.to_owned() }
+    if is_tty() { format!("\x1b[1;97m{s}\x1b[0m") } else { s.to_owned() }
 }
 
-/// Dark forest green — used for borders and decorative chrome.
+/// 256-colour dark forest green — used for borders and decorative chrome.
 pub fn dark_green(s: &str) -> String {
-    if is_tty() { format!("\x1b[38;2;22;101;52m{s}\x1b[0m") } else { s.to_owned() }
+    if is_tty() { format!("\x1b[38;5;28m{s}\x1b[0m") } else { s.to_owned() }
 }
 
 /// Bold bright green — used for account names in the routing diagram.
 pub fn green_bold(s: &str) -> String {
-    if is_tty() { format!("\x1b[1;38;2;34;197;94m{s}\x1b[0m") } else { s.to_owned() }
+    if is_tty() { format!("\x1b[1;32m{s}\x1b[0m") } else { s.to_owned() }
 }
 
 /// Bold brand green — the primary brand colour for the "shunt" wordmark.
 pub fn brand_green(s: &str) -> String {
-    if is_tty() { format!("\x1b[1;38;2;34;197;94m{s}\x1b[0m") } else { s.to_owned() }
+    if is_tty() { format!("\x1b[1;38;5;154m{s}\x1b[0m") } else { s.to_owned() }
 }
 
 // ---------------------------------------------------------------------------
