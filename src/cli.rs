@@ -1654,7 +1654,9 @@ fn print_splash(info: &[String]) {
     }
     let _ = cterm::disable_raw_mode();
     let _ = terminal.show_cursor();
-    println!(); // move cursor to next line after the inline viewport
+    // Ratatui leaves the cursor at the end of the inline viewport's last line.
+    // \r resets to column 0 before \n moves down, so subsequent output is left-aligned.
+    print!("\r\n");
 }
 
 // ---------------------------------------------------------------------------
