@@ -152,20 +152,23 @@ shunt status    # snapshot view
 ```
 
 ```
-── ACCOUNTS ──────────────────────────────────────────────────
+  ◆  work                                        Claude Pro
+    you@work.com
 
-  ✓  work        Anthropic  you@example.com      available   1.2M tok
-          5h window  ████████░░░░░░░░░░  61% remaining  resets in 2h 14m
-          7d window  ███░░░░░░░░░░░░░░░  79% remaining  resets in 4d 6h
+    ✓  available
+    5h  ████████████░░░░░░░░  61% left  ·  resets in 2h 14m
+    7d  ███░░░░░░░░░░░░░░░░░  13% left  ·  resets in 1d 14h
 
-  ✓  personal    Anthropic  alt@example.com      available   fresh
-          5h window  ░░░░░░░░░░░░░░░░░░  100% remaining
+  ◆  personal                                    Claude Pro
+    alt@example.com
 
-  ✓  groq-main   Groq       —                    available   fresh
+    ✓  available
+    5h  ────────────────────  fresh  4h 2m ago
+    7d  ────────────────────  fresh
 
-── SAVINGS ───────────────────────────────────────────────────
-
-  Today: 2.3M tok  ·  $6.12  ·  All-time: $48.30
+  ◆  groq-main                                   Groq
+    ✓  available
+    5h  ────────────────────  fresh
 ```
 
 ---
