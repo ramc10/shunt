@@ -2488,24 +2488,26 @@ async fn cmd_update() -> Result<()> {
     extract_binary_from_tarball(&bytes, &tmp_path)
         .context("Failed to extract binary from archive")?;
 
-    // Replace current executable atomically
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o755))?;
     }
-    std::fs::rename(&tmp_path, &exe_path)
-        .context("Failed to replace binary (try running with sudo?)")?;
 
-    // macOS: remove quarantine and ad-hoc sign so Gatekeeper allows unsigned binaries
+    // macOS: sign the temp file BEFORE replacing the live binary so Gatekeeper
+    // never sees an unsigned binary on disk even if the process is killed mid-update.
     #[cfg(target_os = "macos")]
     {
-        let p = exe_path.display().to_string();
-        std::process::Command::new("xattr").args(["-d", "com.apple.quarantine", &p])
+        let p = tmp_path.display().to_string();
+        std::process::Command::new("xattr").args(["-dr", "com.apple.quarantine", &p])
             .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().ok();
         std::process::Command::new("codesign").args(["--force", "--deep", "--sign", "-", &p])
             .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().ok();
     }
+
+    // Atomic replace — new binary is already signed, so this is safe.
+    std::fs::rename(&tmp_path, &exe_path)
+        .context("Failed to replace binary (try running with sudo?)")?;
 
     status!("  {} Updated to {}", green(CHECK), bold_white(&format!("v{latest}")));
     println!();
