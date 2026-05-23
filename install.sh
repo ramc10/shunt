@@ -51,7 +51,7 @@ LANG=C tar -xzf "$TMP/$ARCHIVE" -C "$TMP"
 
 # Install binary
 mkdir -p "$INSTALL_DIR"
-cp "$TMP/shunt-${VERSION}-${TARGET}/$BIN" "$INSTALL_DIR/$BIN"
+cp "$TMP/$BIN" "$INSTALL_DIR/$BIN"
 chmod +x "$INSTALL_DIR/$BIN"
 
 # macOS: remove quarantine and ad-hoc sign so Gatekeeper allows unsigned binaries
