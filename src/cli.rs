@@ -1008,13 +1008,20 @@ async fn cmd_setup_auto(config_override: Option<PathBuf>) -> Result<()> {
 
 async fn wait_for_health(host: &str, port: u16, timeout_secs: u64) -> bool {
     let url = format!("http://{host}:{port}/health");
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .unwrap_or_default();
     let deadline = tokio::time::Instant::now()
         + std::time::Duration::from_secs(timeout_secs);
     while tokio::time::Instant::now() < deadline {
-        if reqwest::get(&url).await.map(|r| r.status().is_success()).unwrap_or(false) {
+        if client.get(&url).send().await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false)
+        {
             return true;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     }
     false
 }
@@ -2847,6 +2854,7 @@ fn register_service() -> Result<bool> {
     #[cfg(target_os = "macos")]
     {
         let plist_path = service_plist_path();
+        let plist_was_present = plist_path.exists();
         if let Some(parent) = plist_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -2883,16 +2891,18 @@ fn register_service() -> Result<bool> {
         // Wrap both unload and load in threads with timeouts.
         let plist_str = plist_path.display().to_string();
 
-        // Unload first (best-effort, ignore result)
-        let p = plist_str.clone();
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = std::process::Command::new("launchctl")
-                .args(["unload", &p])
-                .output();
-            let _ = tx.send(());
-        });
-        let _ = rx.recv_timeout(std::time::Duration::from_secs(4));
+        // Unload only if a plist was already there (i.e. this is a reinstall)
+        if plist_was_present {
+            let p = plist_str.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = std::process::Command::new("launchctl")
+                    .args(["unload", &p])
+                    .output();
+                let _ = tx.send(());
+            });
+            let _ = rx.recv_timeout(std::time::Duration::from_secs(4));
+        }
 
         // Load
         let (tx, rx) = std::sync::mpsc::channel();
@@ -2963,11 +2973,21 @@ async fn cmd_service_install() -> Result<()> {
         .unwrap_or(8082);
 
     // 3. Register the platform service
+    print!("  {} Registering login service… ", dim("·"));
+    use std::io::Write as _;
+    std::io::stdout().flush().ok();
     let service_loaded = register_service()?;
+    if service_loaded {
+        println!("{}", green("done"));
+    } else {
+        println!("{}", dim("skipped (SSH session — activates on next login)"));
+    }
 
     // 4. If launchd/systemd couldn't activate the service (e.g. SSH session
     //    without a GUI bootstrap context), start the proxy directly.
     if !service_loaded {
+        print!("  {} Starting proxy… ", dim("·"));
+        std::io::stdout().flush().ok();
         let exe = std::env::current_exe().context("cannot locate current executable")?;
         let _ = std::process::Command::new(&exe)
             .args(["start", "--daemon"])
@@ -2981,10 +3001,13 @@ async fn cmd_service_install() -> Result<()> {
     auto_write_shell_export(port);
 
     // 6. Wait for proxy to be healthy
-    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     let config = crate::config::load_config(None).ok();
     let host = config.as_ref().map(|c| c.server.host.clone()).unwrap_or_else(|| "127.0.0.1".into());
-    let running = wait_for_health(&host, port, 6).await;
+    let running = wait_for_health(&host, port, 8).await;
+    if !service_loaded {
+        println!("{}", if running { green("done").to_string() } else { dim("starting…").to_string() });
+    }
 
     println!();
     if running {
