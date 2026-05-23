@@ -47,7 +47,7 @@ trap 'rm -rf "$TMP"' EXIT
 
 echo "Downloading $BIN $VERSION for $TARGET..."
 curl -fsSL "$URL" -o "$TMP/$ARCHIVE"
-tar -xzf "$TMP/$ARCHIVE" -C "$TMP"
+LANG=C tar -xzf "$TMP/$ARCHIVE" -C "$TMP"
 
 # Install binary
 mkdir -p "$INSTALL_DIR"
