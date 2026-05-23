@@ -12,8 +12,8 @@ use tokio::sync::RwLock;
 use tracing::{error, warn};
 
 use crate::config::{state_path, Config, CredentialsStore};
+use crate::credential::Credential;
 use crate::forwarder::Forwarder;
-use crate::oauth::OAuthCredential;
 use crate::provider::Provider;
 use crate::quota;
 use crate::router;
@@ -25,7 +25,7 @@ struct AppState {
     forwarder: Arc<Forwarder>,
     state: StateStore,
     /// Live credentials — can be refreshed at runtime without restarting.
-    credentials: Arc<RwLock<HashMap<String, OAuthCredential>>>,
+    credentials: Arc<RwLock<HashMap<String, Credential>>>,
     /// Per-account mutex that serialises concurrent token-refresh attempts.
     ///
     /// When multiple in-flight requests hit a 401 for the same account at the
@@ -47,15 +47,16 @@ pub fn create_app(config: Config) -> anyhow::Result<Router> {
 }
 
 /// Shared live credentials map — can be written to without restarting the proxy.
-pub type LiveCredentials = Arc<RwLock<HashMap<String, OAuthCredential>>>;
+pub type LiveCredentials = Arc<RwLock<HashMap<String, Credential>>>;
 
 /// Create a pure proxy app (no management routes).
 /// Registers /v1/messages, /v1/chat/completions, /v1/models, and a fallback.
-pub fn create_proxy_app(
+/// Build a shared `AppState` and the `LiveCredentials` handle it references.
+fn build_app_state(
     config: Config,
     state: StateStore,
     anthropic_base_url: Option<String>,
-) -> anyhow::Result<(Router, LiveCredentials)> {
+) -> anyhow::Result<(AppState, LiveCredentials)> {
     let forwarder = Forwarder::new(&config.server.upstream_url, config.server.request_timeout_secs)?;
 
     for a in config.accounts.iter().filter(|a| a.credential.is_none()) {
@@ -78,6 +79,16 @@ pub fn create_proxy_app(
         anthropic_base_url,
     };
 
+    Ok((app_state, credentials))
+}
+
+pub fn create_proxy_app(
+    config: Config,
+    state: StateStore,
+    anthropic_base_url: Option<String>,
+) -> anyhow::Result<(Router, LiveCredentials)> {
+    let (app_state, credentials) = build_app_state(config, state, anthropic_base_url)?;
+
     let app = Router::new()
         .route("/v1/messages", post(proxy_handler))
         .route("/v1/messages/count_tokens", post(proxy_handler))
@@ -95,27 +106,7 @@ pub fn create_control_app(
     config: Config,
     state: StateStore,
 ) -> anyhow::Result<Router> {
-    let forwarder = Forwarder::new(&config.server.upstream_url, config.server.request_timeout_secs)?;
-
-    for a in config.accounts.iter().filter(|a| a.credential.is_none()) {
-        state.set_auth_failed(&a.name);
-    }
-
-    let credentials: LiveCredentials = Arc::new(RwLock::new(
-        config.accounts.iter()
-            .filter_map(|a| a.credential.as_ref().map(|c| (a.name.clone(), c.clone())))
-            .collect::<HashMap<_, _>>(),
-    ));
-
-    let app_state = AppState {
-        config: Arc::new(config),
-        forwarder: Arc::new(forwarder),
-        state,
-        credentials,
-        refresh_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
-        started_ms: now_ms(),
-        anthropic_base_url: None,
-    };
+    let (app_state, _) = build_app_state(config, state, None)?;
 
     let app = Router::new()
         .route("/health", get(health))
@@ -126,13 +117,30 @@ pub fn create_control_app(
     Ok(app)
 }
 
-/// Compat shim for tests — calls `create_proxy_app`.
+/// Combined app used by tests and the single-port fallback mode.
+/// Includes both proxy routes and management routes (/health, /status, /use)
+/// sharing a single AppState so state changes are visible across all routes.
 pub fn create_app_with_state(
     config: Config,
     state: StateStore,
     anthropic_base_url: Option<String>,
 ) -> anyhow::Result<(Router, LiveCredentials)> {
-    create_proxy_app(config, state, anthropic_base_url)
+    let (app_state, credentials) = build_app_state(config, state, anthropic_base_url)?;
+
+    let app = Router::new()
+        // Management routes
+        .route("/health", get(health))
+        .route("/status", get(status_handler))
+        .route("/use", post(use_handler))
+        // Proxy routes
+        .route("/v1/messages", post(proxy_handler))
+        .route("/v1/messages/count_tokens", post(proxy_handler))
+        .route("/v1/chat/completions", post(openai_compat_handler))
+        .route("/v1/models", get(openai_models_handler))
+        .fallback(proxy_handler)
+        .with_state(app_state);
+
+    Ok((app, credentials))
 }
 
 async fn health() -> impl IntoResponse {
@@ -178,7 +186,7 @@ async fn status_handler(State(s): State<AppState>) -> impl IntoResponse {
         }));
 
         let acc_state = account_states.get(&a.name);
-        let email = a.credential.as_ref().and_then(|c| c.email.as_deref()).map(|e| e.to_owned());
+        let email = a.credential.as_ref().and_then(|c| c.email()).map(|e| e.to_owned());
         let disabled = acc_state.map(|s| s.disabled).unwrap_or(false);
         let auth_failed = acc_state.map(|s| s.auth_failed).unwrap_or(false);
         let cooldown_until_ms = acc_state.map(|s| s.cooldown_until_ms).unwrap_or(0);
@@ -322,15 +330,16 @@ async fn proxy_handler(
         let account_name = account.name.clone();
 
         // Use the live (possibly refreshed) token rather than the one baked into config.
-        // For OpenAI/chatgpt.com accounts, use the id_token (short-lived OIDC JWT) as
-        // the bearer — chatgpt.com's API authenticates via id_token, not access_token.
+        // For OpenAI/chatgpt.com accounts, Credential::bearer_token() returns id_token
+        // (short-lived OIDC JWT) which chatgpt.com requires. For all other providers it
+        // returns access_token. API-key accounts return the key directly.
         let token = {
             let creds = s.credentials.read().await;
             let cred = creds.get(&account_name)
                 .cloned()
                 .or_else(|| account.credential.clone());
             match cred {
-                Some(c) => c.access_token,
+                Some(c) => c.bearer_token().to_owned(),
                 None => String::new(),
             }
         };
@@ -339,11 +348,16 @@ async fn proxy_handler(
         // the request body + path before forwarding and translate the response
         // back so the client always sees its native wire format.
         let req_is_anthropic = path.starts_with("/v1/messages");
-        let acct_is_anthropic = matches!(account.provider, Provider::Anthropic);
+        let acct_is_anthropic = account.provider.wire_protocol()
+            == crate::provider::WireProtocol::Anthropic;
+        // chatgpt.com (Provider::OpenAI) uses a proprietary backend-api path + sentinel token.
+        // All other OpenAI-compat providers (OpenAIApi, Groq, Mistral, …) use /v1/chat/completions.
+        let acct_is_chatgpt = matches!(account.provider, Provider::OpenAI);
 
         let (fwd_path, fwd_body, mut fwd_headers) = if req_is_anthropic == acct_is_anthropic {
+            // Same wire protocol — pass through unchanged.
             (path.clone(), body_bytes.clone(), headers.clone())
-        } else if req_is_anthropic {
+        } else if req_is_anthropic && acct_is_chatgpt {
             // Anthropic client → chatgpt.com account: translate to backend-api format.
             let val = serde_json::from_slice::<serde_json::Value>(&body_bytes).unwrap_or(json!({}));
             let translated = translate_anthropic_req_to_chatgpt(&val);
@@ -353,6 +367,19 @@ async fn proxy_handler(
             }
             (
                 "/backend-api/conversation".to_owned(),
+                bytes::Bytes::from(serde_json::to_vec(&translated).unwrap_or_default()),
+                h,
+            )
+        } else if req_is_anthropic {
+            // Anthropic client → standard OpenAI-compat account (OpenAIApi, Groq, Mistral, …).
+            let val = serde_json::from_slice::<serde_json::Value>(&body_bytes).unwrap_or(json!({}));
+            let translated = translate_anthropic_req_to_openai(val);
+            let mut h = headers.clone();
+            for name in &["anthropic-version", "anthropic-beta", "anthropic-dangerous-direct-browser-access"] {
+                h.remove(*name);
+            }
+            (
+                "/v1/chat/completions".to_owned(),
                 bytes::Bytes::from(serde_json::to_vec(&translated).unwrap_or_default()),
                 h,
             )
@@ -372,9 +399,9 @@ async fn proxy_handler(
         let upstream = account.upstream_url.as_deref()
             .unwrap_or(&s.config.server.upstream_url);
 
-        // Inject chatgpt.com sentinel token for cross-protocol (Anthropic → chatgpt.com) requests.
+        // Inject chatgpt.com sentinel token — only for the chatgpt.com proprietary path.
         // Wrap in tokio::time::timeout (3s) to guarantee we don't block on Cloudflare challenges.
-        if req_is_anthropic && !acct_is_anthropic {
+        if req_is_anthropic && acct_is_chatgpt {
             tracing::info!(account = %account_name, upstream = %upstream, "routing to chatgpt.com — fetching sentinel");
             let sentinel_client = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(3))
@@ -395,10 +422,9 @@ async fn proxy_handler(
             }
         }
 
-        // For non-Anthropic accounts (chatgpt.com), apply a hard 15s cap on the forward call.
-        // Cloudflare may hold the TCP connection open indefinitely for certain TLS fingerprints;
-        // without a cap the request would hang for the full 600s forwarder timeout.
-        let response = if !acct_is_anthropic {
+        // Apply a hard 15s cap only for chatgpt.com: Cloudflare may hold the TCP connection
+        // open indefinitely for certain TLS fingerprints.  Standard API providers don't need this.
+        let response = if acct_is_chatgpt {
             tracing::info!(account = %account_name, path = %fwd_path, "forwarding to chatgpt.com (15s cap)");
             match tokio::time::timeout(
                 std::time::Duration::from_secs(15),
@@ -437,9 +463,12 @@ async fn proxy_handler(
                 // Translate response back to the client's expected protocol.
                 let response = if req_is_anthropic == acct_is_anthropic {
                     response
-                } else if req_is_anthropic {
+                } else if req_is_anthropic && acct_is_chatgpt {
                     // Got chatgpt.com response; client expects Anthropic.
                     translate_response_chatgpt_to_anthropic(response, &model).await
+                } else if req_is_anthropic {
+                    // Got standard OpenAI-compat response; client expects Anthropic.
+                    translate_response_openai_to_anthropic(response, &model).await
                 } else {
                     // Got Anthropic response; client expects OpenAI.
                     translate_response_anthropic_to_openai(response).await
@@ -510,11 +539,11 @@ async fn proxy_handler(
                     };
 
                     // Check if the token already changed while we were waiting.
-                    let token_before = cred.access_token.clone();
+                    let token_before = cred.access_token().to_owned();
                     let already_refreshed = {
                         let creds = s.credentials.read().await;
                         creds.get(&account_name)
-                            .map(|c| c.access_token != token_before)
+                            .map(|c| c.access_token() != token_before)
                             .unwrap_or(false)
                     };
 
@@ -522,23 +551,24 @@ async fn proxy_handler(
                         // Another concurrent request already refreshed — just retry.
                         warn!(account = %account_name, "401 — token was refreshed by concurrent request, retrying");
                         refreshed.insert(account_name);
-                    } else {
+                    } else if let Some(oauth_cred) = cred.as_oauth() {
+                        // OAuth account — attempt token refresh.
                         match tokio::time::timeout(
                             std::time::Duration::from_secs(10),
-                            account.provider.refresh_token(&cred),
+                            account.provider.refresh_token(oauth_cred),
                         ).await {
                             Ok(Ok(fresh)) => {
                                 warn!(account = %account_name, "401 — token refreshed, retrying");
                                 {
                                     let mut creds = s.credentials.write().await;
-                                    creds.insert(account_name.clone(), fresh.clone());
+                                    creds.insert(account_name.clone(), Credential::Oauth(fresh.clone()));
                                 }
                                 // Persist to disk so the refreshed token survives a restart.
                                 let name = account_name.clone();
                                 let fresh = fresh.clone();
                                 tokio::task::spawn_blocking(move || {
                                     let mut store = CredentialsStore::load();
-                                    store.accounts.insert(name, fresh.clone());
+                                    store.accounts.insert(name, Credential::Oauth(fresh.clone()));
                                     store.save().ok();
                                     if fresh.id_token.is_some() {
                                         crate::oauth::write_codex_auth_file(&fresh);
@@ -554,6 +584,11 @@ async fn proxy_handler(
                                 tried.insert(account_name);
                             }
                         }
+                    } else {
+                        // API-key account — 401 means the key is invalid; no refresh possible.
+                        error!(account = %account_name, "401 — API key rejected, cooling 5min");
+                        s.state.set_cooldown(&account_name, 5 * 60_000);
+                        tried.insert(account_name);
                     }
                 } else {
                     // Already refreshed once and still 401 — cool down this account.
@@ -673,7 +708,7 @@ pub async fn prefetch_rate_limits(config: Arc<Config>, state: StateStore, live_c
         }
 
         // Skip accounts with no credentials or no prefetch support.
-        let creds = match account.credential.clone() {
+        let cred = match account.credential.clone() {
             Some(c) => c,
             None => continue,
         };
@@ -687,7 +722,7 @@ pub async fn prefetch_rate_limits(config: Arc<Config>, state: StateStore, live_c
         };
         let url = format!("{}{}", config.server.upstream_url, path);
 
-        let resp = prefetch_send(&client, &url, &account.provider, &creds.access_token, &body).await;
+        let resp = prefetch_send(&client, &url, &account.provider, cred.bearer_token(), &body).await;
 
         let r = match resp {
             Ok(r) => r,
@@ -696,7 +731,13 @@ pub async fn prefetch_rate_limits(config: Arc<Config>, state: StateStore, live_c
 
         if r.status() == reqwest::StatusCode::UNAUTHORIZED {
             tracing::info!(account = %account.name, "prefetch: token expired, refreshing");
-            let fresh = match account.provider.refresh_token(&creds).await {
+            let Some(oauth_cred) = cred.as_oauth() else {
+                // API-key account — 401 during prefetch means the key is invalid.
+                tracing::error!(account = %account.name, "prefetch 401 — API key rejected");
+                state.set_auth_failed(&account.name);
+                continue;
+            };
+            let fresh = match account.provider.refresh_token(oauth_cred).await {
                 Ok(f) => f,
                 Err(e) => {
                     tracing::warn!(account = %account.name, "token refresh failed: {e}");
@@ -705,13 +746,13 @@ pub async fn prefetch_rate_limits(config: Arc<Config>, state: StateStore, live_c
                 }
             };
             let mut store = crate::config::CredentialsStore::load();
-            store.accounts.insert(account.name.clone(), fresh.clone());
+            store.accounts.insert(account.name.clone(), Credential::Oauth(fresh.clone()));
             store.save().ok();
             if fresh.id_token.is_some() {
                 crate::oauth::write_codex_auth_file(&fresh);
             }
             // Update live credentials so the proxy uses the fresh token immediately.
-            live_creds.write().await.insert(account.name.clone(), fresh.clone());
+            live_creds.write().await.insert(account.name.clone(), Credential::Oauth(fresh.clone()));
 
             match prefetch_send(&client, &url, &account.provider, &fresh.access_token, &body).await {
                 Ok(r2) if r2.status() == reqwest::StatusCode::UNAUTHORIZED => {
@@ -762,14 +803,12 @@ async fn auth_probe_get(
     account: &crate::config::AccountConfig,
     state: &StateStore,
 ) {
-    let creds = match account.credential.clone() {
+    let cred = match account.credential.clone() {
         Some(c) => c,
         None => return,
     };
-    let upstream = match account.provider {
-        crate::provider::Provider::OpenAI => "https://chatgpt.com",
-        crate::provider::Provider::Anthropic => "https://api.anthropic.com",
-    };
+    let upstream = account.upstream_url.as_deref()
+        .unwrap_or_else(|| account.provider.default_upstream_url());
     let url = format!("{}{}", upstream, path);
 
     let do_get = |token: &str| -> reqwest::RequestBuilder {
@@ -778,15 +817,20 @@ async fn auth_probe_get(
         client.get(&url).headers(headers)
     };
 
-    let probe_token = &creds.access_token;
-    let resp = match do_get(probe_token).send().await {
+    let resp = match do_get(cred.bearer_token()).send().await {
         Ok(r) => r,
         Err(e) => { tracing::warn!(account = %account.name, "auth probe failed: {e}"); return; }
     };
 
     if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-        tracing::info!(account = %account.name, "auth probe: access token rejected, refreshing");
-        let fresh = match account.provider.refresh_token(&creds).await {
+        tracing::info!(account = %account.name, "auth probe: token rejected, refreshing");
+        let Some(oauth_cred) = cred.as_oauth() else {
+            // API-key account — key is invalid; no refresh possible.
+            tracing::error!(account = %account.name, "auth probe 401 — API key rejected");
+            state.set_auth_failed(&account.name);
+            return;
+        };
+        let fresh = match account.provider.refresh_token(oauth_cred).await {
             Ok(f) => f,
             Err(e) => {
                 tracing::warn!(account = %account.name, "token refresh failed: {e}");
@@ -795,7 +839,7 @@ async fn auth_probe_get(
             }
         };
         let mut store = crate::config::CredentialsStore::load();
-        store.accounts.insert(account.name.clone(), fresh.clone());
+        store.accounts.insert(account.name.clone(), Credential::Oauth(fresh.clone()));
         store.save().ok();
         if fresh.id_token.is_some() {
             crate::oauth::write_codex_auth_file(&fresh);
@@ -845,11 +889,12 @@ async fn sync_live_creds_from_auth_json(
     let Some(from_file) = crate::oauth::read_codex_credentials() else { return };
     let current_exp = live_creds.read().await
         .get(account_name)
+        .and_then(|c| c.as_oauth())
         .map(|c| c.expires_at)
         .unwrap_or(0);
     if from_file.expires_at > current_exp {
         tracing::info!(account = %account_name, "synced fresher token from auth.json");
-        live_creds.write().await.insert(account_name.to_owned(), from_file);
+        live_creds.write().await.insert(account_name.to_owned(), Credential::Oauth(from_file));
     }
 }
 
@@ -866,10 +911,10 @@ async fn do_proactive_refresh(
             tracing::info!(account = %account.name, "proactive refresh ok — auth.json updated");
             {
                 let mut map = live_creds.write().await;
-                map.insert(account.name.clone(), fresh.clone());
+                map.insert(account.name.clone(), Credential::Oauth(fresh.clone()));
             }
             let mut store = crate::config::CredentialsStore::load();
-            store.accounts.insert(account.name.clone(), fresh.clone());
+            store.accounts.insert(account.name.clone(), Credential::Oauth(fresh.clone()));
             store.save().ok();
             if fresh.id_token.is_some() {
                 crate::oauth::write_codex_auth_file(&fresh);
@@ -910,11 +955,13 @@ pub async fn openai_token_refresh_loop(
             map.get(&account.name).cloned().or_else(|| account.credential.clone())
         };
         if let Some(creds) = creds {
-            if access_token_expires_soon(&creds, 30) {
-                // access_token is nearly expired — refresh now so shunt can serve requests immediately.
-                do_proactive_refresh(account, &creds, &live_creds, &state).await;
-            } else {
-                tracing::info!(account = %account.name, "access_token fresh at startup");
+            if let Some(oauth) = creds.as_oauth() {
+                if access_token_expires_soon(oauth, 30) {
+                    // access_token is nearly expired — refresh now so shunt can serve requests immediately.
+                    do_proactive_refresh(account, oauth, &live_creds, &state).await;
+                } else {
+                    tracing::info!(account = %account.name, "access_token fresh at startup");
+                }
             }
         }
     }
@@ -1004,7 +1051,8 @@ pub async fn recovery_watcher(
                 map.get(*name).cloned()
             };
             let Some(cred) = cred else { continue };
-            if cred.refresh_token.is_empty() { continue; }
+            if !cred.has_refresh_token() { continue; }
+            let Some(oauth_cred) = cred.as_oauth().cloned() else { continue };
 
             let provider = config.accounts.iter()
                 .find(|a| a.name == *name)
@@ -1013,7 +1061,7 @@ pub async fn recovery_watcher(
 
             let result = tokio::time::timeout(
                 Duration::from_secs(20),
-                provider.refresh_token(&cred),
+                provider.refresh_token(&oauth_cred),
             ).await;
 
             match result {
@@ -1021,13 +1069,13 @@ pub async fn recovery_watcher(
                     tracing::info!(account = %name, "recovery: token refreshed — account back online");
                     {
                         let mut map = credentials.write().await;
-                        map.insert(name.to_string(), fresh.clone());
+                        map.insert(name.to_string(), Credential::Oauth(fresh.clone()));
                     }
                     let name_owned = name.to_string();
                     let fresh_owned = fresh.clone();
                     tokio::task::spawn_blocking(move || {
                         let mut store = crate::config::CredentialsStore::load();
-                        store.accounts.insert(name_owned, fresh_owned.clone());
+                        store.accounts.insert(name_owned, Credential::Oauth(fresh_owned.clone()));
                         store.save().ok();
                         if fresh_owned.id_token.is_some() {
                             crate::oauth::write_codex_auth_file(&fresh_owned);
@@ -1159,7 +1207,7 @@ pub async fn cooldown_watcher(
                     tracing::info!(account = %account.name, "cooldown expired — strong resume prefetch");
                     let token = {
                         let creds = credentials.read().await;
-                        creds.get(&account.name).map(|c| c.access_token.clone())
+                        creds.get(&account.name).map(|c| c.bearer_token().to_owned())
                     };
                     if let Some(token) = token {
                         post_cooldown_prefetch(
@@ -1201,7 +1249,7 @@ pub async fn cooldown_watcher(
                     );
                     let token = {
                         let creds = credentials.read().await;
-                        creds.get(&account.name).map(|c| c.access_token.clone())
+                        creds.get(&account.name).map(|c| c.bearer_token().to_owned())
                     };
                     if let Some(token) = token {
                         post_cooldown_prefetch(

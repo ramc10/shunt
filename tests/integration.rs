@@ -16,6 +16,7 @@ use serde_json::json;
 use tokio::net::TcpListener;
 
 use shunt::config::{AccountConfig, Config, ServerConfig};
+use shunt::credential::Credential;
 use shunt::oauth::OAuthCredential;
 use shunt::provider::Provider;
 use shunt::proxy::create_app_with_state;
@@ -151,14 +152,14 @@ fn to_reqwest_headers(h: &axum::http::HeaderMap) -> reqwest::header::HeaderMap {
 
 const TEST_TOKEN: &str = "test-oauth-token-abc123";
 
-fn test_credential() -> OAuthCredential {
-    OAuthCredential {
+fn test_credential() -> Credential {
+    Credential::Oauth(OAuthCredential {
         email: None,
         access_token: TEST_TOKEN.into(),
         refresh_token: "test-refresh-token".into(),
         expires_at: u64::MAX / 2,
         id_token: None,
-    }
+    })
 }
 
 fn test_account() -> AccountConfig {
@@ -374,13 +375,13 @@ fn test_account2() -> AccountConfig {
         name: "second".into(),
         plan_type: "pro".into(),
         provider: Provider::default(),
-        credential: Some(OAuthCredential {
+        credential: Some(Credential::Oauth(OAuthCredential {
             email: None,
             access_token: TEST_TOKEN_2.into(),
             refresh_token: "test-refresh-2".into(),
             expires_at: u64::MAX / 2,
             id_token: None,
-        }),
+        })),
         upstream_url: None,
     }
 }
@@ -771,14 +772,14 @@ fn openai_account(upstream_url: String) -> AccountConfig {
     AccountConfig {
         name: "codex".into(),
         plan_type: "pro".into(),
-        provider: Provider::OpenAI,
-        credential: Some(OAuthCredential {
+        provider: Provider::OpenAIApi,
+        credential: Some(Credential::Oauth(OAuthCredential {
             email: None,
             access_token: OPENAI_TOKEN.into(),
             refresh_token: "openai-refresh".into(),
             expires_at: u64::MAX / 2,
             id_token: None,
-        }),
+        })),
         upstream_url: Some(upstream_url),
     }
 }
@@ -1020,13 +1021,13 @@ async fn test_live_api() {
             return;
         };
 
-    let credential = OAuthCredential {
+    let credential = Credential::Oauth(OAuthCredential {
         email: None,
         access_token: if is_bearer { token.clone() } else { token.clone() },
         refresh_token: String::new(),
         expires_at: u64::MAX / 2,
         id_token: None,
-    };
+    });
 
     let cfg = Config {
         server: ServerConfig {

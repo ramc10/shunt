@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::{config_path, config_template, credentials_path, log_path, pid_path, CredentialsStore};
+use crate::credential::Credential;
 use crate::oauth::{claude_credentials_path, read_claude_credentials, refresh_token, revoke_token, run_oauth_flow};
 use crate::term::{self, bold, bold_white, brand_green, cyan, dark_green, dim, green, green_bold, red, yellow, CHECK, CROSS, DIAMOND, DOT, EMPTY};
 
@@ -274,7 +275,7 @@ pub async fn cmd_setup(config_override: Option<PathBuf>) -> Result<()> {
 
     // Store credential
     let mut store = CredentialsStore::default();
-    store.accounts.insert("main".into(), cred);
+    store.accounts.insert("main".into(), Credential::Oauth(cred));
     store.save()?;
 
     println!();
@@ -393,12 +394,14 @@ async fn cmd_add_account(
     let mut cred = match provider {
         Provider::Anthropic => run_oauth_flow().await?,
         Provider::OpenAI    => crate::oauth::run_openai_oauth_flow().await?,
+        _ => anyhow::bail!("provider {} does not support OAuth login; use `api_key` in config instead", provider),
     };
 
     // Fetch email (non-fatal)
     let email = match provider {
         Provider::Anthropic => crate::oauth::fetch_account_email(&cred.access_token).await,
         Provider::OpenAI    => crate::oauth::fetch_openai_account_email(&cred.access_token).await,
+        _ => None,
     };
     if let Some(ref e) = email {
         println!("  {} Signed in as {}", green(CHECK), bold(e));
@@ -412,15 +415,15 @@ async fn cmd_add_account(
             Provider::Anthropic => config_text.push_str(&format!(
                 "\n[[accounts]]\nname = \"{name}\"\nplan_type = \"pro\"\n"
             )),
-            Provider::OpenAI => config_text.push_str(&format!(
-                "\n[[accounts]]\nname = \"{name}\"\nplan_type = \"pro\"\nprovider = \"openai\"\n"
+            _ => config_text.push_str(&format!(
+                "\n[[accounts]]\nname = \"{name}\"\nplan_type = \"pro\"\nprovider = \"{provider}\"\n"
             )),
         }
         std::fs::write(&config_p, &config_text)?;
     }
 
     let mut store = CredentialsStore::load();
-    store.accounts.insert(name.clone(), cred.clone());
+    store.accounts.insert(name.clone(), Credential::Oauth(cred.clone()));
     store.save()?;
 
     // Keep ~/.codex/auth.json in sync so the Codex CLI works without re-login.
@@ -455,7 +458,7 @@ async fn cmd_remove_account(config_override: Option<PathBuf>, name: Option<Strin
             bail!("No accounts to remove.");
         }
         let items: Vec<term::SelectItem> = removable.iter().map(|a| {
-            let email = a.credential.as_ref().and_then(|c| c.email.as_deref()).unwrap_or("");
+            let email = a.credential.as_ref().and_then(|c| c.email()).unwrap_or("");
             term::SelectItem {
                 label: format!("{}  {}", bold(&pad(&a.name, 12)), dim(&pad(email, 32))),
                 value: a.name.clone(),
@@ -537,7 +540,7 @@ async fn cmd_logout(config_override: Option<PathBuf>, name: Option<String>, all:
             return Ok(());
         }
         let items: Vec<term::SelectItem> = with_cred.iter().map(|a| {
-            let email = a.credential.as_ref().and_then(|c| c.email.as_deref()).unwrap_or("");
+            let email = a.credential.as_ref().and_then(|c| c.email()).unwrap_or("");
             term::SelectItem {
                 label: format!("{}  {}", bold(&pad(&a.name, 12)), dim(&pad(email, 32))),
                 value: a.name.clone(),
@@ -584,7 +587,7 @@ async fn cmd_logout(config_override: Option<PathBuf>, name: Option<String>, all:
             print!("  {} Revoking '{}' token… ", dim("↻"), name);
             use std::io::Write;
             std::io::stdout().flush().ok();
-            if revoke_token(&cred.access_token).await {
+            if revoke_token(cred.access_token()).await {
                 println!("{}", green("done"));
             } else {
                 println!("{}", dim("(server did not confirm — cleared locally)"));
@@ -727,14 +730,16 @@ async fn cmd_start(
         for account in &mut config.accounts {
             if let Some(cred) = &account.credential {
                 if cred.needs_refresh() {
-                    if let Ok(Ok(fresh)) = tokio::time::timeout(
-                        std::time::Duration::from_secs(10),
-                        account.provider.refresh_token(cred),
-                    ).await {
-                        let mut store = CredentialsStore::load();
-                        store.accounts.insert(account.name.clone(), fresh.clone());
-                        store.save().ok();
-                        account.credential = Some(fresh);
+                    if let Some(oauth) = cred.as_oauth() {
+                        if let Ok(Ok(fresh)) = tokio::time::timeout(
+                            std::time::Duration::from_secs(10),
+                            account.provider.refresh_token(oauth),
+                        ).await {
+                            let mut store = CredentialsStore::load();
+                            store.accounts.insert(account.name.clone(), Credential::Oauth(fresh.clone()));
+                            store.save().ok();
+                            account.credential = Some(Credential::Oauth(fresh));
+                        }
                     }
                 }
             }
@@ -782,21 +787,23 @@ async fn cmd_start(
         for account in &mut config.accounts {
             if let Some(cred) = &account.credential {
                 if cred.needs_refresh() {
-                    print!("  {} Refreshing '{}'… ", yellow("↻"), account.name);
-                    std::io::stdout().flush().ok();
-                    match tokio::time::timeout(
-                        std::time::Duration::from_secs(10),
-                        account.provider.refresh_token(cred),
-                    ).await {
-                        Ok(Ok(fresh)) => {
-                            println!("{}", green("done"));
-                            let mut store = CredentialsStore::load();
-                            store.accounts.insert(account.name.clone(), fresh.clone());
-                            store.save().ok();
-                            account.credential = Some(fresh);
+                    if let Some(oauth) = cred.as_oauth() {
+                        print!("  {} Refreshing '{}'… ", yellow("↻"), account.name);
+                        std::io::stdout().flush().ok();
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(10),
+                            account.provider.refresh_token(oauth),
+                        ).await {
+                            Ok(Ok(fresh)) => {
+                                println!("{}", green("done"));
+                                let mut store = CredentialsStore::load();
+                                store.accounts.insert(account.name.clone(), Credential::Oauth(fresh.clone()));
+                                store.save().ok();
+                                account.credential = Some(Credential::Oauth(fresh));
+                            }
+                            Ok(Err(e)) => println!("{}", yellow(&format!("failed ({})", e))),
+                            Err(_)    => println!("{}", yellow("timed out")),
                         }
-                        Ok(Err(e)) => println!("{}", yellow(&format!("failed ({})", e))),
-                        Err(_)    => println!("{}", yellow("timed out")),
                     }
                 }
             }
@@ -1007,7 +1014,7 @@ async fn cmd_setup_auto(config_override: Option<PathBuf>) -> Result<()> {
     }
 
     let mut store = CredentialsStore::default();
-    store.accounts.insert("main".into(), cred);
+    store.accounts.insert("main".into(), Credential::Oauth(cred));
     store.save()?;
 
     Ok(())
@@ -1098,13 +1105,17 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
     let mut store_dirty = false;
     let mut store = CredentialsStore::load();
     for acc in &mut config.accounts {
-        if acc.credential.as_ref().map(|c| c.email.is_none()).unwrap_or(false) {
-            let token = acc.credential.as_ref().map(|c| c.access_token.clone()).unwrap_or_default();
+        if acc.credential.as_ref().map(|c| c.email().is_none()).unwrap_or(false) {
+            let token = acc.credential.as_ref().map(|c| c.access_token().to_owned()).unwrap_or_default();
             if let Some(email) = crate::oauth::fetch_account_email(&token).await {
-                if let Some(c) = acc.credential.as_mut() { c.email = Some(email.clone()); }
+                if let Some(oauth) = acc.credential.as_mut().and_then(|c| c.as_oauth_mut()) {
+                    oauth.email = Some(email.clone());
+                }
                 if let Some(stored) = store.accounts.get_mut(&acc.name) {
-                    stored.email = Some(email);
-                    store_dirty = true;
+                    if let Some(oauth) = stored.as_oauth_mut() {
+                        oauth.email = Some(email);
+                        store_dirty = true;
+                    }
                 }
             }
         }
@@ -1204,7 +1215,7 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
                 _                    => "Claude Pro",
             }
         };
-        let email_str = acc.credential.as_ref().and_then(|c| c.email.as_deref()).unwrap_or("");
+        let email_str = acc.credential.as_ref().and_then(|c| c.email()).unwrap_or("");
 
         // ── routing tag ─────────────────────────────────────
         let is_pinned  = pinned_account.as_deref() == Some(&acc.name);
@@ -1342,7 +1353,7 @@ async fn cmd_use(config_override: Option<PathBuf>, account: Option<String>) -> R
             _ => dim("offline").to_string(),
         };
 
-        let email = a.credential.as_ref().and_then(|c| c.email.as_deref()).unwrap_or("");
+        let email = a.credential.as_ref().and_then(|c| c.email()).unwrap_or("");
         let pin = if is_pinned { format!("  {}", yellow("pinned")) } else { String::new() };
 
         term::SelectItem {

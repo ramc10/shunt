@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::credential::{deserialize_credential_map, Credential};
 use crate::oauth::OAuthCredential;
 use crate::provider::Provider;
 
@@ -49,7 +50,8 @@ pub fn pid_path() -> PathBuf {
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct CredentialsStore {
-    pub accounts: HashMap<String, OAuthCredential>,
+    #[serde(deserialize_with = "deserialize_credential_map", default)]
+    pub accounts: HashMap<String, Credential>,
 }
 
 impl CredentialsStore {
@@ -153,9 +155,18 @@ struct RawAccount {
     name: String,
     #[serde(default = "default_plan_type")]
     plan_type: String,
-    /// "anthropic" (default) | "openai" / "codex"
+    /// "anthropic" (default) | "openai" / "codex" | "groq" | "mistral" | "local" | …
     #[serde(default)]
     provider: Option<String>,
+    /// Inline API key (use api_key_env for better security).
+    #[serde(default)]
+    api_key: Option<String>,
+    /// Name of an environment variable that holds the API key.
+    #[serde(default)]
+    api_key_env: Option<String>,
+    /// Per-account upstream URL override (required for Local provider).
+    #[serde(default)]
+    upstream_url: Option<String>,
 }
 
 fn default_host() -> String { "127.0.0.1".into() }
@@ -213,13 +224,14 @@ pub struct AccountConfig {
     pub name: String,
     pub plan_type: String,
     pub provider: Provider,
-    /// `None` when the account is in config but has no credential yet.
-    /// These accounts are shown in status but skipped during proxying.
-    pub credential: Option<OAuthCredential>,
+    /// `None` when the account has no credential.
+    /// OAuth accounts: None means reauth required (shown as auth_failed).
+    /// ApiKey accounts: None means key not yet configured.
+    /// Local accounts: None is normal (no auth required).
+    pub credential: Option<Credential>,
     /// Override the upstream base URL for this account.
-    /// Used in tests and for custom per-account routing.
-    /// `None` means use `config.server.upstream_url` (same-protocol) or
-    /// `provider.default_upstream_url()` (cross-protocol translation).
+    /// `None` means use `config.server.upstream_url` (primary provider) or
+    /// `provider.default_upstream_url()` (non-primary provider).
     pub upstream_url: Option<String>,
 }
 
@@ -303,20 +315,40 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
     for a in &raw.accounts {
         let provider = a.provider.as_deref().map(Provider::from_str).unwrap_or_default();
 
-        // Resolve credential: stored credential first, then auto-import from provider's local CLI.
-        let cred = store
-            .accounts
-            .get(&a.name)
-            .cloned()
-            .or_else(|| provider.read_local_credentials());
+        // Resolve credential.
+        //
+        // OAuth providers (Anthropic, OpenAI): credentials.json first, then
+        // auto-import from the provider's local CLI tool.
+        //
+        // API-key providers: credentials.json first, then inline api_key field,
+        // then api_key_env field, then the provider's well-known env var.
+        let cred: Option<Credential> = store.accounts.get(&a.name).cloned()
+            .or_else(|| {
+                // Inline api_key from TOML (less secure, but convenient for testing).
+                a.api_key.as_deref().map(|k| Credential::Apikey { key: k.to_owned() })
+            })
+            .or_else(|| {
+                // api_key_env: name of env var holding the key.
+                a.api_key_env.as_deref()
+                    .and_then(|var| std::env::var(var).ok())
+                    .map(|k| Credential::Apikey { key: k })
+            })
+            .or_else(|| {
+                // Auto-import from provider's CLI tool (OAuth providers) or
+                // well-known env var (API-key providers).
+                provider.read_local_credentials()
+            });
 
-        // Non-primary-provider accounts get the provider's real upstream URL pre-populated.
-        // Primary-provider accounts leave it None so proxy falls back to config.server.upstream_url.
-        let acct_upstream = if provider != primary_provider {
-            Some(provider.default_upstream_url().to_owned())
-        } else {
-            None
-        };
+        // Upstream URL: per-account override from TOML takes priority, then
+        // non-primary-provider accounts get the provider's default URL so
+        // the forwarder knows where to send requests.
+        let acct_upstream = a.upstream_url.clone().or_else(|| {
+            if provider != primary_provider {
+                Some(provider.default_upstream_url().to_owned())
+            } else {
+                None
+            }
+        });
 
         accounts.push(AccountConfig {
             name: a.name.clone(),
