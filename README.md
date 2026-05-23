@@ -11,6 +11,10 @@
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey)
 
+```bash
+curl -sSf https://raw.githubusercontent.com/ramc10/shunt/main/install.sh | sh
+```
+
 </div>
 
 ---
@@ -58,22 +62,6 @@ AI coding agents are only as fast as their rate limits allow. Hit your Claude 5-
 - **Zero-downtime exhaustion handling** — if every account is drained, requests are held open and retried the instant the first account resets. Your agent session never errors out
 - **Cross-provider routing** — overflow Claude requests to Groq or DeepSeek when your Anthropic accounts are hot. Mix providers transparently
 - **Drop-in** — one env var and your existing tools route through shunt. No code changes, no SDK swaps
-
----
-
-## Install
-
-```bash
-curl -sSf https://raw.githubusercontent.com/ramc10/shunt/main/install.sh | sh
-```
-
-Downloads the right pre-built binary for your OS and arch — no Rust, no dependencies.
-
-Or via Cargo:
-
-```bash
-cargo install shunt-proxy
-```
 
 ---
 
