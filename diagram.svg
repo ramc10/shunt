@@ -39,9 +39,9 @@
   <line x1="154" y1="206" x2="178" y2="206"/>
 
   <!-- left horizontal → logo -->
-  <line class="arrow" x1="178" y1="126" x2="240" y2="126"/>
+  <line class="arrow" x1="178" y1="126" x2="218" y2="126"/>
   <!-- arrowhead -->
-  <polygon points="240,121 252,126 240,131" fill="#aaa" stroke="none"/>
+  <polygon points="218,121 230,126 218,131" fill="#aaa" stroke="none"/>
 
   <!-- ── CENTER: shunt logo ── -->
   <!-- logo is 10 units × 4 units at 14px/unit, centered at x=320, y=126 -->
@@ -58,7 +58,7 @@
   <rect class="logo" x="334" y="154" width="14" height="14"/>
 
   <!-- logo → right horizontal -->
-  <line class="arrow" x1="390" y1="126" x2="450" y2="126"/>
+  <line class="arrow" x1="410" y1="126" x2="450" y2="126"/>
   <!-- arrowhead -->
   <polygon points="450,121 462,126 450,131" fill="#aaa" stroke="none"/>
 
