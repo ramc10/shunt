@@ -1381,18 +1381,169 @@ fn auto_write_shell_export(port: u16) {
 // status
 // ---------------------------------------------------------------------------
 
+/// Renders status by fetching from a remote shunt URL (set by `shunt connect`).
+/// Accounts are sourced directly from the remote /status JSON, not local config.
+async fn cmd_status_remote(remote_url: &str) -> Result<()> {
+    let status_url = format!("{remote_url}/status");
+    let live: Option<serde_json::Value> = reqwest::Client::new()
+        .get(&status_url)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await.ok()
+        .and_then(|r| futures_executor_hack(r));
+
+    let Some(data) = live else {
+        println!();
+        println!("  {} Cannot connect to remote shunt at {}", red(CROSS), cyan(remote_url));
+        println!("  {} The share tunnel may have expired. Run {} on the host.", dim("·"), cyan("shunt share"));
+        println!();
+        return Ok(());
+    };
+
+    let accounts = data["accounts"].as_array().map(|v| v.as_slice()).unwrap_or(&[]);
+    let version = data["version"].as_str().unwrap_or("?");
+
+    let provider_lines = {
+        let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for a in accounts {
+            let label = a["provider"].as_str().unwrap_or("unknown");
+            *counts.entry(label).or_default() += 1;
+        }
+        let mut lines = vec!["accounts connected".to_string(), String::new()];
+        lines.extend(counts.iter().map(|(label, n)| {
+            let provider_display = match *label {
+                "anthropic" => "Claude Code",
+                "openai"    => "Codex",
+                l           => l,
+            };
+            format!("{n} {provider_display} {}", if *n == 1 { "account" } else { "accounts" })
+        }));
+        lines
+    };
+
+    let title = format!("shunt  v{}", env!("CARGO_PKG_VERSION"));
+    print_status_splash(&title, provider_lines);
+    println!();
+
+    let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs()).unwrap_or(0);
+    let pinned = data["pinned_account"].as_str().map(|s| s.to_owned());
+    let last_used = data["last_used_account"].as_str().map(|s| s.to_owned());
+
+    // Pinned notice
+    if let Some(ref p) = pinned {
+        println!("  {}  pinned to {}", yellow(DIAMOND), bold(p));
+        println!("  {}  run {} to restore auto routing", dim("·"), cyan("shunt use auto"));
+        println!();
+    }
+
+    for acc in accounts {
+        let name      = acc["name"].as_str().unwrap_or("?");
+        let status    = acc["status"].as_str().unwrap_or("offline");
+        let email     = acc["email"].as_str().unwrap_or("");
+        let plan_type = acc["plan_type"].as_str().unwrap_or("pro");
+        let provider  = acc["provider"].as_str().unwrap_or("anthropic");
+
+        let (status_icon, status_text): (String, String) = match status {
+            "available"       => (green(CHECK),   green("available")),
+            "cooling"         => (yellow("↻"),    yellow("cooling")),
+            "disabled"        => (red(CROSS),     red("disabled")),
+            "reauth_required" => (red(CROSS),     red("session expired")),
+            _                 => (dim(EMPTY),     dim("offline")),
+        };
+
+        let plan_label = match provider {
+            "anthropic" => match plan_type.to_lowercase().as_str() {
+                "max" | "claude_max" => "Claude Max",
+                "team"               => "Claude Team",
+                _                    => "Claude Pro",
+            },
+            _ => "",
+        };
+
+        let is_pinned  = pinned.as_deref() == Some(name);
+        let is_last    = !is_pinned && last_used.as_deref() == Some(name);
+        let (routing_tag, tag_vis_len): (String, usize) = if is_pinned {
+            (format!("  {}", yellow("pinned")), 8)
+        } else if is_last {
+            (format!("  {}", green("active")), 8)
+        } else {
+            (String::new(), 0)
+        };
+
+        println!("{}", card_header(name, &green_bold(name), &routing_tag, tag_vis_len, plan_label));
+        if !email.is_empty() {
+            println!("{}", card_row(&dim(email)));
+        }
+        println!();
+        println!("{}", card_row(&format!("{}  {}", status_icon, status_text)));
+
+        // Rate-limit bars
+        if let Some(rl) = acc["rate_limit"].as_object() {
+            let util_5h   = rl.get("utilization_5h").and_then(|v| v.as_f64());
+            let reset_5h  = rl.get("reset_5h").and_then(|v| v.as_u64());
+            let status_5h = rl.get("status_5h").and_then(|v| v.as_str()).unwrap_or("allowed");
+            let util_7d   = rl.get("utilization_7d").and_then(|v| v.as_f64());
+            let reset_7d  = rl.get("reset_7d").and_then(|v| v.as_u64());
+            let status_7d = rl.get("status_7d").and_then(|v| v.as_str()).unwrap_or("allowed");
+
+            let window_row = |label: &str, util: Option<f64>, reset: Option<u64>, wstatus: &str| {
+                if reset.map(|t| t <= now_secs).unwrap_or(false) {
+                    let ago = reset.map(|t| format!(
+                        "  {} ago", term::fmt_duration_ms(now_secs.saturating_sub(t) * 1000)
+                    )).unwrap_or_default();
+                    println!("{}", card_row(&format!(
+                        "{}  {}  {}{}",
+                        dim(label), green(&"─".repeat(20)), green("fresh"), dim(&ago)
+                    )));
+                } else if let Some(u) = util {
+                    let rem = 100u64.saturating_sub((u * 100.0) as u64);
+                    let bar = util_bar(u, 20);
+                    let reset_str = reset.and_then(|t| secs_until(t))
+                        .map(|s| format!("  ·  resets in {}", term::fmt_duration_ms(s * 1000)))
+                        .unwrap_or_default();
+                    let pct = if wstatus == "exhausted" {
+                        red("exhausted")
+                    } else {
+                        format!("{}% left", bold(&rem.to_string()))
+                    };
+                    println!("{}", card_row(&format!(
+                        "{}  {}  {}{}",
+                        dim(label), bar, pct, dim(&reset_str)
+                    )));
+                }
+            };
+
+            if util_5h.is_some() || reset_5h.is_some() { window_row("5h", util_5h, reset_5h, status_5h); }
+            if util_7d.is_some() || reset_7d.is_some() { window_row("7d", util_7d, reset_7d, status_7d); }
+        }
+
+        println!();
+        println!("{}", card_sep());
+        println!();
+    }
+
+    // Remote host info footer
+    println!("  {}  remote shunt v{}  {}  {}", dim("·"), dim(version), dim("·"), dim(remote_url));
+    println!();
+    Ok(())
+}
+
 async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
+    // Remote mode: ANTHROPIC_BASE_URL is a non-local shunt (written by `shunt connect`).
+    // Render accounts directly from the remote /status JSON — local config is irrelevant.
+    if let Some(remote) = std::env::var("ANTHROPIC_BASE_URL").ok()
+        .filter(|u| !u.contains("127.0.0.1") && !u.contains("localhost"))
+        .map(|u| u.trim_end_matches('/').to_owned())
+    {
+        return cmd_status_remote(&remote).await;
+    }
+
     let mut config = crate::config::load_config(config_override.as_deref())?;
 
-    // Fetch live status: if ANTHROPIC_BASE_URL is a remote shunt (set by
-    // `shunt connect`), use that; otherwise fall back to local control port.
-    let status_url = std::env::var("ANTHROPIC_BASE_URL").ok()
-        .filter(|u| !u.contains("127.0.0.1") && !u.contains("localhost"))
-        .map(|u| format!("{}/status", u.trim_end_matches('/')))
-        .unwrap_or_else(|| format!("http://{}:{}/status", config.server.host, config.server.control_port));
-
-    let live: Option<serde_json::Value> = reqwest::get(&status_url)
-        .await.ok().and_then(|r| futures_executor_hack(r));
+    // Fetch live status from local control port.
+    let live: Option<serde_json::Value> = reqwest::get(
+        format!("http://{}:{}/status", config.server.host, config.server.control_port)
+    ).await.ok().and_then(|r| futures_executor_hack(r));
 
     // Back-fill missing emails (existing accounts set up before email support).
     // Fetch in parallel, persist any that are new.
