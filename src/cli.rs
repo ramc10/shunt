@@ -2805,11 +2805,11 @@ async fn cmd_share(config_override: Option<PathBuf>, tunnel: bool, stop: bool) -
                     .and_then(|c| c.server.custom_domain.clone());
                 let domain_label = match &existing_domain {
                     Some(d) => format!("{}  {}",
-                        bold("Custom domain (permanent)"),
-                        dim(&format!("— {} · your domain", d))),
+                        bold("Permanent (named Cloudflare tunnel)"),
+                        dim(&format!("— {} · auto-setup DNS + tunnel", d))),
                     None => format!("{}  {}",
-                        bold("Custom domain (permanent)"),
-                        dim("— your own domain, always-on")),
+                        bold("Permanent (named Cloudflare tunnel)"),
+                        dim("— your domain, auto-setup DNS + tunnel, always-on")),
                 };
                 let online_items = vec![
                     term::SelectItem {
@@ -2910,7 +2910,25 @@ async fn cmd_share(config_override: Option<PathBuf>, tunnel: bool, stop: bool) -
         }
 
         ShareMode::CustomDomain => {
-            // Resolve domain: use saved, or prompt + save
+            // Step 1: verify cloudflared is installed
+            match std::process::Command::new("cloudflared")
+                .arg("--version")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+            {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    bail!(
+                        "cloudflared is not installed.\n\n  \
+                         Install it:\n    brew install cloudflared\n  \
+                         or: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/"
+                    );
+                }
+                Err(e) => bail!("Failed to check cloudflared: {e}"),
+                Ok(_) => {}
+            }
+
+            // Step 2: resolve domain (use saved, or prompt + save)
             let domain = if let Some(d) = saved_domain {
                 d
             } else {
@@ -2923,13 +2941,10 @@ async fn cmd_share(config_override: Option<PathBuf>, tunnel: bool, stop: bool) -
                 let mut input = String::new();
                 std::io::stdin().read_line(&mut input)?;
                 let domain = input.trim().trim_end_matches('/').to_string();
-                if domain.is_empty() {
-                    bail!("No domain entered.");
-                }
+                if domain.is_empty() { bail!("No domain entered."); }
                 if !domain.starts_with("http") {
                     bail!("Domain must start with http:// or https://");
                 }
-                // Save to config
                 let mut cfg_text = std::fs::read_to_string(&config_p)?;
                 cfg_text = insert_into_server_section(&cfg_text,
                     &format!("custom_domain = \"{domain}\""));
@@ -2938,13 +2953,17 @@ async fn cmd_share(config_override: Option<PathBuf>, tunnel: bool, stop: bool) -
                 domain
             };
 
-            share_and_print(&domain, &key, &relay_url, "Online sharing (custom domain)", &[
+            // Steps 3-7: auto-setup DNS + start named tunnel
+            start_named_cloudflare_tunnel(&domain, port)?;
+
+            share_and_print(&domain, &key, &relay_url, "Permanent tunnel active", &[
                 format!("  {} Code expires in 10 minutes — one-time use", dim("·")),
-                format!("  {} Make sure {} is pointing to port {} on this machine.",
-                    dim("·"), cyan(&domain), port),
-                format!("  {} Restart to apply: {}", dim("·"), cyan("shunt start")),
-                format!("  {} To stop sharing:  {}", dim("·"), cyan("shunt share --stop")),
+                format!("  {} Tunnel is active at {} — keep this terminal open.", dim("·"), cyan(&domain)),
+                format!("  {} Press Ctrl+C to stop.", dim("·")),
             ]).await;
+
+            tokio::signal::ctrl_c().await.ok();
+            println!("\n  {} Tunnel closed.", dim("·"));
         }
 
         ShareMode::Lan => {
@@ -3035,6 +3054,156 @@ fn start_cloudflare_tunnel(port: u16) -> Result<String> {
     }
 
     bail!("cloudflared exited before providing a tunnel URL")
+}
+
+/// Set up and run a named Cloudflare tunnel for a custom domain (permanent sharing).
+///
+/// Steps:
+///   1. Login if ~/.cloudflared/cert.pem is absent.
+///   2. Find or create the "shunt" tunnel, capturing its UUID.
+///   3. Route DNS (idempotent — "already exists" errors are ignored).
+///   4. Write ~/.cloudflared/config.yml.
+///   5. Spawn `cloudflared tunnel run`, scan stderr for "registered", then return.
+fn start_named_cloudflare_tunnel(domain: &str, port: u16) -> Result<()> {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+
+    let home = dirs::home_dir().context("Cannot find home directory")?;
+    let cf_dir = home.join(".cloudflared");
+
+    // ── Step 1: login if cert.pem is absent ─────────────────────────────────
+    if !cf_dir.join("cert.pem").exists() {
+        println!();
+        println!("  {} No Cloudflare credentials found. Opening browser for login…", dim("·"));
+        println!();
+        let status = Command::new("cloudflared")
+            .args(["tunnel", "login"])
+            .status()
+            .context("Failed to run `cloudflared tunnel login`")?;
+        if !status.success() {
+            bail!("`cloudflared tunnel login` failed (exit {:?})", status.code());
+        }
+    }
+
+    // ── Step 2: find or create "shunt" tunnel ───────────────────────────────
+    let tunnel_id = cloudflared_find_or_create_tunnel()?;
+    println!("  {} Tunnel ID: {}", dim("·"), dim(&tunnel_id));
+
+    // ── Step 3: route DNS (idempotent) ──────────────────────────────────────
+    let hostname = domain
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_end_matches('/');
+
+    println!("  {} Routing DNS for {}…", dim("·"), cyan(hostname));
+    let dns_out = Command::new("cloudflared")
+        .args(["tunnel", "route", "dns", "shunt", hostname])
+        .output()
+        .context("Failed to run `cloudflared tunnel route dns`")?;
+    if !dns_out.status.success() {
+        let stderr_text = String::from_utf8_lossy(&dns_out.stderr);
+        if !stderr_text.to_lowercase().contains("already exists") {
+            bail!("`cloudflared tunnel route dns` failed:\n{}", stderr_text.trim());
+        }
+    }
+    println!("  {} DNS route OK.", green(CHECK));
+
+    // ── Step 4: write ~/.cloudflared/config.yml ──────────────────────────────
+    let creds_file = cf_dir.join(format!("{tunnel_id}.json"));
+    let config_yml = cf_dir.join("config.yml");
+    std::fs::write(&config_yml, format!(
+        "tunnel: shunt\n\
+         credentials-file: {creds}\n\
+         ingress:\n  \
+           - hostname: {hostname}\n    \
+             service: http://127.0.0.1:{port}\n  \
+           - service: http_status:404\n",
+        creds = creds_file.display(),
+    )).context("Failed to write ~/.cloudflared/config.yml")?;
+    println!("  {} Config written.", green(CHECK));
+
+    // ── Step 5: launch and wait for "registered" ────────────────────────────
+    println!("  {} Starting named tunnel…", dim("·"));
+    let mut child = Command::new("cloudflared")
+        .args(["tunnel", "run", "--config",
+               &config_yml.to_string_lossy(), "shunt"])
+        .stderr(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .context("Failed to spawn `cloudflared tunnel run`")?;
+
+    let stderr = child.stderr.take().expect("stderr piped");
+    for line in BufReader::new(stderr).lines() {
+        let line = line?;
+        let lower = line.to_lowercase();
+        if lower.contains("registered") || lower.contains("connection established") {
+            std::mem::forget(child);
+            println!("  {} Tunnel connected.", green(CHECK));
+            println!();
+            return Ok(());
+        }
+        if lower.contains("error") || lower.contains("failed") {
+            eprintln!("  {} cloudflared: {}", yellow("!"), dim(&line));
+        }
+    }
+
+    bail!("`cloudflared tunnel run` exited before the tunnel became ready")
+}
+
+/// Find an existing "shunt" tunnel or create one, returning its UUID.
+fn cloudflared_find_or_create_tunnel() -> Result<String> {
+    use std::process::{Command, Stdio};
+
+    // List existing tunnels
+    let list_out = Command::new("cloudflared")
+        .args(["tunnel", "list", "--output", "json"])
+        .stdout(Stdio::piped()).stderr(Stdio::null())
+        .output().context("Failed to run `cloudflared tunnel list`")?;
+
+    if list_out.status.success() {
+        if let Ok(serde_json::Value::Array(items)) =
+            serde_json::from_slice::<serde_json::Value>(&list_out.stdout)
+        {
+            for item in &items {
+                if item["name"].as_str() == Some("shunt") {
+                    if let Some(id) = item["id"].as_str() {
+                        println!("  {} Found existing 'shunt' tunnel.", green(CHECK));
+                        return Ok(id.to_owned());
+                    }
+                }
+            }
+        }
+    }
+
+    // Create it
+    println!("  {} Creating 'shunt' tunnel…", dim("·"));
+    let create_out = Command::new("cloudflared")
+        .args(["tunnel", "create", "shunt"])
+        .stdout(Stdio::piped()).stderr(Stdio::piped())
+        .output().context("Failed to run `cloudflared tunnel create shunt`")?;
+
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&create_out.stdout),
+        String::from_utf8_lossy(&create_out.stderr),
+    );
+    if !create_out.status.success() {
+        bail!("`cloudflared tunnel create shunt` failed:\n{}", combined.trim());
+    }
+
+    // Parse "Created tunnel shunt with id <uuid>"
+    for line in combined.lines() {
+        if line.to_lowercase().contains("with id") {
+            if let Some(pos) = line.to_lowercase().find("with id") {
+                let rest = line[pos + "with id".len()..].trim();
+                if let Some(id) = rest.split_whitespace().next() {
+                    if id.len() >= 32 { return Ok(id.to_owned()); }
+                }
+            }
+        }
+    }
+
+    bail!("Could not parse tunnel ID from cloudflared output:\n{}", combined.trim())
 }
 
 fn extract_cloudflare_url(line: &str) -> Option<String> {
