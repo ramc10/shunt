@@ -1385,17 +1385,32 @@ fn auto_write_shell_export(port: u16) {
 /// Accounts are sourced directly from the remote /status JSON, not local config.
 async fn cmd_status_remote(remote_url: &str) -> Result<()> {
     let status_url = format!("{remote_url}/status");
-    let live: Option<serde_json::Value> = reqwest::Client::new()
+    let resp = reqwest::Client::new()
         .get(&status_url)
         .timeout(std::time::Duration::from_secs(10))
         .send()
-        .await.ok()
-        .and_then(|r| futures_executor_hack(r));
+        .await;
+
+    let live: Option<serde_json::Value> = match resp {
+        Ok(r) => futures_executor_hack(r),
+        Err(e) => {
+            println!();
+            println!("  {} Cannot connect to remote shunt at {}", red(CROSS), cyan(remote_url));
+            if e.is_connect() || e.is_timeout() {
+                println!("  {} Host unreachable — is the tunnel/domain still active?", dim("·"));
+            } else {
+                println!("  {} Error: {e}", dim("·"));
+            }
+            println!("  {} Run {} on the host machine to create a new share code.", dim("·"), cyan("shunt share"));
+            println!();
+            return Ok(());
+        }
+    };
 
     let Some(data) = live else {
         println!();
-        println!("  {} Cannot connect to remote shunt at {}", red(CROSS), cyan(remote_url));
-        println!("  {} The share tunnel may have expired. Run {} on the host.", dim("·"), cyan("shunt share"));
+        println!("  {} Connected to {} but got an unexpected response.", red(CROSS), cyan(remote_url));
+        println!("  {} The URL may not point to a shunt instance.", dim("·"));
         println!();
         return Ok(());
     };
