@@ -1930,8 +1930,8 @@ fn render_splash_frame(
 
     // Right: custom lines (center-aligned) or static description (right-aligned).
     let static_desc: Vec<String> = vec![
-        "Pool multiple Claude accounts".into(),
-        "behind a single endpoint.".into(),
+        "Pool multiple AI coding agent".into(),
+        "accounts behind a single endpoint.".into(),
         "Maximise rate limits across".into(),
         "all accounts automatically.".into(),
     ];
