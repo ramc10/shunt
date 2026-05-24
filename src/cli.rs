@@ -1384,20 +1384,15 @@ fn auto_write_shell_export(port: u16) {
 async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
     let mut config = crate::config::load_config(config_override.as_deref())?;
 
-    // Fetch live status: try local control port first, then fall back to
-    // ANTHROPIC_BASE_URL (set by `shunt connect` on remote machines).
-    let local_status_url = format!("http://{}:{}/status", config.server.host, config.server.control_port);
-    let mut live: Option<serde_json::Value> = reqwest::get(&local_status_url)
-        .await.ok().and_then(|r| futures_executor_hack(r));
+    // Fetch live status: if ANTHROPIC_BASE_URL is a remote shunt (set by
+    // `shunt connect`), use that; otherwise fall back to local control port.
+    let status_url = std::env::var("ANTHROPIC_BASE_URL").ok()
+        .filter(|u| !u.contains("127.0.0.1") && !u.contains("localhost"))
+        .map(|u| format!("{}/status", u.trim_end_matches('/')))
+        .unwrap_or_else(|| format!("http://{}:{}/status", config.server.host, config.server.control_port));
 
-    if live.is_none() {
-        if let Ok(remote) = std::env::var("ANTHROPIC_BASE_URL") {
-            if !remote.contains("127.0.0.1") && !remote.contains("localhost") {
-                let url = format!("{}/status", remote.trim_end_matches('/'));
-                live = reqwest::get(&url).await.ok().and_then(|r| futures_executor_hack(r));
-            }
-        }
-    }
+    let live: Option<serde_json::Value> = reqwest::get(&status_url)
+        .await.ok().and_then(|r| futures_executor_hack(r));
 
     // Back-fill missing emails (existing accounts set up before email support).
     // Fetch in parallel, persist any that are new.
@@ -2396,33 +2391,29 @@ fn strip_ansi(s: &str) -> String {
 async fn cmd_monitor(config_override: Option<PathBuf>) -> Result<()> {
     let client = reqwest::Client::new();
 
-    // Resolve base URL: prefer local control port, fall back to ANTHROPIC_BASE_URL
-    // (written by `shunt connect` on remote machines).
-    let local_base = crate::config::load_config(config_override.as_deref()).ok()
-        .map(|c| format!("http://{}:{}", c.server.host, c.server.control_port));
+    // If ANTHROPIC_BASE_URL points to a remote shunt (written by `shunt connect`),
+    // always use that — the user intends to monitor the host machine, not local.
+    let remote_base = std::env::var("ANTHROPIC_BASE_URL").ok()
+        .filter(|u| !u.contains("127.0.0.1") && !u.contains("localhost"))
+        .map(|u| u.trim_end_matches('/').to_owned());
 
-    let base_url = if let Some(ref url) = local_base {
-        let running = client.get(format!("{url}/health"))
+    let base_url = if let Some(remote) = remote_base {
+        remote
+    } else {
+        // Local mode: use the control port.
+        let config = crate::config::load_config(config_override.as_deref())?;
+        let local = format!("http://{}:{}", config.server.host, config.server.control_port);
+        let running = client.get(format!("{local}/health"))
             .timeout(std::time::Duration::from_secs(3))
             .send().await.is_ok();
-        if running { Some(url.clone()) } else { None }
-    } else {
-        None
-    };
-
-    // Fall back to remote shunt set by `shunt connect`.
-    let base_url = base_url.or_else(|| {
-        std::env::var("ANTHROPIC_BASE_URL").ok()
-            .filter(|u| !u.contains("127.0.0.1") && !u.contains("localhost"))
-            .map(|u| u.trim_end_matches('/').to_owned())
-    });
-
-    let Some(base_url) = base_url else {
-        println!();
-        println!("  {} Proxy is not running.", red(CROSS));
-        println!("  {} Start it first with {}.", dim("·"), cyan("shunt start"));
-        println!();
-        return Ok(());
+        if !running {
+            println!();
+            println!("  {} Proxy is not running.", red(CROSS));
+            println!("  {} Start it first with {}.", dim("·"), cyan("shunt start"));
+            println!();
+            return Ok(());
+        }
+        local
     };
 
     crate::monitor::run_monitor(&base_url).await
