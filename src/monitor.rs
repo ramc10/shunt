@@ -23,7 +23,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::term::{fmt_duration_ms, fmt_tokens};
+use crate::term::fmt_duration_ms;
 
 // ---------------------------------------------------------------------------
 // Status API response types (mirrors proxy.rs /status handler)
@@ -187,27 +187,6 @@ impl TimeWindow {
     fn bucket_ms(self) -> u64 { self.ms() / self.bucket_count() as u64 }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum ChartMetric {
-    Tokens,
-    Requests,
-}
-
-impl ChartMetric {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Tokens   => "tokens",
-            Self::Requests => "reqs",
-        }
-    }
-
-    fn next(self) -> Self {
-        match self {
-            Self::Tokens   => Self::Requests,
-            Self::Requests => Self::Tokens,
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Error classification
@@ -286,7 +265,6 @@ pub async fn run_monitor(base_url: &str) -> Result<()> {
     let mut refresh_ms: u64 = 1_000;
     // Interactive chart state
     let mut chart_window = TimeWindow::FiveMin;
-    let mut chart_metric = ChartMetric::Tokens;
     // Spinner frame counter for "not running" state
     let start_time = Instant::now();
 
@@ -302,7 +280,7 @@ pub async fn run_monitor(base_url: &str) -> Result<()> {
 
         terminal.draw(|f| {
             draw(f, &state, &fetch_err, scroll, base_url, &picker, show_help,
-                 refresh_ms, start_time, chart_window, chart_metric)
+                 refresh_ms, start_time, chart_window)
         })?;
 
         // Poll for key events (non-blocking, 200ms timeout)
@@ -376,10 +354,6 @@ pub async fn run_monitor(base_url: &str) -> Result<()> {
                     (KeyCode::Char('['), _) => {
                         chart_window = chart_window.prev();
                     }
-                    // m — toggle metric (tokens ↔ requests)
-                    (KeyCode::Char('m'), _) => {
-                        chart_metric = chart_metric.next();
-                    }
                     _ => {}
                 }
             }
@@ -431,7 +405,6 @@ fn draw(
     refresh_ms: u64,
     start_time: Instant,
     chart_window: TimeWindow,
-    chart_metric: ChartMetric,
 ) {
     let area = f.area();
 
@@ -448,7 +421,7 @@ fn draw(
 
     match state {
         None => draw_connecting(f, chunks[1], error, base_url, start_time),
-        Some(s) => draw_body(f, chunks[1], s, scroll, chart_window, chart_metric),
+        Some(s) => draw_body(f, chunks[1], s, scroll, chart_window),
     }
 
     draw_footer(f, chunks[2], picker.is_some(), refresh_ms);
@@ -538,9 +511,6 @@ fn draw_footer(f: &mut Frame, area: Rect, picker_open: bool, refresh_ms: u64) {
             Span::styled("t", style_green()),
             Span::styled(" time", style_dim()),
             sep(),
-            Span::styled("m", style_green()),
-            Span::styled(" metric", style_dim()),
-            sep(),
             Span::styled("+/-", style_green()),
             Span::styled(format!(" speed  {rate_str}"), style_dim()),
             sep(),
@@ -609,7 +579,6 @@ fn draw_body(
     s: &StatusResponse,
     scroll: usize,
     chart_window: TimeWindow,
-    chart_metric: ChartMetric,
 ) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
@@ -617,7 +586,7 @@ fn draw_body(
         .split(area);
 
     draw_accounts(f, chunks[0], s);
-    draw_right_panel(f, chunks[1], s, scroll, chart_window, chart_metric);
+    draw_right_panel(f, chunks[1], s, scroll, chart_window);
 }
 
 // ---------------------------------------------------------------------------
@@ -630,7 +599,6 @@ fn draw_right_panel(
     s: &StatusResponse,
     scroll: usize,
     chart_window: TimeWindow,
-    chart_metric: ChartMetric,
 ) {
     let halves = Layout::default()
         .direction(Direction::Vertical)
@@ -638,7 +606,7 @@ fn draw_right_panel(
         .split(area);
 
     draw_request_log(f, halves[0], s, scroll);
-    draw_history_chart(f, halves[1], s, chart_window, chart_metric);
+    draw_history_chart(f, halves[1], s, chart_window);
 }
 
 fn draw_accounts(f: &mut Frame, area: Rect, s: &StatusResponse) {
@@ -765,7 +733,6 @@ fn draw_history_chart(
     area: Rect,
     s: &StatusResponse,
     window: TimeWindow,
-    metric: ChartMetric,
 ) {
     // Build a title row that doubles as the time-window selector.
     // Highlight the active window in green, others dimmed.
@@ -786,22 +753,10 @@ fn draw_history_chart(
             title_spans.push(Span::styled(format!(" {} ", w.label()), style_dim()));
         }
     }
-    title_spans.push(Span::styled("  ·  ", style_dim()));
-    // Metric toggle indicator
-    for m in [ChartMetric::Tokens, ChartMetric::Requests] {
-        if m == metric {
-            title_spans.push(Span::styled(
-                format!("[{}]", m.label()),
-                Style::default().fg(YELLOW).add_modifier(Modifier::BOLD),
-            ));
-        } else {
-            title_spans.push(Span::styled(format!(" {} ", m.label()), style_dim()));
-        }
-    }
 
     let block = Block::default()
         .title(Line::from(title_spans))
-        .borders(Borders::TOP)
+        .borders(Borders::NONE)
         .border_style(style_dkgreen());
 
     let inner = block.inner(area);
@@ -839,11 +794,7 @@ fn draw_history_chart(
         if let Some(idx) = acc_idx {
             // bucket 0 = oldest, bucket n-1 = newest
             let b = (n_buckets - 1).saturating_sub((age_ms / bucket_ms) as usize);
-            let val = match metric {
-                ChartMetric::Tokens   => (req.input_tokens + req.output_tokens) as f64,
-                ChartMetric::Requests => 1.0,
-            };
-            account_buckets[idx][b] += val;
+            account_buckets[idx][b] += 1.0;
         }
     }
 
@@ -876,7 +827,7 @@ fn draw_history_chart(
 
     if active_datasets.is_empty() {
         let msg = Line::from(Span::styled(
-            format!("  no {} in the last {}", metric.label(), window.label()),
+            format!("  no requests in the last {}", window.label()),
             style_dim(),
         ));
         f.render_widget(Paragraph::new(msg), inner);
@@ -905,8 +856,8 @@ fn draw_history_chart(
     ];
 
     // Y-axis labels: 0 at bottom, max at top
-    let y_top_label = fmt_metric_val(max_val, metric);
-    let y_mid_label = fmt_metric_val(max_val / 2.0, metric);
+    let y_top_label = format!("{:.0}", max_val);
+    let y_mid_label = format!("{:.0}", max_val / 2.0);
     let y_labels = vec![
         Span::styled("0", style_dim()),
         Span::styled(y_mid_label, style_dim()),
@@ -941,21 +892,6 @@ fn fmt_secs_label(secs: f64) -> String {
     }
 }
 
-/// Format a metric value compactly for the y-axis label.
-fn fmt_metric_val(v: f64, metric: ChartMetric) -> String {
-    match metric {
-        ChartMetric::Requests => format!("{:.0}", v),
-        ChartMetric::Tokens => {
-            if v >= 1_000_000.0 {
-                format!("{:.1}M", v / 1_000_000.0)
-            } else if v >= 1_000.0 {
-                format!("{:.0}k", v / 1_000.0)
-            } else {
-                format!("{:.0}", v)
-            }
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Request log (right panel — unchanged)
@@ -981,7 +917,8 @@ fn draw_request_log(f: &mut Frame, area: Rect, s: &StatusResponse, scroll: usize
             Span::styled(" requests", style_dim()),
             Span::styled(rate_str, style_dim()),
         ]))
-        .borders(Borders::NONE);
+        .borders(Borders::BOTTOM)
+        .border_style(style_dkgreen());
 
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -996,8 +933,6 @@ fn draw_request_log(f: &mut Frame, area: Rect, s: &StatusResponse, scroll: usize
         Cell::from(Span::styled("time", style_dim())),
         Cell::from(Span::styled("account", style_dim())),
         Cell::from(Span::styled("model", style_dim())),
-        Cell::from(Span::styled("in", style_dim())),
-        Cell::from(Span::styled("out", style_dim())),
         Cell::from(Span::styled("dur", style_dim())),
     ]).height(1);
 
@@ -1016,8 +951,6 @@ fn draw_request_log(f: &mut Frame, area: Rect, s: &StatusResponse, scroll: usize
                 Cell::from(Span::styled(time_str, style_dim())),
                 Cell::from(Span::styled(&r.account, style_green())),
                 Cell::from(Span::styled(model_short, style_cyan())),
-                Cell::from(Span::styled(fmt_tokens(r.input_tokens), style_white())),
-                Cell::from(Span::styled(fmt_tokens(r.output_tokens), style_white())),
                 Cell::from(Span::styled(fmt_dur_short(r.duration_ms), style_dim())),
             ])
         })
@@ -1027,8 +960,6 @@ fn draw_request_log(f: &mut Frame, area: Rect, s: &StatusResponse, scroll: usize
         Constraint::Length(8),
         Constraint::Length(12),
         Constraint::Min(16),
-        Constraint::Length(7),
-        Constraint::Length(7),
         Constraint::Length(7),
     ];
 
@@ -1097,7 +1028,6 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
         ("-",        "slower refresh rate"),
         ("t / ]",   "next time window"),
         ("[",        "prev time window"),
-        ("m",        "toggle tokens/requests"),
         ("?",        "toggle this help"),
         ("any key",  "close help"),
     ];
