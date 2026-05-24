@@ -3188,11 +3188,8 @@ fn cf_api_get_token(config_p: &std::path::Path) -> Result<String> {
     println!("  {}   Account → Cloudflare Tunnel: Edit", dim("·"));
     println!("  {}   Zone → DNS: Edit  (for your domain's zone)", dim("·"));
     println!();
-    print!("  Token: ");
-    std::io::stdout().flush()?;
-    let mut token = String::new();
-    std::io::stdin().read_line(&mut token)?;
-    let token = token.trim().to_string();
+    let token = rpassword::prompt_password("  Token: ")
+        .context("Failed to read token")?;
     if token.is_empty() { bail!("No API token entered."); }
 
     // save to config
