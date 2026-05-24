@@ -2938,8 +2938,8 @@ async fn cmd_share(config_override: Option<PathBuf>, tunnel: bool, stop: bool) -
                 domain
             };
 
-            // Steps 3-7: auto-setup DNS + start named tunnel
-            start_named_cloudflare_tunnel(&domain, port)?;
+            // Steps 2-6: auto-setup DNS + start named tunnel (fully CLI, no browser)
+            start_named_cloudflare_tunnel(&domain, port, &config_p)?;
 
             share_and_print(&domain, &key, &relay_url, "Permanent tunnel active", &[
                 format!("  {} Code expires in 10 minutes — one-time use", dim("·")),
@@ -3081,84 +3081,70 @@ fn start_cloudflare_tunnel(port: u16) -> Result<String> {
     bail!("cloudflared exited before providing a tunnel URL")
 }
 
-/// Set up and run a named Cloudflare tunnel for a custom domain (permanent sharing).
+/// Set up and run a named Cloudflare tunnel via the Cloudflare API — no browser required.
 ///
-/// Steps:
-///   1. Login if ~/.cloudflared/cert.pem is absent.
-///   2. Find or create the "shunt" tunnel, capturing its UUID.
-///   3. Route DNS (idempotent — "already exists" errors are ignored).
-///   4. Write ~/.cloudflared/config.yml.
-///   5. Spawn `cloudflared tunnel run`, scan stderr for "registered", then return.
-fn start_named_cloudflare_tunnel(domain: &str, port: u16) -> Result<()> {
+/// Steps (all CLI, no browser dropoff):
+///   1. Prompt for / load Cloudflare API token (saved to config for reuse).
+///   2. Resolve account ID and zone ID via the API.
+///   3. Find or create the "shunt" tunnel via API → write credentials JSON.
+///   4. Create DNS CNAME record via API (idempotent).
+///   5. Write ~/.cloudflared/config.yml.
+///   6. Start `cloudflared tunnel run`, wait for "registered", return.
+fn start_named_cloudflare_tunnel(domain: &str, port: u16, config_p: &std::path::Path) -> Result<()> {
     use std::io::{BufRead, BufReader};
     use std::process::{Command, Stdio};
 
     let bin = ensure_cloudflared()?;
     let home = dirs::home_dir().context("Cannot find home directory")?;
     let cf_dir = home.join(".cloudflared");
+    std::fs::create_dir_all(&cf_dir)?;
 
-    // ── Step 1: login if cert.pem is absent ─────────────────────────────────
-    if !cf_dir.join("cert.pem").exists() {
-        println!();
-        println!("  {} No Cloudflare credentials found. Opening browser for login…", dim("·"));
-        println!();
-        let status = Command::new(&bin)
-            .args(["tunnel", "login"])
-            .status()
-            .context("Failed to run `cloudflared tunnel login`")?;
-        if !status.success() {
-            bail!("`cloudflared tunnel login` failed (exit {:?})", status.code());
-        }
-    }
-
-    // ── Step 2: find or create "shunt" tunnel ───────────────────────────────
-    let tunnel_id = cloudflared_find_or_create_tunnel(&bin)?;
-    println!("  {} Tunnel ID: {}", dim("·"), dim(&tunnel_id));
-
-    // ── Step 3: route DNS (idempotent) ──────────────────────────────────────
     let hostname = domain
         .trim_start_matches("https://")
         .trim_start_matches("http://")
         .trim_end_matches('/');
 
-    println!("  {} Routing DNS for {}…", dim("·"), cyan(hostname));
-    let dns_out = Command::new(&bin)
-        .args(["tunnel", "route", "dns", "shunt", hostname])
-        .output()
-        .context("Failed to run `cloudflared tunnel route dns`")?;
-    if !dns_out.status.success() {
-        let stderr_text = String::from_utf8_lossy(&dns_out.stderr);
-        if !stderr_text.to_lowercase().contains("already exists") {
-            bail!("`cloudflared tunnel route dns` failed:\n{}", stderr_text.trim());
-        }
-    }
-    println!("  {} DNS route OK.", green(CHECK));
+    // ── Step 1: get API token ────────────────────────────────────────────────
+    let token = cf_api_get_token(config_p)?;
 
-    // ── Step 4: write ~/.cloudflared/config.yml ──────────────────────────────
-    let creds_file = cf_dir.join(format!("{tunnel_id}.json"));
+    // ── Step 2: resolve account + zone ──────────────────────────────────────
+    print!("  {} Resolving Cloudflare account…", dim("·"));
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    let account_id = cf_api_get_account_id(&token)?;
+    println!(" {}", green(CHECK));
+
+    let root_domain = hostname.splitn(2, '.').nth(1).unwrap_or(hostname);
+    print!("  {} Resolving zone for {}…", dim("·"), dim(root_domain));
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    let zone_id = cf_api_get_zone_id(&token, root_domain)?;
+    println!(" {}", green(CHECK));
+
+    // ── Step 3: find or create "shunt" tunnel ───────────────────────────────
+    let creds_path = cf_dir.join("shunt-creds.json");
+    let tunnel_id = cf_api_find_or_create_tunnel(&token, &account_id, &creds_path)?;
+    println!("  {} Tunnel: {}", dim("·"), dim(&tunnel_id));
+
+    // ── Step 4: create / update DNS CNAME ───────────────────────────────────
+    print!("  {} Setting DNS CNAME for {}…", dim("·"), cyan(hostname));
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    cf_api_upsert_dns(&token, &zone_id, hostname, &tunnel_id)?;
+    println!(" {}", green(CHECK));
+
+    // ── Step 5: write cloudflared config ────────────────────────────────────
     let config_yml = cf_dir.join("config.yml");
     std::fs::write(&config_yml, format!(
-        "tunnel: shunt\n\
-         credentials-file: {creds}\n\
-         ingress:\n  \
-           - hostname: {hostname}\n    \
-             service: http://127.0.0.1:{port}\n  \
-           - service: http_status:404\n",
-        creds = creds_file.display(),
+        "tunnel: shunt\ncredentials-file: {creds}\ningress:\n  - hostname: {hostname}\n    service: http://127.0.0.1:{port}\n  - service: http_status:404\n",
+        creds = creds_path.display(),
     )).context("Failed to write ~/.cloudflared/config.yml")?;
-    println!("  {} Config written.", green(CHECK));
 
-    // ── Step 5: launch and wait for "registered" ────────────────────────────
-    println!("  {} Starting named tunnel…", dim("·"));
+    // ── Step 6: launch tunnel and wait for "registered" ─────────────────────
+    println!("  {} Starting tunnel…", dim("·"));
     let mut child = Command::new(&bin)
-        .args(["tunnel", "run", "--config",
-               &config_yml.to_string_lossy(), "shunt"])
-        .stderr(Stdio::piped())
-        .stdout(Stdio::null())
-        .spawn()
-        .context("Failed to spawn `cloudflared tunnel run`")?;
+        .args(["tunnel", "run", "--config", &config_yml.to_string_lossy(), "shunt"])
+        .stderr(Stdio::piped()).stdout(Stdio::null())
+        .spawn().context("Failed to spawn cloudflared")?;
 
-    let stderr = child.stderr.take().expect("stderr piped");
+    let stderr = child.stderr.take().expect("piped");
     for line in BufReader::new(stderr).lines() {
         let line = line?;
         let lower = line.to_lowercase();
@@ -3169,67 +3155,182 @@ fn start_named_cloudflare_tunnel(domain: &str, port: u16) -> Result<()> {
             return Ok(());
         }
         if lower.contains("error") || lower.contains("failed") {
-            eprintln!("  {} cloudflared: {}", yellow("!"), dim(&line));
+            eprintln!("  {} {}", yellow("!"), dim(&line));
         }
     }
-
-    bail!("`cloudflared tunnel run` exited before the tunnel became ready")
+    bail!("cloudflared exited before the tunnel became ready")
 }
 
-/// Find an existing "shunt" tunnel or create one, returning its UUID.
-fn cloudflared_find_or_create_tunnel(bin: &str) -> Result<String> {
-    use std::process::{Command, Stdio};
-
-    // List existing tunnels
-    let list_out = Command::new(bin)
-        .args(["tunnel", "list", "--output", "json"])
-        .stdout(Stdio::piped()).stderr(Stdio::null())
-        .output().context("Failed to run `cloudflared tunnel list`")?;
-
-    if list_out.status.success() {
-        if let Ok(serde_json::Value::Array(items)) =
-            serde_json::from_slice::<serde_json::Value>(&list_out.stdout)
-        {
-            for item in &items {
-                if item["name"].as_str() == Some("shunt") {
-                    if let Some(id) = item["id"].as_str() {
-                        println!("  {} Found existing 'shunt' tunnel.", green(CHECK));
-                        return Ok(id.to_owned());
-                    }
+/// Prompt for a Cloudflare API token, or load from config / env var.
+/// Saves newly entered tokens to the shunt config for reuse.
+fn cf_api_get_token(config_p: &std::path::Path) -> Result<String> {
+    // env var takes priority
+    if let Ok(t) = std::env::var("CLOUDFLARE_API_TOKEN") {
+        if !t.is_empty() { return Ok(t); }
+    }
+    // saved in shunt config
+    if let Ok(text) = std::fs::read_to_string(config_p) {
+        for line in text.lines() {
+            let line = line.trim();
+            if line.starts_with("cloudflare_api_token") {
+                if let Some(v) = line.splitn(2, '=').nth(1) {
+                    let t = v.trim().trim_matches('"').to_string();
+                    if !t.is_empty() { return Ok(t); }
                 }
             }
         }
     }
+    // prompt
+    use std::io::Write;
+    println!();
+    println!("  {} A Cloudflare API token is needed to create the tunnel and DNS record.", dim("·"));
+    println!("  {} Create one at {} with permissions:", dim("·"), cyan("https://dash.cloudflare.com/profile/api-tokens"));
+    println!("  {}   Account → Cloudflare Tunnel: Edit", dim("·"));
+    println!("  {}   Zone → DNS: Edit  (for your domain's zone)", dim("·"));
+    println!();
+    print!("  Token: ");
+    std::io::stdout().flush()?;
+    let mut token = String::new();
+    std::io::stdin().read_line(&mut token)?;
+    let token = token.trim().to_string();
+    if token.is_empty() { bail!("No API token entered."); }
 
-    // Create it
-    println!("  {} Creating 'shunt' tunnel…", dim("·"));
-    let create_out = Command::new(bin)
-        .args(["tunnel", "create", "shunt"])
-        .stdout(Stdio::piped()).stderr(Stdio::piped())
-        .output().context("Failed to run `cloudflared tunnel create shunt`")?;
+    // save to config
+    let mut text = std::fs::read_to_string(config_p).unwrap_or_default();
+    text = insert_into_server_section(&text, &format!("cloudflare_api_token = \"{token}\""));
+    std::fs::write(config_p, &text)?;
+    println!("  {} Token saved to config.", green(CHECK));
+    Ok(token)
+}
 
-    let combined = format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&create_out.stdout),
-        String::from_utf8_lossy(&create_out.stderr),
-    );
-    if !create_out.status.success() {
-        bail!("`cloudflared tunnel create shunt` failed:\n{}", combined.trim());
+fn cf_api<T: serde::de::DeserializeOwned>(
+    token: &str, method: &str, path: &str,
+    body: Option<serde_json::Value>,
+) -> Result<T> {
+    let url = format!("https://api.cloudflare.com/client/v4{path}");
+    let client = reqwest::blocking::Client::new();
+    let req = match method {
+        "GET"    => client.get(&url),
+        "POST"   => client.post(&url),
+        "PUT"    => client.put(&url),
+        "PATCH"  => client.patch(&url),
+        "DELETE" => client.delete(&url),
+        m => bail!("Unknown HTTP method: {m}"),
+    };
+    let req = req.bearer_auth(token).header("Content-Type", "application/json");
+    let req = if let Some(b) = body { req.json(&b) } else { req };
+    let resp: serde_json::Value = req.send()?.json()?;
+    if !resp["success"].as_bool().unwrap_or(false) {
+        let errs = resp["errors"].to_string();
+        bail!("Cloudflare API error: {errs}");
     }
+    serde_json::from_value(resp["result"].clone()).context("Failed to parse Cloudflare API response")
+}
 
-    // Parse "Created tunnel shunt with id <uuid>"
-    for line in combined.lines() {
-        if line.to_lowercase().contains("with id") {
-            if let Some(pos) = line.to_lowercase().find("with id") {
-                let rest = line[pos + "with id".len()..].trim();
-                if let Some(id) = rest.split_whitespace().next() {
-                    if id.len() >= 32 { return Ok(id.to_owned()); }
-                }
-            }
+fn cf_api_get_account_id(token: &str) -> Result<String> {
+    let accounts: serde_json::Value = cf_api(token, "GET", "/accounts?per_page=1", None)?;
+    accounts.as_array()
+        .and_then(|a| a.first())
+        .and_then(|a| a["id"].as_str())
+        .map(|s| s.to_owned())
+        .context("No Cloudflare accounts found for this token")
+}
+
+fn cf_api_get_zone_id(token: &str, root_domain: &str) -> Result<String> {
+    let zones: serde_json::Value = cf_api(token, "GET",
+        &format!("/zones?name={root_domain}&per_page=1"), None)?;
+    zones.as_array()
+        .and_then(|a| a.first())
+        .and_then(|z| z["id"].as_str())
+        .map(|s| s.to_owned())
+        .with_context(|| format!("Zone '{root_domain}' not found — is this domain on Cloudflare?"))
+}
+
+fn cf_api_find_or_create_tunnel(
+    token: &str, account_id: &str, creds_path: &std::path::Path,
+) -> Result<String> {
+    // Search for existing "shunt" tunnel
+    let tunnels: serde_json::Value = cf_api(token, "GET",
+        &format!("/accounts/{account_id}/cfd_tunnel?name=shunt&per_page=10&is_deleted=false"), None)?;
+
+    if let Some(existing) = tunnels.as_array().and_then(|a| a.iter().find(|t| t["name"] == "shunt")) {
+        let id = existing["id"].as_str().context("Tunnel has no id")?.to_owned();
+        println!("  {} Found existing 'shunt' tunnel.", green(CHECK));
+        // Write a minimal creds file if not present (tunnel run needs it)
+        if !creds_path.exists() {
+            let account_tag = existing["account_tag"].as_str().unwrap_or(account_id);
+            let creds = serde_json::json!({
+                "AccountTag": account_tag,
+                "TunnelID": id,
+                "TunnelName": "shunt"
+            });
+            std::fs::write(creds_path, creds.to_string())?;
         }
+        return Ok(id);
     }
 
-    bail!("Could not parse tunnel ID from cloudflared output:\n{}", combined.trim())
+    // Create new tunnel — generate a random 32-byte secret
+    print!("  {} Creating 'shunt' tunnel…", dim("·"));
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    let secret_bytes = crate::oauth::rand_bytes::<32>();
+    let secret_b64 = base64_encode(&secret_bytes);
+
+    let resp: serde_json::Value = cf_api(token, "POST",
+        &format!("/accounts/{account_id}/cfd_tunnel"),
+        Some(serde_json::json!({"name": "shunt", "tunnel_secret": secret_b64})))?;
+
+    let tunnel_id = resp["id"].as_str().context("No tunnel id in response")?.to_owned();
+    let account_tag = resp["account_tag"].as_str().unwrap_or(account_id);
+    println!(" {}", green(CHECK));
+
+    // Write credentials file
+    let creds = serde_json::json!({
+        "AccountTag":   account_tag,
+        "TunnelSecret": secret_b64,
+        "TunnelID":     tunnel_id,
+        "TunnelName":   "shunt"
+    });
+    std::fs::write(creds_path, creds.to_string())?;
+
+    Ok(tunnel_id)
+}
+
+fn cf_api_upsert_dns(token: &str, zone_id: &str, hostname: &str, tunnel_id: &str) -> Result<()> {
+    let content = format!("{tunnel_id}.cfargotunnel.com");
+
+    // Check if record already exists
+    let records: serde_json::Value = cf_api(token, "GET",
+        &format!("/zones/{zone_id}/dns_records?type=CNAME&name={hostname}&per_page=1"), None)?;
+
+    if let Some(record) = records.as_array().and_then(|a| a.first()) {
+        let record_id = record["id"].as_str().context("DNS record has no id")?;
+        cf_api::<serde_json::Value>(token, "PATCH",
+            &format!("/zones/{zone_id}/dns_records/{record_id}"),
+            Some(serde_json::json!({"content": content, "proxied": true})))?;
+    } else {
+        cf_api::<serde_json::Value>(token, "POST",
+            &format!("/zones/{zone_id}/dns_records"),
+            Some(serde_json::json!({"type": "CNAME", "name": hostname, "content": content, "proxied": true})))?;
+    }
+    Ok(())
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    // simple base64 without external dep — use the alphabet
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[((n >> 18) & 63) as usize] as char);
+        out.push(ALPHABET[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 { ALPHABET[((n >> 6) & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { ALPHABET[(n & 63) as usize] as char } else { '=' });
+    }
+    out
 }
 
 fn extract_cloudflare_url(line: &str) -> Option<String> {
