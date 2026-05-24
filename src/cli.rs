@@ -143,6 +143,14 @@ enum Command {
         /// Share code printed by `shunt share` on the host
         code: String,
     },
+    /// Disconnect from a remote shunt instance
+    ///
+    /// Removes ANTHROPIC_BASE_URL and ANTHROPIC_API_KEY written by `shunt connect`
+    /// from your shell profile and ~/.claude/settings.json.
+    ///
+    /// Examples:
+    ///   shunt disconnect
+    Disconnect,
     /// Update shunt to the latest release
     Update,
     /// Completely remove shunt — stops service, deletes config, removes binary
@@ -197,6 +205,7 @@ pub async fn run() -> Result<()> {
         Command::Monitor { config } => cmd_monitor(config).await,
         Command::Remote { code } => cmd_remote(code).await,
         Command::Connect { code } => cmd_connect(code).await,
+        Command::Disconnect => cmd_disconnect().await,
         Command::Update => cmd_update().await,
         Command::Share { config, tunnel, stop } => cmd_share(config, tunnel, stop).await,
         Command::Uninstall => cmd_uninstall().await,
@@ -3468,6 +3477,87 @@ async fn cmd_connect(code: String) -> Result<()> {
             .unwrap_or_else(|| "source ~/.zshrc".to_string()).as_str()));
     println!();
 
+    Ok(())
+}
+
+async fn cmd_disconnect() -> Result<()> {
+    print_splash(&[
+        format!("{}  {}", brand_green("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
+        dim("Disconnecting from remote shunt…").to_string(),
+        String::new(),
+    ]);
+
+    let mut any = false;
+
+    // 1. Shell profile — strip ANTHROPIC_BASE_URL and ANTHROPIC_API_KEY lines
+    //    written by `shunt connect` (remote URLs, not localhost ones).
+    if let Some(profile) = detect_shell_profile() {
+        if let Ok(contents) = std::fs::read_to_string(&profile) {
+            let needs_clean = contents.lines().any(|l| {
+                (l.contains("ANTHROPIC_BASE_URL") && !l.contains("127.0.0.1") && !l.contains("localhost"))
+                    || l.contains("ANTHROPIC_API_KEY")
+                    || l.trim() == "# Added by shunt connect"
+            });
+            if needs_clean {
+                let cleaned: String = contents
+                    .lines()
+                    .filter(|l| {
+                        let is_remote_url = l.contains("ANTHROPIC_BASE_URL")
+                            && !l.contains("127.0.0.1")
+                            && !l.contains("localhost");
+                        let is_api_key = l.contains("ANTHROPIC_API_KEY");
+                        let is_comment = l.trim() == "# Added by shunt connect";
+                        !is_remote_url && !is_api_key && !is_comment
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let cleaned = if contents.ends_with('\n') {
+                    format!("{cleaned}\n")
+                } else {
+                    cleaned
+                };
+                std::fs::write(&profile, cleaned)?;
+                println!("  {} Removed from {}", green(CHECK), dim(&profile.display().to_string()));
+                any = true;
+            }
+        }
+    }
+
+    // 2. ~/.claude/settings.json — remove the env keys written by `shunt connect`.
+    let home = dirs::home_dir().context("Cannot find home directory")?;
+    let settings_path = home.join(".claude").join("settings.json");
+    if settings_path.exists() {
+        let text = std::fs::read_to_string(&settings_path)?;
+        let mut root: serde_json::Value = serde_json::from_str(&text)
+            .unwrap_or(serde_json::Value::Object(Default::default()));
+        let mut changed = false;
+        if let Some(env_obj) = root.get_mut("env").and_then(|e| e.as_object_mut()) {
+            // Only remove ANTHROPIC_BASE_URL if it points at a remote host
+            if let Some(url) = env_obj.get("ANTHROPIC_BASE_URL").and_then(|v| v.as_str()) {
+                if !url.contains("127.0.0.1") && !url.contains("localhost") {
+                    env_obj.remove("ANTHROPIC_BASE_URL");
+                    changed = true;
+                }
+            }
+            if env_obj.remove("ANTHROPIC_API_KEY").is_some() {
+                changed = true;
+            }
+        }
+        if changed {
+            std::fs::write(&settings_path, serde_json::to_string_pretty(&root)?)?;
+            println!("  {} Removed from {}", green(CHECK), dim(&settings_path.display().to_string()));
+            any = true;
+        }
+    }
+
+    if !any {
+        println!("  {} Nothing to remove — no remote connection found.", dim("·"));
+    }
+
+    println!();
+    println!("  {} Run {} to clear the current shell session.", dim("·"),
+        cyan("unset ANTHROPIC_BASE_URL ANTHROPIC_API_KEY"));
+    println!();
     Ok(())
 }
 
