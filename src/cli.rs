@@ -1384,10 +1384,20 @@ fn auto_write_shell_export(port: u16) {
 async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
     let mut config = crate::config::load_config(config_override.as_deref())?;
 
-    // Fetch live status from the control plane (sees all accounts).
-    let live: Option<serde_json::Value> = reqwest::get(
-        format!("http://{}:{}/status", config.server.host, config.server.control_port)
-    ).await.ok().and_then(|r| futures_executor_hack(r));
+    // Fetch live status: try local control port first, then fall back to
+    // ANTHROPIC_BASE_URL (set by `shunt connect` on remote machines).
+    let local_status_url = format!("http://{}:{}/status", config.server.host, config.server.control_port);
+    let mut live: Option<serde_json::Value> = reqwest::get(&local_status_url)
+        .await.ok().and_then(|r| futures_executor_hack(r));
+
+    if live.is_none() {
+        if let Ok(remote) = std::env::var("ANTHROPIC_BASE_URL") {
+            if !remote.contains("127.0.0.1") && !remote.contains("localhost") {
+                let url = format!("{}/status", remote.trim_end_matches('/'));
+                live = reqwest::get(&url).await.ok().and_then(|r| futures_executor_hack(r));
+            }
+        }
+    }
 
     // Back-fill missing emails (existing accounts set up before email support).
     // Fetch in parallel, persist any that are new.
@@ -2384,23 +2394,36 @@ fn strip_ansi(s: &str) -> String {
 // ---------------------------------------------------------------------------
 
 async fn cmd_monitor(config_override: Option<PathBuf>) -> Result<()> {
-    let config = crate::config::load_config(config_override.as_deref())?;
-    let base_url = format!("http://{}:{}", config.server.host, config.server.control_port);
+    let client = reqwest::Client::new();
 
-    // Quick check: is the proxy running? Hard 3-second timeout so we don't hang.
-    let running = reqwest::Client::new()
-        .get(format!("{base_url}/health"))
-        .timeout(std::time::Duration::from_secs(3))
-        .send()
-        .await
-        .is_ok();
-    if !running {
+    // Resolve base URL: prefer local control port, fall back to ANTHROPIC_BASE_URL
+    // (written by `shunt connect` on remote machines).
+    let local_base = crate::config::load_config(config_override.as_deref()).ok()
+        .map(|c| format!("http://{}:{}", c.server.host, c.server.control_port));
+
+    let base_url = if let Some(ref url) = local_base {
+        let running = client.get(format!("{url}/health"))
+            .timeout(std::time::Duration::from_secs(3))
+            .send().await.is_ok();
+        if running { Some(url.clone()) } else { None }
+    } else {
+        None
+    };
+
+    // Fall back to remote shunt set by `shunt connect`.
+    let base_url = base_url.or_else(|| {
+        std::env::var("ANTHROPIC_BASE_URL").ok()
+            .filter(|u| !u.contains("127.0.0.1") && !u.contains("localhost"))
+            .map(|u| u.trim_end_matches('/').to_owned())
+    });
+
+    let Some(base_url) = base_url else {
         println!();
         println!("  {} Proxy is not running.", red(CROSS));
         println!("  {} Start it first with {}.", dim("·"), cyan("shunt start"));
         println!();
         return Ok(());
-    }
+    };
 
     crate::monitor::run_monitor(&base_url).await
 }
