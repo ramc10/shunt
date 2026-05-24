@@ -49,9 +49,14 @@ echo "Downloading $BIN $VERSION for $TARGET..."
 curl -fsSL "$URL" -o "$TMP/$ARCHIVE"
 LANG=C tar -xzf "$TMP/$ARCHIVE" -C "$TMP"
 
-# Install binary
+# Install binary (tarball extracts into a versioned subdirectory)
 mkdir -p "$INSTALL_DIR"
-cp "$TMP/$BIN" "$INSTALL_DIR/$BIN"
+BIN_SRC="$(find "$TMP" -type f -name "$BIN" | head -1)"
+if [ -z "$BIN_SRC" ]; then
+  echo "Binary not found in archive." >&2
+  exit 1
+fi
+cp "$BIN_SRC" "$INSTALL_DIR/$BIN"
 chmod +x "$INSTALL_DIR/$BIN"
 
 # macOS: remove quarantine and ad-hoc sign so Gatekeeper allows unsigned binaries
