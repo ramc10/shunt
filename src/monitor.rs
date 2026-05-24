@@ -616,18 +616,19 @@ fn draw_body(
         .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
         .split(area);
 
-    draw_left_panel(f, chunks[0], s, chart_window, chart_metric);
-    draw_request_log(f, chunks[1], s, scroll);
+    draw_accounts(f, chunks[0], s);
+    draw_right_panel(f, chunks[1], s, scroll, chart_window, chart_metric);
 }
 
 // ---------------------------------------------------------------------------
-// Left panel: accounts list (top) + history chart (bottom)
+// Right panel: request log (top) + history chart (bottom)
 // ---------------------------------------------------------------------------
 
-fn draw_left_panel(
+fn draw_right_panel(
     f: &mut Frame,
     area: Rect,
     s: &StatusResponse,
+    scroll: usize,
     chart_window: TimeWindow,
     chart_metric: ChartMetric,
 ) {
@@ -636,7 +637,7 @@ fn draw_left_panel(
         .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
         .split(area);
 
-    draw_accounts(f, halves[0], s);
+    draw_request_log(f, halves[0], s, scroll);
     draw_history_chart(f, halves[1], s, chart_window, chart_metric);
 }
 
@@ -645,7 +646,7 @@ fn draw_accounts(f: &mut Frame, area: Rect, s: &StatusResponse) {
         .title(Line::from(vec![
             Span::styled(" accounts", style_dim()),
         ]))
-        .borders(Borders::RIGHT | Borders::BOTTOM)
+        .borders(Borders::RIGHT)
         .border_style(style_dkgreen());
 
     let inner = block.inner(area);
@@ -800,7 +801,7 @@ fn draw_history_chart(
 
     let block = Block::default()
         .title(Line::from(title_spans))
-        .borders(Borders::RIGHT | Borders::TOP)
+        .borders(Borders::TOP)
         .border_style(style_dkgreen());
 
     let inner = block.inner(area);
