@@ -18,6 +18,7 @@ use crate::provider::Provider;
 use crate::quota;
 use crate::router;
 use crate::state::StateStore;
+use crate::telemetry::TelemetryClient;
 
 #[derive(Clone)]
 struct AppState {
@@ -39,10 +40,12 @@ struct AppState {
     /// If set, /v1/chat/completions requests are translated and forwarded here
     /// (the Anthropic proxy base URL, e.g. "http://127.0.0.1:8082").
     anthropic_base_url: Option<String>,
+    /// Optional relay-server telemetry client.
+    telemetry: Option<TelemetryClient>,
 }
 
 pub fn create_app(config: Config) -> anyhow::Result<Router> {
-    let (app, _) = create_app_with_state(config, StateStore::load(&state_path()), None)?;
+    let (app, _, _) = create_app_with_state(config, StateStore::load(&state_path()), None)?;
     Ok(app)
 }
 
@@ -74,6 +77,10 @@ fn build_app_state(
             .collect::<HashMap<_, _>>(),
     ));
 
+    let telemetry = config.server.telemetry_url.as_deref().map(|url| {
+        TelemetryClient::new(url, config.server.telemetry_token.clone(), config.server.instance_name.clone())
+    });
+
     let app_state = AppState {
         config: Arc::new(config),
         forwarder: Arc::new(forwarder),
@@ -82,6 +89,7 @@ fn build_app_state(
         refresh_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         started_ms: now_ms(),
         anthropic_base_url,
+        telemetry,
     };
 
     Ok((app_state, credentials))
@@ -129,8 +137,9 @@ pub fn create_app_with_state(
     config: Config,
     state: StateStore,
     anthropic_base_url: Option<String>,
-) -> anyhow::Result<(Router, LiveCredentials)> {
+) -> anyhow::Result<(Router, LiveCredentials, Option<TelemetryClient>)> {
     let (app_state, credentials) = build_app_state(config, state, anthropic_base_url)?;
+    let telemetry = app_state.telemetry.clone();
 
     let app = Router::new()
         // Management routes
@@ -145,7 +154,49 @@ pub fn create_app_with_state(
         .fallback(proxy_handler)
         .with_state(app_state);
 
-    Ok((app, credentials))
+    Ok((app, credentials, telemetry))
+}
+
+/// Build a status JSON snapshot from config + state — used by the heartbeat loop.
+pub fn build_status_snapshot(config: &Config, state: &StateStore, started_ms: u64) -> serde_json::Value {
+    let account_states = state.account_states();
+    let quotas         = state.quota_snapshot();
+    let rate_limits    = state.rate_limit_snapshot();
+
+    let accounts: Vec<_> = config.accounts.iter().map(|a| {
+        let st            = account_states.get(&a.name);
+        let rl            = rate_limits.get(&a.name);
+        let utilization_5h = rl.and_then(|r| r.utilization_5h).unwrap_or(0.0);
+        let utilization_7d = rl.and_then(|r| r.utilization_7d).unwrap_or(0.0);
+        let reset_5h       = rl.and_then(|r| r.reset_5h);
+        let reset_7d       = rl.and_then(|r| r.reset_7d);
+        let disabled       = st.map(|s| s.disabled).unwrap_or(false);
+        let auth_failed    = st.map(|s| s.auth_failed).unwrap_or(false);
+        let cooldown_until_ms = st.map(|s| s.cooldown_until_ms).unwrap_or(0);
+        let available      = state.is_available(&a.name);
+        let email          = a.credential.as_ref().and_then(|c| c.email()).map(|e| e.to_owned());
+
+        json!({
+            "name": a.name,
+            "email": email,
+            "provider": a.provider.to_string(),
+            "available": available,
+            "disabled": disabled,
+            "auth_failed": auth_failed,
+            "cooldown_until_ms": cooldown_until_ms,
+            "utilization_5h": utilization_5h,
+            "reset_5h": reset_5h,
+            "utilization_7d": utilization_7d,
+            "reset_7d": reset_7d,
+        })
+    }).collect();
+
+    json!({
+        "started_ms": started_ms,
+        "accounts": accounts,
+        "pinned_account": state.get_pinned(),
+        "last_used_account": state.get_last_used(),
+    })
 }
 
 async fn health() -> impl IntoResponse {
@@ -485,7 +536,7 @@ async fn proxy_handler(
                     // Got Anthropic response; client expects OpenAI.
                     translate_response_anthropic_to_openai(response).await
                 };
-                return Ok(tap_usage(response, &s.state, &account_name, &log_model, req_start_ms).await);
+                return Ok(tap_usage(response, &s.state, s.telemetry.as_ref(), &account_name, &log_model, req_start_ms).await);
             }
             429 => {
                 let info = account.provider.parse_rate_limits(response.headers());
@@ -646,6 +697,7 @@ async fn proxy_handler(
 async fn tap_usage(
     resp: Response,
     state: &StateStore,
+    telemetry: Option<&TelemetryClient>,
     account: &str,
     model: &str,
     req_start_ms: u64,
@@ -654,13 +706,12 @@ async fn tap_usage(
     use crate::state::RequestLog;
 
     if quota::is_streaming_response(&resp) {
-        let state = state.clone();
-        let account = account.to_owned();
-        let model = model.to_owned();
+        let state    = state.clone();
+        let telem    = telemetry.cloned();
+        let account  = account.to_owned();
+        let model    = model.to_owned();
         let on_complete = Arc::new(move |input: u64, output: u64| {
-            state.record_usage(&account, input, output);
-            state.record_global(&model, input, output);
-            state.record_request(RequestLog {
+            let log = RequestLog {
                 ts_ms: req_start_ms,
                 account: account.clone(),
                 model: model.clone(),
@@ -668,7 +719,11 @@ async fn tap_usage(
                 input_tokens: input,
                 output_tokens: output,
                 duration_ms: now_ms().saturating_sub(req_start_ms),
-            });
+            };
+            state.record_usage(&account, input, output);
+            state.record_global(&model, input, output);
+            if let Some(ref t) = telem { t.push_event(&log); }
+            state.record_request(log);
         });
         let (parts, body) = resp.into_parts();
         let wrapped = quota::wrap_streaming_body(body, on_complete);
@@ -682,9 +737,7 @@ async fn tap_usage(
         Err(_) => return Response::from_parts(parts, Body::empty()),
     };
     let (input, output) = quota::extract_usage_from_json(&bytes);
-    state.record_usage(account, input, output);
-    state.record_global(model, input, output);
-    state.record_request(RequestLog {
+    let log = RequestLog {
         ts_ms: req_start_ms,
         account: account.to_owned(),
         model: model.to_owned(),
@@ -692,7 +745,11 @@ async fn tap_usage(
         input_tokens: input,
         output_tokens: output,
         duration_ms: now_ms().saturating_sub(req_start_ms),
-    });
+    };
+    state.record_usage(account, input, output);
+    state.record_global(model, input, output);
+    if let Some(t) = telemetry { t.push_event(&log); }
+    state.record_request(log);
     Response::from_parts(parts, Body::from(bytes))
 }
 

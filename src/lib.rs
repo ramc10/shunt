@@ -15,4 +15,5 @@ pub mod remote;
 pub mod router;
 pub mod state;
 pub mod sync;
+pub mod telemetry;
 pub mod term;

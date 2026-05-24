@@ -2278,13 +2278,36 @@ async fn serve_all_providers(
         config_file: config.config_file.clone(),
         model_mapping: config.model_mapping.clone(),
     };
-    let control_app = crate::proxy::create_control_app(control_config, state.clone())?;
+    let control_app = crate::proxy::create_control_app(control_config.clone(), state.clone())?;
     let control_listener = tokio::net::TcpListener::bind(format!("{host}:{control_port}"))
         .await
         .with_context(|| format!("cannot bind {host}:{control_port} for control plane"))?;
     handles.push(tokio::spawn(async move {
         axum::serve(control_listener, control_app).await
     }));
+
+    // Spawn heartbeat loop if telemetry is configured.
+    if let Some(telemetry_url) = config.server.telemetry_url.clone() {
+        let telem = crate::telemetry::TelemetryClient::new(
+            &telemetry_url,
+            config.server.telemetry_token.clone(),
+            config.server.instance_name.clone(),
+        );
+        let state_hb  = state.clone();
+        let config_hb = std::sync::Arc::new(control_config);
+        let started   = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                let snapshot = crate::proxy::build_status_snapshot(&config_hb, &state_hb, started);
+                telem.push_heartbeat(snapshot).await;
+            }
+        });
+    }
 
     if handles.is_empty() {
         return Ok(());

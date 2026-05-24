@@ -133,6 +133,14 @@ struct RawServer {
     expiry_soon_minutes: Option<u64>,
     /// Upstream request timeout in seconds (default: 600)
     request_timeout_secs: Option<u64>,
+    /// URL of a shunt relay-server instance for multi-machine history aggregation.
+    /// e.g. "http://relay.internal:3001"
+    telemetry_url: Option<String>,
+    /// Bearer token sent to the relay-server. Must match RELAY_TOKEN on the server.
+    telemetry_token: Option<String>,
+    /// Human-readable name for this shunt instance (shown in the relay dashboard).
+    /// Defaults to the system hostname.
+    instance_name: Option<String>,
 }
 
 impl Default for RawServer {
@@ -149,6 +157,9 @@ impl Default for RawServer {
             sticky_ttl_minutes: None,
             expiry_soon_minutes: None,
             request_timeout_secs: None,
+            telemetry_url: None,
+            telemetry_token: None,
+            instance_name: None,
         }
     }
 }
@@ -177,6 +188,13 @@ struct RawAccount {
 }
 
 fn default_host() -> String { "127.0.0.1".into() }
+
+pub fn default_instance_name() -> String {
+    hostname::get()
+        .ok()
+        .and_then(|h| h.into_string().ok())
+        .unwrap_or_else(|| "shunt".into())
+}
 fn default_port() -> u16 { 8082 }
 fn default_control_port() -> u16 { 19081 }
 fn default_log_level() -> String { "info".into() }
@@ -206,6 +224,12 @@ pub struct ServerConfig {
     pub expiry_soon_secs: u64,
     /// Upstream request timeout in seconds.
     pub request_timeout_secs: u64,
+    /// Optional relay-server URL for cross-instance history aggregation.
+    pub telemetry_url: Option<String>,
+    /// Bearer token for the relay-server.
+    pub telemetry_token: Option<String>,
+    /// Identifier for this shunt instance sent in telemetry payloads.
+    pub instance_name: String,
 }
 
 impl Default for ServerConfig {
@@ -222,6 +246,9 @@ impl Default for ServerConfig {
             sticky_ttl_ms: 10 * 60 * 1000,
             expiry_soon_secs: 30 * 60,
             request_timeout_secs: 600,
+            telemetry_url: None,
+            telemetry_token: None,
+            instance_name: default_instance_name(),
         }
     }
 }
@@ -298,6 +325,14 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
         .or_else(|| std::env::var("SHUNT_RELAY_URL").ok())
         .unwrap_or_else(|| "https://relay.ramcharan.shop".into());
 
+    let telemetry_url = raw.server.telemetry_url.clone()
+        .or_else(|| std::env::var("SHUNT_TELEMETRY_URL").ok());
+    let telemetry_token = raw.server.telemetry_token.clone()
+        .or_else(|| std::env::var("SHUNT_TELEMETRY_TOKEN").ok());
+    let instance_name = raw.server.instance_name.clone()
+        .or_else(|| std::env::var("SHUNT_INSTANCE_NAME").ok())
+        .unwrap_or_else(default_instance_name);
+
     let server = ServerConfig {
         host: raw.server.host,
         port: raw.server.port,
@@ -310,6 +345,9 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
         sticky_ttl_ms: raw.server.sticky_ttl_minutes.unwrap_or(10) * 60 * 1000,
         expiry_soon_secs: raw.server.expiry_soon_minutes.unwrap_or(30) * 60,
         request_timeout_secs: raw.server.request_timeout_secs.unwrap_or(600),
+        telemetry_url,
+        telemetry_token,
+        instance_name,
     };
 
     if raw.accounts.is_empty() {
