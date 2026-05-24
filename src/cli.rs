@@ -698,6 +698,15 @@ async fn cmd_add_account(
         store.save()?;
     }
 
+    // Clear any persisted auth_failed / disabled flags so the proxy treats
+    // the fresh credential as healthy on next start (or hot-reload).
+    {
+        let state = crate::state::StateStore::load(&crate::config::state_path());
+        state.clear_auth_failed(&name);
+        // Give the background writer thread time to flush (~100 ms poll interval).
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+
     println!();
     println!("  {} Account {} added.", green(CHECK), bold(&format!("'{name}'")));
     offer_restart(config_override).await;
@@ -2751,6 +2760,15 @@ fn extract_binary_from_tarball(data: &[u8], dest: &std::path::Path) -> Result<()
     for entry in archive.entries()? {
         let mut entry = entry?;
         let path = entry.path()?;
+        // Reject path traversal attempts
+        if path.components().any(|c| c == std::path::Component::ParentDir) {
+            bail!("Unsafe path in archive: {:?}", path);
+        }
+        // Reject symlinks and directories — only plain files allowed
+        let entry_type = entry.header().entry_type();
+        if entry_type.is_symlink() || entry_type.is_hard_link() || entry_type.is_dir() {
+            continue;
+        }
         if path.file_name().and_then(|n| n.to_str()) == Some("shunt") {
             let mut out = std::fs::File::create(dest)?;
             std::io::copy(&mut entry, &mut out)?;

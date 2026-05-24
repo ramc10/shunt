@@ -331,7 +331,9 @@ async fn proxy_handler(
     let path = req.uri().path().to_owned();
     let headers = req.headers().clone();
 
-    let body_bytes: Bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
+    // 100 MB limit — sufficient for any LLM request including large context windows
+    const MAX_REQUEST_BODY: usize = 100 * 1024 * 1024;
+    let body_bytes: Bytes = axum::body::to_bytes(req.into_body(), MAX_REQUEST_BODY)
         .await
         .map_err(|_| ProxyError::BodyRead)?;
 

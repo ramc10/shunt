@@ -30,7 +30,7 @@ pub const OPENAI_DEVICE_TOKEN_URL: &str = "https://auth.openai.com/api/accounts/
 // Credential type
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct OAuthCredential {
     pub access_token: String,
     pub refresh_token: String,
@@ -42,6 +42,18 @@ pub struct OAuthCredential {
     /// OpenAI id_token — required by the Codex CLI's ~/.codex/auth.json
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id_token: Option<String>,
+}
+
+impl std::fmt::Debug for OAuthCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OAuthCredential")
+            .field("access_token", &"[REDACTED]")
+            .field("refresh_token", &"[REDACTED]")
+            .field("expires_at", &self.expires_at)
+            .field("email", &self.email)
+            .field("id_token", &self.id_token.as_ref().map(|_| "[REDACTED]"))
+            .finish()
+    }
 }
 
 impl OAuthCredential {
@@ -323,7 +335,10 @@ pub async fn refresh_token(cred: &OAuthCredential) -> Result<OAuthCredential> {
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        bail!("token refresh failed ({status}): {body}");
+        let err = serde_json::from_str::<serde_json::Value>(&body).ok()
+            .and_then(|v| v["error"].as_str().or_else(|| v["error_description"].as_str()).map(String::from))
+            .unwrap_or_else(|| "unknown error".to_string());
+        bail!("token refresh failed ({status}): {err}");
     }
 
     let body: serde_json::Value = resp.json().await.context("token refresh: invalid JSON")?;
@@ -506,7 +521,10 @@ async fn exchange_code(code: &str, state: &str, redirect_uri: &str, verifier: &s
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        bail!("token exchange failed ({status}): {body}");
+        let err = serde_json::from_str::<serde_json::Value>(&body).ok()
+            .and_then(|v| v["error"].as_str().or_else(|| v["error_description"].as_str()).map(String::from))
+            .unwrap_or_else(|| "unknown error".to_string());
+        bail!("token exchange failed ({status}): {err}");
     }
 
     let body: serde_json::Value = resp.json().await.context("token exchange: invalid JSON")?;
@@ -580,7 +598,10 @@ pub async fn refresh_openai_token(cred: &OAuthCredential) -> Result<OAuthCredent
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        bail!("OpenAI token refresh failed ({status}): {body}");
+        let err = serde_json::from_str::<serde_json::Value>(&body).ok()
+            .and_then(|v| v["error"].as_str().or_else(|| v["error_description"].as_str()).map(String::from))
+            .unwrap_or_else(|| "unknown error".to_string());
+        bail!("OpenAI token refresh failed ({status}): {err}");
     }
 
     let body: serde_json::Value = resp.json().await.context("OpenAI token refresh: invalid JSON")?;
@@ -647,7 +668,10 @@ pub async fn run_openai_oauth_flow() -> Result<OAuthCredential> {
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        bail!("Codex device code request failed ({status}): {body}");
+        let err = serde_json::from_str::<serde_json::Value>(&body).ok()
+            .and_then(|v| v["error"].as_str().or_else(|| v["error_description"].as_str()).map(String::from))
+            .unwrap_or_else(|| "unknown error".to_string());
+        bail!("Codex device code request failed ({status}): {err}");
     }
 
     let info: serde_json::Value = resp.json().await.context("device code: invalid JSON")?;
@@ -693,7 +717,10 @@ pub async fn run_openai_oauth_flow() -> Result<OAuthCredential> {
         }
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            bail!("Codex device poll error ({status}): {body}");
+            let err = serde_json::from_str::<serde_json::Value>(&body).ok()
+                .and_then(|v| v["error"].as_str().or_else(|| v["error_description"].as_str()).map(String::from))
+                .unwrap_or_else(|| "unknown error".to_string());
+            bail!("Codex device poll error ({status}): {err}");
         }
 
         let body: serde_json::Value = resp.json().await.context("device poll: invalid JSON")?;
@@ -722,7 +749,10 @@ pub async fn run_openai_oauth_flow() -> Result<OAuthCredential> {
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        bail!("Codex token exchange failed ({status}): {body}");
+        let err = serde_json::from_str::<serde_json::Value>(&body).ok()
+            .and_then(|v| v["error"].as_str().or_else(|| v["error_description"].as_str()).map(String::from))
+            .unwrap_or_else(|| "unknown error".to_string());
+        bail!("Codex token exchange failed ({status}): {err}");
     }
 
     let body: serde_json::Value = resp.json().await.context("token exchange: invalid JSON")?;

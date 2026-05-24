@@ -312,8 +312,18 @@ impl StateStore {
     }
 
     pub fn set_sticky(&self, fingerprint: &str, account_name: &str, ttl_ms: u64) {
+        const MAX_STICKY_ENTRIES: usize = 10_000;
         {
             let mut data = self.inner.lock().unwrap();
+            // Prune expired entries if approaching limit
+            if data.sticky.len() >= MAX_STICKY_ENTRIES {
+                let now = now_ms();
+                data.sticky.retain(|_, v| v.expires_at_ms > now);
+                // If still at limit after pruning, clear oldest half to prevent DoS
+                if data.sticky.len() >= MAX_STICKY_ENTRIES {
+                    data.sticky.clear();
+                }
+            }
             data.sticky.insert(
                 fingerprint.to_owned(),
                 StickyEntry { account_name: account_name.to_owned(), expires_at_ms: now_ms() + ttl_ms },
@@ -403,8 +413,8 @@ impl StateStore {
                 quota.input_tokens = 0;
                 quota.output_tokens = 0;
             }
-            quota.input_tokens += input_tokens;
-            quota.output_tokens += output_tokens;
+            quota.input_tokens = quota.input_tokens.saturating_add(input_tokens);
+            quota.output_tokens = quota.output_tokens.saturating_add(output_tokens);
         }
         self.persist();
     }
@@ -512,12 +522,12 @@ impl StateStore {
         {
             let mut data = self.inner.lock().unwrap();
             let bucket = data.global_daily.entry(key).or_default();
-            bucket.input_tokens  += input_tokens;
-            bucket.output_tokens += output_tokens;
+            bucket.input_tokens  = bucket.input_tokens.saturating_add(input_tokens);
+            bucket.output_tokens = bucket.output_tokens.saturating_add(output_tokens);
             bucket.api_cost_usd  += cost;
-            data.all_time_input      += input_tokens;
-            data.all_time_output     += output_tokens;
-            data.all_time_cost_usd   += cost;
+            data.all_time_input  = data.all_time_input.saturating_add(input_tokens);
+            data.all_time_output = data.all_time_output.saturating_add(output_tokens);
+            data.all_time_cost_usd += cost;
 
             // Prune buckets older than 90 days to prevent unbounded growth.
             if data.global_daily.len() > 100 {
@@ -718,6 +728,11 @@ fn write_to_disk(data: &StateData, path: &Path) -> Result<()> {
     }
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, serde_json::to_string_pretty(data)?)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+    }
     std::fs::rename(&tmp, path)?;
     Ok(())
 }

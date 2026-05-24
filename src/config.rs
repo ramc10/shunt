@@ -72,12 +72,12 @@ impl CredentialsStore {
         }
         let tmp = p.with_extension("tmp");
         std::fs::write(&tmp, serde_json::to_string_pretty(self)?)?;
-        std::fs::rename(&tmp, &p)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600))?;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
         }
+        std::fs::rename(&tmp, &p)?;
         // On Windows, restrict the file to the current user via icacls (best-effort).
         #[cfg(windows)]
         {
@@ -376,7 +376,10 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
         let cred: Option<Credential> = store.accounts.get(&a.name).cloned()
             .or_else(|| {
                 // Inline api_key from TOML (less secure, but convenient for testing).
-                a.api_key.as_deref().map(|k| Credential::Apikey { key: k.to_owned() })
+                a.api_key.as_deref().map(|k| {
+                    tracing::warn!(account = %a.name, "Inline api_key in config.toml is insecure — use api_key_env instead");
+                    Credential::Apikey { key: k.to_owned() }
+                })
             })
             .or_else(|| {
                 // api_key_env: name of env var holding the key.

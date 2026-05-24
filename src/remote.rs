@@ -13,7 +13,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::term::{bold, cyan, dim, fmt_duration_ms, green, red, yellow};
@@ -87,6 +87,10 @@ const ALL_OFFLINE_NOTIFY_COOLDOWN: Duration = Duration::from_secs(3_600);
 
 pub async fn run_remote(code: Option<String>, relay_url: Option<String>, local_url: String) -> Result<()> {
     let relay = relay_url.unwrap_or_else(|| DEFAULT_RELAY.to_string());
+    // Require HTTPS for relay to protect encrypted payloads in transit
+    if !relay.starts_with("https://") {
+        bail!("Relay URL must use HTTPS (got: {}). Use the default relay or provide an https:// URL.", relay);
+    }
     match code {
         None        => run_host(relay, local_url).await,
         Some(code)  => run_client(code, relay).await,
