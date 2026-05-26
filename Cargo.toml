@@ -1,6 +1,6 @@
 [package]
 name = "shunt-proxy"
-version = "0.1.102"
+version = "0.1.104"
 edition = "2021"
 authors = ["Ramcharan <sairamcharansudagoni@gmail.com>"]
 description = "A local proxy that pools multiple Claude accounts behind a single endpoint, routing requests to maximise rate limits"
@@ -56,6 +56,8 @@ unicode-width = "0.1"
 tui-big-text = "0.8"
 async-stream = "0.3"
 hostname = "0.4"
+parking_lot = "0.12"
+zeroize = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

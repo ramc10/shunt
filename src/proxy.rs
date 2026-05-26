@@ -1,5 +1,9 @@
 use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::Instant;
+
+use parking_lot::Mutex as ParkingMutex;
 
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
@@ -34,7 +38,7 @@ struct AppState {
     /// should wait and then re-use the fresh token instead of each making their
     /// own refresh call (which would rotate the refresh_token out from under the
     /// others and cause cascading auth failures).
-    refresh_locks: Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    refresh_locks: Arc<ParkingMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// Epoch-ms when this proxy instance started.
     started_ms: u64,
     /// If set, /v1/chat/completions requests are translated and forwarded here
@@ -42,6 +46,36 @@ struct AppState {
     anthropic_base_url: Option<String>,
     /// Optional relay-server telemetry client.
     telemetry: Option<TelemetryClient>,
+    /// Per-IP token-bucket rate limiter (#16). None when rate_limit_rpm == 0.
+    rate_limiter: Option<Arc<ParkingMutex<HashMap<IpAddr, TokenBucket>>>>,
+}
+
+/// Simple token-bucket for per-IP rate limiting.
+struct TokenBucket {
+    tokens: f64,
+    last_refill: Instant,
+}
+
+impl TokenBucket {
+    fn new(capacity: f64) -> Self {
+        Self { tokens: capacity, last_refill: Instant::now() }
+    }
+
+    /// Refill tokens proportional to elapsed time, then consume one.
+    /// Returns true if the request is allowed.
+    fn check_and_consume(&mut self, rpm: f64) -> bool {
+        let elapsed = self.last_refill.elapsed().as_secs_f64();
+        self.last_refill = Instant::now();
+        // Refill at rpm/60 tokens per second; cap at burst (10 tokens).
+        let burst = (rpm / 6.0).max(10.0);
+        self.tokens = (self.tokens + elapsed * rpm / 60.0).min(burst);
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 pub fn create_app(config: Config) -> anyhow::Result<Router> {
@@ -81,15 +115,22 @@ fn build_app_state(
         TelemetryClient::new(url, config.server.telemetry_token.clone(), config.server.instance_name.clone())
     });
 
+    let rate_limiter = if config.server.rate_limit_rpm > 0 {
+        Some(Arc::new(ParkingMutex::new(HashMap::<IpAddr, TokenBucket>::new())))
+    } else {
+        None
+    };
+
     let app_state = AppState {
         config: Arc::new(config),
         forwarder: Arc::new(forwarder),
         state,
         credentials: Arc::clone(&credentials),
-        refresh_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        refresh_locks: Arc::new(ParkingMutex::new(HashMap::new())),
         started_ms: now_ms(),
         anthropic_base_url,
         telemetry,
+        rate_limiter,
     };
 
     Ok((app_state, credentials))
@@ -312,6 +353,15 @@ fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
 }
 
+/// Extract client IP from `X-Real-IP` header, falling back to a loopback sentinel.
+fn extract_client_ip(req: &Request) -> IpAddr {
+    req.headers()
+        .get("x-real-ip")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+}
+
 async fn proxy_handler(
     State(s): State<AppState>,
     req: Request,
@@ -324,6 +374,16 @@ async fn proxy_handler(
             .unwrap_or("");
         if provided != expected {
             return Err(ProxyError::Unauthorized);
+        }
+    }
+
+    // #16: per-IP rate limiting (token bucket, configurable via rate_limit_rpm).
+    if let Some(ref rl) = s.rate_limiter {
+        let ip = extract_client_ip(&req);
+        let rpm = s.config.server.rate_limit_rpm as f64;
+        let allowed = rl.lock().entry(ip).or_insert_with(|| TokenBucket::new(rpm)).check_and_consume(rpm);
+        if !allowed {
+            return Err(ProxyError::RateLimited);
         }
     }
 
@@ -542,14 +602,20 @@ async fn proxy_handler(
             }
             429 => {
                 let info = account.provider.parse_rate_limits(response.headers());
-                // Sleep until the actual reset time if the headers tell us when that is;
-                // otherwise fall back to 60s so we don't hammer the API.
+                // Sleep until the actual reset time if the headers tell us when that is.
+                // Fall back to Retry-After (per-minute rate limits), then 60s.
+                let retry_after_ms = response.headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .map(|secs| secs.saturating_mul(1_000).max(500));
                 let cooldown_ms = info.as_ref()
                     .and_then(|i| i.reset_5h.or(i.reset_7d))
                     .map(|reset_secs| {
                         let reset_ms = reset_secs.saturating_mul(1_000);
                         reset_ms.saturating_sub(now_ms()).saturating_add(500) // +500ms buffer
                     })
+                    .or(retry_after_ms)
                     .unwrap_or(60_000);
                 warn!(account = %account_name, cooldown_ms, "429 rate-limited — cooling until reset");
                 if let Some(info) = info {
@@ -584,7 +650,7 @@ async fn proxy_handler(
                     // re-check credentials and skip the refresh if the token was
                     // already rotated while they were queued.
                     let account_lock = {
-                        let mut locks = s.refresh_locks.lock().unwrap();
+                        let mut locks = s.refresh_locks.lock();
                         locks.entry(account_name.clone())
                             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
                             .clone()
@@ -1058,23 +1124,42 @@ enum ProxyError {
     Upstream,
     AllAccountsUnavailable,
     Unauthorized,
+    RateLimited,
 }
 
 impl IntoResponse for ProxyError {
     fn into_response(self) -> Response {
-        let (status, msg) = match self {
-            ProxyError::BodyRead => (StatusCode::BAD_REQUEST, "failed to read request body"),
-            ProxyError::Upstream => (StatusCode::BAD_GATEWAY, "upstream request failed"),
-            ProxyError::AllAccountsUnavailable => {
-                (StatusCode::SERVICE_UNAVAILABLE, "all accounts are on cooldown or disabled")
+        match self {
+            ProxyError::RateLimited => {
+                let mut resp = (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    axum::Json(json!({
+                        "type": "error",
+                        "error": {"type": "rate_limit_error", "message": "too many requests — slow down"}
+                    })),
+                ).into_response();
+                resp.headers_mut().insert(
+                    axum::http::header::RETRY_AFTER,
+                    axum::http::HeaderValue::from_static("60"),
+                );
+                resp
             }
-            ProxyError::Unauthorized => (StatusCode::UNAUTHORIZED, "invalid or missing api key"),
-        };
-
-        (status, axum::Json(json!({
-            "type": "error",
-            "error": {"type": "api_error", "message": msg}
-        }))).into_response()
+            other => {
+                let (status, msg) = match other {
+                    ProxyError::BodyRead => (StatusCode::BAD_REQUEST, "failed to read request body"),
+                    ProxyError::Upstream => (StatusCode::BAD_GATEWAY, "upstream request failed"),
+                    ProxyError::AllAccountsUnavailable => {
+                        (StatusCode::SERVICE_UNAVAILABLE, "all accounts are on cooldown or disabled")
+                    }
+                    ProxyError::Unauthorized => (StatusCode::UNAUTHORIZED, "invalid or missing api key"),
+                    ProxyError::RateLimited => unreachable!(),
+                };
+                (status, axum::Json(json!({
+                    "type": "error",
+                    "error": {"type": "api_error", "message": msg}
+                }))).into_response()
+            }
+        }
     }
 }
 
