@@ -20,7 +20,7 @@
 Shunt is a local proxy that combines your Claude Code accounts into one endpoint. It auto-routes every request to the account with the most headroom, fails over silently when one hits a limit, and holds your connection open until capacity frees up — your agent session never sees a 429.
 
 <div align="center">
-<img src="https://shunt-web.vercel.app/assets/shunt_logo-removebg-preview.png" alt="shunt" width="120" style="image-rendering:pixelated">
+<img src="https://raw.githubusercontent.com/ramc10/shunt/main/diagram.svg" width="600">
 </div>
 
 **Works with:** Claude Code · Cursor · Codex CLI · Windsurf · any OpenAI or Anthropic SDK
