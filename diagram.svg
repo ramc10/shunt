@@ -2,16 +2,18 @@
   <style>
     text { font-family: 'Consolas', 'Monaco', 'Courier New', monospace; fill: #e8e8e8; }
     .label { font-size: 13px; }
-    .tick { fill: #4caf50; font-size: 13px; }
-    .dim { fill: #888; font-size: 13px; }
-    line, path { stroke: #666; stroke-width: 1.5; fill: none; }
-    .arrow { stroke: #aaa; stroke-width: 1.5; }
-    rect.logo { fill: #e8e8e8; }
-    rect.bg { fill: #0d1117; }
+    .tick { fill: #bcff5e; font-size: 13px; }
+    .dim { fill: #666; font-size: 13px; }
+    line, path { stroke: #2a3040; stroke-width: 1.5; fill: none; }
+    .arrow { stroke: #bcff5e; stroke-width: 1.5; }
+    rect.logo { fill: #bcff5e; filter: drop-shadow(0 0 6px #bcff5e88); }
+    rect.bg { fill: #07090d; rx: 8; }
+    rect.border { fill: none; stroke: #1a1f27; stroke-width: 1; }
   </style>
 
   <!-- background -->
   <rect class="bg" width="640" height="260" rx="8"/>
+  <rect class="border" width="639" height="259" x="0.5" y="0.5" rx="8"/>
 
   <!-- ── LEFT: agents ── -->
   <!-- vertical bar connecting all agents -->
@@ -41,7 +43,7 @@
   <!-- left horizontal → logo -->
   <line class="arrow" x1="178" y1="126" x2="218" y2="126"/>
   <!-- arrowhead -->
-  <polygon points="218,121 230,126 218,131" fill="#aaa" stroke="none"/>
+  <polygon points="218,121 230,126 218,131" fill="#bcff5e" stroke="none"/>
 
   <!-- ── CENTER: shunt logo ── -->
   <!-- logo is 10 units × 4 units at 14px/unit, centered at x=320, y=126 -->
@@ -60,7 +62,7 @@
   <!-- logo → right horizontal -->
   <line class="arrow" x1="410" y1="126" x2="450" y2="126"/>
   <!-- arrowhead -->
-  <polygon points="450,121 462,126 450,131" fill="#aaa" stroke="none"/>
+  <polygon points="450,121 462,126 450,131" fill="#bcff5e" stroke="none"/>
 
   <!-- ── RIGHT: providers ── -->
   <!-- vertical bar -->
