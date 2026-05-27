@@ -4,7 +4,7 @@
 
 # shunt
 
-**A proxy for AI coding agents — pool accounts, beat rate limits.**
+**Pool your Claude rate limits. Never get throttled mid-session again.**
 
 [![crates.io](https://img.shields.io/crates/v/shunt-proxy.svg)](https://crates.io/crates/shunt-proxy)
 [![downloads](https://img.shields.io/github/downloads/ramc10/shunt/total)](https://github.com/ramc10/shunt/releases)
@@ -15,7 +15,7 @@
 
 ---
 
-Shunt sits between your coding agents and your AI providers. It pools multiple accounts behind a single local endpoint, always routing to whoever has the most capacity left — so you never hit a rate limit mid-session.
+Shunt is a local proxy that combines your Claude Code accounts into one endpoint. It auto-routes every request to the account with the most headroom, fails over silently when one hits a limit, and holds your connection open until capacity frees up — your agent session never sees a 429.
 
 <div align="center">
 <img src="https://raw.githubusercontent.com/ramc10/shunt/main/diagram.svg" width="600">
@@ -29,7 +29,7 @@ Shunt sits between your coding agents and your AI providers. It pools multiple a
 
 ## Install
 
-**macOS / Linux**
+**macOS / Linux — one command:**
 
 ```bash
 curl -sSf https://raw.githubusercontent.com/ramc10/shunt/main/install.sh | sh
@@ -50,43 +50,51 @@ shunt setup      # import your Claude Code session + configure your shell
 shunt start      # start the proxy
 ```
 
-That's it. Your tools will route through shunt automatically.
+That's it. Claude Code and your other tools route through shunt automatically.
 
-To add more accounts:
+Add more accounts to grow your pool:
 
 ```bash
 shunt add-account personal   # another Claude account (OAuth)
-shunt add-account groq       # Groq (prompts for API key)
+shunt add-account work       # another Claude account
 shunt add-account codex      # ChatGPT Pro (device-code flow)
+shunt add-account groq       # Groq (prompts for API key)
 ```
 
 ---
 
-## What you get
+## What shunt does
 
-**No more waiting on rate limits**
+**Combines your rate limits**
 
-If an account hits a limit, shunt switches to the next one instantly. If every account is drained, it holds your request open and retries the moment the first one resets — your agent session never fails.
+N accounts = N × the limit you already pay for. Three Claude Pro accounts means three 5-hour windows and three 7-day windows, pooled and automatically load-balanced.
 
-**Live dashboard**
+**Fails over silently**
+
+When an account hits its limit, the next request goes to whichever account has capacity. No 429 errors, no broken loops. If every account is drained, shunt holds the connection open and retries the moment the first one resets.
+
+**Live status**
 
 ```bash
-shunt monitor
+shunt status
 ```
 
 ```
-  ◆  work                                        Claude Pro
-    you@work.com
+  ◆  main                                        Claude Pro
+    you@example.com
 
     ✓  available
-    5h  ████████████░░░░░░░░  61% left  ·  resets in 2h 14m
-    7d  ███░░░░░░░░░░░░░░░░░  13% left  ·  resets in 1d 14h
+    5h  ████████████████░░░░  81% left  ·  resets in 2h 28m
+    7d  █████████████████░░░  85% left  ·  resets in 4d 16h
 
-  ◆  personal                                    Claude Pro
+  ────────────────────────────────────────────────────────
+
+  ◆  work                                        Claude Pro
     alt@example.com
 
     ✓  available
-    5h  ────────────────────  fresh
+    5h  ██████████████████░░  92% left  ·  resets in 2h 28m
+    7d  █████████████░░░░░░░  65% left  ·  resets in 4d 5h
 ```
 
 **Share with your team**
@@ -97,10 +105,6 @@ shunt share --tunnel     # any network via Cloudflare tunnel
 shunt connect <code>     # on another machine — configures everything
 ```
 
-**Savings tracker**
-
-Every request is tracked against API pricing. Shunt shows you how much you've saved by using subscriptions instead.
-
 ---
 
 ## Commands
@@ -110,7 +114,7 @@ shunt setup              # first-time setup
 shunt start              # start the proxy
 shunt stop               # stop the proxy
 shunt restart
-shunt status             # account utilization and savings
+shunt status             # account utilization
 shunt monitor            # live fullscreen dashboard
 shunt logs               # recent logs
 shunt logs -f            # follow logs
