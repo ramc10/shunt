@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="https://raw.githubusercontent.com/ramc10/shunt/main/logo.svg" alt="shunt" width="120"><br>
+<img src="https://shunt-web.vercel.app/assets/shunt_logo-removebg-preview.png" alt="shunt" width="96" style="image-rendering:pixelated"><br>
 
 # shunt
 
@@ -10,6 +10,8 @@
 [![downloads](https://img.shields.io/github/downloads/ramc10/shunt/total)](https://github.com/ramc10/shunt/releases)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![platform](https://img.shields.io/badge/macOS%20%7C%20Linux-lightgrey)
+
+**[shunt-web.vercel.app](https://shunt-web.vercel.app)**
 
 </div>
 
