@@ -147,6 +147,9 @@ struct StateData {
     /// Recent request log (ephemeral — not persisted to disk).
     #[serde(skip)]
     recent_requests: VecDeque<RequestLog>,
+    /// Runtime model override — all requests use this model if set (ephemeral).
+    #[serde(skip)]
+    model_override: Option<String>,
     /// Daily token + cost buckets keyed by "YYYY-MM-DD" (all accounts combined).
     #[serde(default)]
     global_daily: HashMap<String, DailyBucket>,
@@ -516,6 +519,22 @@ impl StateStore {
             data.last_used_account = Some(name.to_owned());
         }
         self.persist();
+    }
+
+    // -----------------------------------------------------------------------
+    // Model override
+    // -----------------------------------------------------------------------
+
+    pub fn get_model_override(&self) -> Option<String> {
+        self.inner.lock().model_override.clone()
+    }
+
+    pub fn set_model_override(&self, model: String) {
+        self.inner.lock().model_override = Some(model);
+    }
+
+    pub fn clear_model_override(&self) {
+        self.inner.lock().model_override = None;
     }
 
     // -----------------------------------------------------------------------

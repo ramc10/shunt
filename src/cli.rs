@@ -186,6 +186,18 @@ enum Command {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// Override the model for all requests, or clear the override
+    ///
+    /// Examples:
+    ///   shunt model                           — show current model override
+    ///   shunt model set claude-opus-4-6       — force all requests to use this model
+    ///   shunt model clear                     — restore client-supplied model
+    Model {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[command(subcommand)]
+        action: Option<ModelAction>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -196,6 +208,17 @@ enum ServiceAction {
     Uninstall,
     /// Show whether the service is registered and running
     Status,
+}
+
+#[derive(Subcommand)]
+enum ModelAction {
+    /// Force all requests through a specific model
+    Set {
+        /// Model name, e.g. claude-opus-4-6
+        model: String,
+    },
+    /// Clear the model override and let clients choose the model
+    Clear,
 }
 
 pub async fn run() -> Result<()> {
@@ -220,6 +243,7 @@ pub async fn run() -> Result<()> {
         Command::Uninstall => cmd_uninstall().await,
         Command::Use { config, account } => cmd_use(config, account).await,
         Command::Report { config } => cmd_report(config).await,
+        Command::Model { config, action } => cmd_model(config, action).await,
         Command::Service { action } => match action {
             ServiceAction::Install   => cmd_service_install().await,
             ServiceAction::Uninstall => cmd_service_uninstall().await,
@@ -2118,6 +2142,61 @@ fn write_pinned_to_state(account: Option<String>) {
         let _ = std::fs::write(&tmp, text);
         let _ = std::fs::rename(&tmp, &path);
     }
+}
+
+async fn cmd_model(config_override: Option<PathBuf>, action: Option<ModelAction>) -> Result<()> {
+    let config = crate::config::load_config(config_override.as_deref())?;
+    let model_url = format!("http://{}:{}/model", config.server.host, config.server.control_port);
+    let client = reqwest::Client::new();
+
+    match action {
+        None => {
+            // Show current override
+            let resp = client.get(&model_url).send().await;
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    let v: serde_json::Value = r.json().await.unwrap_or_default();
+                    match v["model"].as_str() {
+                        Some(m) => println!("  {} Model override: {}  ·  {}", green(CHECK), bold(m), dim("shunt model clear to restore")),
+                        None => println!("  {} No model override  ·  {}", dim(DOT), dim("clients choose their own model")),
+                    }
+                }
+                _ => anyhow::bail!("Proxy is not running. Start with `shunt start`."),
+            }
+        }
+        Some(ModelAction::Set { model }) => {
+            let resp = client
+                .post(&model_url)
+                .json(&serde_json::json!({ "model": model }))
+                .send()
+                .await;
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    println!("  {} Model override set: {}  ·  {}", green(CHECK), bold(&model), dim("shunt model clear to restore"));
+                }
+                Ok(r) => {
+                    let body = r.text().await.unwrap_or_default();
+                    anyhow::bail!("Proxy returned error: {body}");
+                }
+                Err(_) => anyhow::bail!("Proxy is not running. Start with `shunt start`."),
+            }
+        }
+        Some(ModelAction::Clear) => {
+            let resp = client.delete(&model_url).send().await;
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    println!("  {} Model override cleared  ·  {}", green(CHECK), dim("clients now choose their own model"));
+                }
+                Ok(r) => {
+                    let body = r.text().await.unwrap_or_default();
+                    anyhow::bail!("Proxy returned error: {body}");
+                }
+                Err(_) => anyhow::bail!("Proxy is not running. Start with `shunt start`."),
+            }
+        }
+    }
+    println!();
+    Ok(())
 }
 
 /// Synchronously awaits a reqwest response to get its JSON.

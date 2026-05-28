@@ -169,6 +169,7 @@ pub fn create_control_app(
         .route("/health", get(health))
         .route("/status", get(status_handler))
         .route("/use", post(use_handler))
+        .route("/model", get(model_get_handler).post(model_set_handler).delete(model_clear_handler))
         .with_state(app_state);
 
     Ok(app)
@@ -190,6 +191,7 @@ pub fn create_app_with_state(
         .route("/health", get(health))
         .route("/status", get(status_handler))
         .route("/use", post(use_handler))
+        .route("/model", get(model_get_handler).post(model_set_handler).delete(model_clear_handler))
         // Proxy routes
         .route("/v1/messages", post(proxy_handler))
         .route("/v1/messages/count_tokens", post(proxy_handler))
@@ -355,6 +357,29 @@ async fn use_handler(
     }
 }
 
+async fn model_get_handler(State(s): State<AppState>) -> impl IntoResponse {
+    let model = s.state.get_model_override();
+    axum::Json(json!({ "model": model }))
+}
+
+async fn model_set_handler(
+    State(s): State<AppState>,
+    axum::Json(body): axum::Json<serde_json::Value>,
+) -> Response {
+    let Some(model) = body["model"].as_str() else {
+        return (StatusCode::BAD_REQUEST, axum::Json(json!({ "error": "missing model field" }))).into_response();
+    };
+    s.state.set_model_override(model.to_owned());
+    info!(model, "model override set");
+    axum::Json(json!({ "model": model })).into_response()
+}
+
+async fn model_clear_handler(State(s): State<AppState>) -> impl IntoResponse {
+    s.state.clear_model_override();
+    info!("model override cleared");
+    axum::Json(json!({ "model": null }))
+}
+
 fn now_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
@@ -411,6 +436,22 @@ async fn proxy_handler(
     let body_bytes: Bytes = axum::body::to_bytes(req.into_body(), MAX_REQUEST_BODY)
         .await
         .map_err(|_| ProxyError::BodyRead)?;
+
+    // Apply model override: if set, patch the `model` field in the JSON body before forwarding.
+    let body_bytes = if let Some(override_model) = s.state.get_model_override() {
+        if let Ok(mut val) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+            if val.get("model").is_some() {
+                val["model"] = serde_json::Value::String(override_model);
+                Bytes::from(serde_json::to_vec(&val).unwrap_or_else(|_| body_bytes.to_vec()))
+            } else {
+                body_bytes
+            }
+        } else {
+            body_bytes
+        }
+    } else {
+        body_bytes
+    };
 
     let model = serde_json::from_slice::<serde_json::Value>(&body_bytes)
         .ok()
