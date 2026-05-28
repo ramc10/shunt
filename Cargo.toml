@@ -1,6 +1,6 @@
 [package]
 name = "shunt-proxy"
-version = "0.1.121"
+version = "0.1.122"
 edition = "2021"
 authors = ["Ramcharan <sairamcharansudagoni@gmail.com>"]
 description = "A local proxy that pools multiple Claude accounts behind a single endpoint, routing requests to maximise rate limits"
@@ -21,7 +21,7 @@ name = "shunt"
 path = "src/lib.rs"
 
 [dependencies]
-axum = "0.7"
+axum = { version = "0.7", features = ["ws"] }
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls", "blocking"], default-features = false }
 serde = { version = "1", features = ["derive"] }
@@ -59,6 +59,8 @@ hostname = "0.4"
 parking_lot = "0.12"
 zeroize = { version = "1", features = ["derive"] }
 regex = "1"
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+tokio-stream = "0.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
