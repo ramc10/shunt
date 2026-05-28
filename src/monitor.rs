@@ -23,7 +23,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::notify::terminal_notify;
 use crate::term::fmt_duration_ms;
 
 // ---------------------------------------------------------------------------
@@ -347,35 +346,11 @@ pub async fn run_monitor(base_url: &str) -> Result<()> {
     let mut focus = Focus::Accounts;
     let mut chart_window = TimeWindow::FifteenMin;
     let start_time = Instant::now();
-    // Track the newest request timestamp we've seen so far; used to detect new
-    // requests each poll cycle and fire terminal bell + iTerm2 notifications.
-    // Initialised to 0 so the very first fetch is used to establish a baseline
-    // without triggering bells for historical requests.
-    let mut last_seen_req_ts: u64 = 0;
-    let mut notif_baseline_set = false;
 
     loop {
         if last_fetch.elapsed() >= Duration::from_millis(refresh_ms) {
             match fetch_status(&status_url).await {
-                Ok(s)  => {
-                    // Detect requests that arrived since the last poll.
-                    let max_ts = s.recent_requests.iter().map(|r| r.ts_ms).max().unwrap_or(0);
-                    if notif_baseline_set && max_ts > last_seen_req_ts {
-                        let new: Vec<&ReqLog> = s.recent_requests.iter()
-                            .filter(|r| r.ts_ms > last_seen_req_ts)
-                            .collect();
-                        if new.len() == 1 {
-                            terminal_notify("shunt", &new[0].model);
-                        } else {
-                            terminal_notify("shunt", &format!("{} new requests", new.len()));
-                        }
-                    }
-                    if max_ts > 0 {
-                        last_seen_req_ts = last_seen_req_ts.max(max_ts);
-                        notif_baseline_set = true;
-                    }
-                    state = Some(s); fetch_err = None;
-                }
+                Ok(s)  => { state = Some(s); fetch_err = None; }
                 Err(e) => { fetch_err = Some(e); state = None; }
             }
             // Fetch model override in parallel (ignore errors — proxy may not support it yet)
