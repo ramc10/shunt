@@ -2,6 +2,7 @@
 ///
 /// Thread-safe via Arc<Mutex<>>. Cooldowns and disables are persisted to disk;
 /// stickiness is ephemeral (lost on restart is acceptable).
+use crate::config::RoutingStrategy;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
@@ -150,6 +151,9 @@ struct StateData {
     /// Runtime model override — all requests use this model if set (ephemeral).
     #[serde(skip)]
     model_override: Option<String>,
+    /// Runtime routing strategy override (ephemeral — not persisted).
+    #[serde(skip)]
+    routing_strategy_override: Option<RoutingStrategy>,
     /// Daily token + cost buckets keyed by "YYYY-MM-DD" (all accounts combined).
     #[serde(default)]
     global_daily: HashMap<String, DailyBucket>,
@@ -535,6 +539,22 @@ impl StateStore {
 
     pub fn clear_model_override(&self) {
         self.inner.lock().model_override = None;
+    }
+
+    // -----------------------------------------------------------------------
+    // Routing strategy override
+    // -----------------------------------------------------------------------
+
+    pub fn get_routing_strategy(&self) -> Option<RoutingStrategy> {
+        self.inner.lock().routing_strategy_override
+    }
+
+    pub fn set_routing_strategy(&self, strategy: RoutingStrategy) {
+        self.inner.lock().routing_strategy_override = Some(strategy);
+    }
+
+    pub fn clear_routing_strategy(&self) {
+        self.inner.lock().routing_strategy_override = None;
     }
 
     // -----------------------------------------------------------------------

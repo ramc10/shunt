@@ -198,6 +198,19 @@ enum Command {
         #[command(subcommand)]
         action: Option<ModelAction>,
     },
+    /// Override the routing strategy at runtime, or clear the override
+    ///
+    /// Examples:
+    ///   shunt strategy                — show current strategy + source
+    ///   shunt strategy set reaper     — drain expiring accounts first
+    ///   shunt strategy set maximus    — time-weighted dual-window scorer (default)
+    ///   shunt strategy clear          — restore config-file strategy
+    Strategy {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[command(subcommand)]
+        action: Option<StrategyAction>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -218,6 +231,17 @@ enum ModelAction {
         model: String,
     },
     /// Clear the model override and let clients choose the model
+    Clear,
+}
+
+#[derive(Subcommand)]
+enum StrategyAction {
+    /// Override the routing strategy
+    Set {
+        /// Strategy name: maximus, reaper, carousel, cushion
+        strategy: String,
+    },
+    /// Clear the strategy override and fall back to config-file value
     Clear,
 }
 
@@ -244,6 +268,7 @@ pub async fn run() -> Result<()> {
         Command::Use { config, account } => cmd_use(config, account).await,
         Command::Report { config } => cmd_report(config).await,
         Command::Model { config, action } => cmd_model(config, action).await,
+        Command::Strategy { config, action } => cmd_strategy(config, action).await,
         Command::Service { action } => match action {
             ServiceAction::Install   => cmd_service_install().await,
             ServiceAction::Uninstall => cmd_service_uninstall().await,
@@ -2186,6 +2211,66 @@ async fn cmd_model(config_override: Option<PathBuf>, action: Option<ModelAction>
             match resp {
                 Ok(r) if r.status().is_success() => {
                     println!("  {} Model override cleared  ·  {}", green(CHECK), dim("clients now choose their own model"));
+                }
+                Ok(r) => {
+                    let body = r.text().await.unwrap_or_default();
+                    anyhow::bail!("Proxy returned error: {body}");
+                }
+                Err(_) => anyhow::bail!("Proxy is not running. Start with `shunt start`."),
+            }
+        }
+    }
+    println!();
+    Ok(())
+}
+
+async fn cmd_strategy(config_override: Option<PathBuf>, action: Option<StrategyAction>) -> Result<()> {
+    let config = crate::config::load_config(config_override.as_deref())?;
+    let strategy_url = format!("http://{}:{}/strategy", config.server.host, config.server.control_port);
+    let client = reqwest::Client::new();
+
+    match action {
+        None => {
+            // Show current strategy + source
+            let resp = client.get(&strategy_url).send().await;
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    let v: serde_json::Value = r.json().await.unwrap_or_default();
+                    let strategy = v["strategy"].as_str().unwrap_or("unknown");
+                    let source = v["source"].as_str().unwrap_or("unknown");
+                    if source == "override" {
+                        println!("  {} Routing strategy: {}  ·  {}  ·  {}", green(CHECK), bold(strategy), dim("runtime override"), dim("shunt strategy clear to restore"));
+                    } else {
+                        println!("  {} Routing strategy: {}  ·  {}", dim(DOT), bold(strategy), dim("from config"));
+                    }
+                }
+                _ => anyhow::bail!("Proxy is not running. Start with `shunt start`."),
+            }
+        }
+        Some(StrategyAction::Set { strategy }) => {
+            let resp = client
+                .post(&strategy_url)
+                .json(&serde_json::json!({ "strategy": strategy }))
+                .send()
+                .await;
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    println!("  {} Routing strategy set: {}  ·  {}", green(CHECK), bold(&strategy), dim("shunt strategy clear to restore"));
+                }
+                Ok(r) => {
+                    let body = r.text().await.unwrap_or_default();
+                    anyhow::bail!("Proxy returned error: {body}");
+                }
+                Err(_) => anyhow::bail!("Proxy is not running. Start with `shunt start`."),
+            }
+        }
+        Some(StrategyAction::Clear) => {
+            let resp = client.delete(&strategy_url).send().await;
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    let v: serde_json::Value = r.json().await.unwrap_or_default();
+                    let strategy = v["strategy"].as_str().unwrap_or("unknown");
+                    println!("  {} Strategy override cleared  ·  {}  ·  {}", green(CHECK), bold(strategy), dim("from config"));
                 }
                 Ok(r) => {
                     let body = r.text().await.unwrap_or_default();

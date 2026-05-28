@@ -170,6 +170,7 @@ pub fn create_control_app(
         .route("/status", get(status_handler))
         .route("/use", post(use_handler))
         .route("/model", get(model_get_handler).post(model_set_handler).delete(model_clear_handler))
+        .route("/strategy", get(strategy_get_handler).post(strategy_set_handler).delete(strategy_clear_handler))
         .with_state(app_state);
 
     Ok(app)
@@ -192,6 +193,7 @@ pub fn create_app_with_state(
         .route("/status", get(status_handler))
         .route("/use", post(use_handler))
         .route("/model", get(model_get_handler).post(model_set_handler).delete(model_clear_handler))
+        .route("/strategy", get(strategy_get_handler).post(strategy_set_handler).delete(strategy_clear_handler))
         // Proxy routes
         .route("/v1/messages", post(proxy_handler))
         .route("/v1/messages/count_tokens", post(proxy_handler))
@@ -380,6 +382,36 @@ async fn model_clear_handler(State(s): State<AppState>) -> impl IntoResponse {
     axum::Json(json!({ "model": null }))
 }
 
+async fn strategy_get_handler(State(s): State<AppState>) -> impl IntoResponse {
+    let (strategy_str, source) = match s.state.get_routing_strategy() {
+        Some(st) => (st.as_str(), "override"),
+        None => (s.config.server.routing_strategy.as_str(), "config"),
+    };
+    axum::Json(json!({ "strategy": strategy_str, "source": source }))
+}
+
+async fn strategy_set_handler(
+    State(s): State<AppState>,
+    axum::Json(body): axum::Json<serde_json::Value>,
+) -> Response {
+    let Some(name) = body["strategy"].as_str() else {
+        return (StatusCode::BAD_REQUEST, axum::Json(json!({ "error": "missing strategy field" }))).into_response();
+    };
+    let Some(strategy) = crate::config::RoutingStrategy::from_str(name) else {
+        return (StatusCode::BAD_REQUEST, axum::Json(json!({ "error": format!("unknown strategy '{name}'") }))).into_response();
+    };
+    s.state.set_routing_strategy(strategy);
+    info!(strategy = name, "routing strategy override set");
+    axum::Json(json!({ "strategy": strategy.as_str(), "source": "override" })).into_response()
+}
+
+async fn strategy_clear_handler(State(s): State<AppState>) -> impl IntoResponse {
+    s.state.clear_routing_strategy();
+    info!("routing strategy override cleared");
+    let strategy_str = s.config.server.routing_strategy.as_str();
+    axum::Json(json!({ "strategy": strategy_str, "source": "config" }))
+}
+
 fn now_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
@@ -515,10 +547,12 @@ async fn proxy_handler(
     let wait_deadline_ms = now_ms() + s.config.server.request_timeout_secs.saturating_mul(1_000);
 
     loop {
+        let effective_strategy = s.state.get_routing_strategy()
+            .unwrap_or(s.config.server.routing_strategy);
         let account = match router::pick_account(
             &s.config.accounts, &s.state, fp_ref, &tried,
             s.config.server.sticky_ttl_ms, s.config.server.expiry_soon_secs,
-            s.config.server.routing_strategy,
+            effective_strategy,
         ) {
             Some(a) => a,
             None => {

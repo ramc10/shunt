@@ -264,6 +264,27 @@ pub enum RoutingStrategy {
     Maximus,
 }
 
+impl RoutingStrategy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Reaper  => "reaper",
+            Self::Carousel => "carousel",
+            Self::Cushion  => "cushion",
+            Self::Maximus  => "maximus",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "reaper" | "earliest-expiry" | "earliest_expiry" => Some(Self::Reaper),
+            "carousel" | "round-robin" | "round_robin" => Some(Self::Carousel),
+            "cushion" | "most-available" | "most_available" => Some(Self::Cushion),
+            "maximus" => Some(Self::Maximus),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub host: String,
@@ -422,12 +443,9 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
         custom_domain: raw.server.custom_domain,
         sticky_ttl_ms: raw.server.sticky_ttl_minutes.unwrap_or(10) * 60 * 1000,
         expiry_soon_secs: raw.server.expiry_soon_minutes.unwrap_or(30) * 60,
-        routing_strategy: match raw.server.routing_strategy.as_deref() {
-            Some("reaper") | Some("earliest-expiry") | Some("earliest_expiry") => RoutingStrategy::Reaper,
-            Some("carousel") | Some("round-robin") | Some("round_robin") => RoutingStrategy::Carousel,
-            Some("cushion") | Some("most-available") | Some("most_available") => RoutingStrategy::Cushion,
-            _ => RoutingStrategy::Maximus,
-        },
+        routing_strategy: raw.server.routing_strategy.as_deref()
+            .and_then(RoutingStrategy::from_str)
+            .unwrap_or_default(),
         request_timeout_secs: raw.server.request_timeout_secs.unwrap_or(600),
         rate_limit_rpm: raw.server.rate_limit_rpm.unwrap_or(0),
         trust_proxy_headers: raw.server.trust_proxy_headers.unwrap_or(false),

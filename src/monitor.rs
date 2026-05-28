@@ -278,6 +278,30 @@ impl ModelPicker {
     fn selected_id(&self) -> &str { MODEL_PRESETS[self.cursor].2 }
 }
 
+/// (display name, description, strategy id, "" = auto/clear)
+const STRATEGY_PRESETS: &[(&str, &str, &str)] = &[
+    ("Maximus",  "Time-weighted dual-window scorer",       "maximus"),
+    ("Reaper",   "Use-it-or-lose-it · drain expiring first", "reaper"),
+    ("Carousel", "Fixed round-robin cycle",                "carousel"),
+    ("Cushion",  "Lowest utilization · softest landing",   "cushion"),
+];
+
+struct StrategyPicker {
+    cursor: usize,
+}
+
+impl StrategyPicker {
+    fn new(current: Option<&str>) -> Self {
+        let cursor = current
+            .and_then(|s| STRATEGY_PRESETS.iter().position(|(_, _, id)| *id == s))
+            .unwrap_or(0); // default to Maximus
+        Self { cursor }
+    }
+    fn up(&mut self)   { self.cursor = if self.cursor == 0 { STRATEGY_PRESETS.len() - 1 } else { self.cursor - 1 }; }
+    fn down(&mut self) { self.cursor = (self.cursor + 1) % STRATEGY_PRESETS.len(); }
+    fn selected_id(&self) -> &str { STRATEGY_PRESETS[self.cursor].2 }
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -287,6 +311,7 @@ pub async fn run_monitor(base_url: &str) -> Result<()> {
     let status_url = format!("{base}/status");
     let use_url    = format!("{base}/use");
     let model_url  = format!("{base}/model");
+    let strategy_url = format!("{base}/strategy");
 
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -313,6 +338,9 @@ pub async fn run_monitor(base_url: &str) -> Result<()> {
     let mut picker: Option<Picker> = None;
     let mut model_picker: Option<ModelPicker> = None;
     let mut model_override: Option<String> = None;
+    let mut strategy_picker: Option<StrategyPicker> = None;
+    let mut current_strategy: Option<String> = None;
+    let mut strategy_source: Option<String> = None;
     let mut show_help = false;
     let mut refresh_ms: u64 = 1_000;
     let mut focus = Focus::Accounts;
@@ -335,12 +363,24 @@ pub async fn run_monitor(base_url: &str) -> Result<()> {
                     model_override = v["model"].as_str().map(|s| s.to_owned());
                 }
             }
+            // Fetch current routing strategy
+            if let Ok(r) = reqwest::Client::new()
+                .get(&strategy_url)
+                .timeout(Duration::from_secs(2))
+                .send().await
+            {
+                if let Ok(v) = r.json::<serde_json::Value>().await {
+                    current_strategy = v["strategy"].as_str().map(|s| s.to_owned());
+                    strategy_source = v["source"].as_str().map(|s| s.to_owned());
+                }
+            }
             last_fetch = Instant::now();
         }
 
         terminal.draw(|f| {
             draw(f, &state, &fetch_err, accounts_scroll, requests_scroll,
                  base_url, &picker, &model_picker, &model_override,
+                 &strategy_picker, &current_strategy, &strategy_source,
                  show_help, refresh_ms, focus, chart_window, start_time)
         })?;
 
@@ -402,6 +442,29 @@ pub async fn run_monitor(base_url: &str) -> Result<()> {
                     continue;
                 }
 
+                // Strategy picker overlay
+                if let Some(ref mut sp) = strategy_picker {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char('q') => { strategy_picker = None; }
+                        KeyCode::Up   | KeyCode::Char('k') => sp.up(),
+                        KeyCode::Down | KeyCode::Char('j') => sp.down(),
+                        KeyCode::Enter => {
+                            let chosen_id = sp.selected_id().to_owned();
+                            strategy_picker = None;
+                            let client = reqwest::Client::new();
+                            let _ = client.post(&strategy_url)
+                                .json(&serde_json::json!({ "strategy": chosen_id }))
+                                .timeout(Duration::from_secs(3))
+                                .send().await;
+                            current_strategy = Some(chosen_id);
+                            strategy_source = Some("override".to_owned());
+                            last_fetch = Instant::now() - Duration::from_secs(10);
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
                 match (key.code, key.modifiers) {
                     (KeyCode::Char('q'), _)
                     | (KeyCode::Esc, _)
@@ -441,6 +504,9 @@ pub async fn run_monitor(base_url: &str) -> Result<()> {
                     }
                     (KeyCode::Char('m'), _) => {
                         model_picker = Some(ModelPicker::new(model_override.as_deref()));
+                    }
+                    (KeyCode::Char('s'), _) => {
+                        strategy_picker = Some(StrategyPicker::new(current_strategy.as_deref()));
                     }
                     (KeyCode::Char('?'), _) => { show_help = true; }
                     (KeyCode::Char('+'), _) | (KeyCode::Char('='), _) => {
@@ -495,6 +561,9 @@ fn draw(
     picker: &Option<Picker>,
     model_picker: &Option<ModelPicker>,
     model_override: &Option<String>,
+    strategy_picker: &Option<StrategyPicker>,
+    current_strategy: &Option<String>,
+    strategy_source: &Option<String>,
     show_help: bool,
     refresh_ms: u64,
     focus: Focus,
@@ -512,21 +581,22 @@ fn draw(
         ])
         .split(area);
 
-    draw_header(f, chunks[0], state, model_override);
+    draw_header(f, chunks[0], state, model_override, current_strategy, strategy_source);
 
     match state {
         None    => draw_connecting(f, chunks[1], error, base_url, start_time),
         Some(s) => draw_body(f, chunks[1], s, accounts_scroll, requests_scroll, focus, chart_window),
     }
 
-    draw_footer(f, chunks[2], picker.is_some() || model_picker.is_some(), refresh_ms, focus);
+    draw_footer(f, chunks[2], picker.is_some() || model_picker.is_some() || strategy_picker.is_some(), refresh_ms, focus);
 
     if let Some(p) = picker { draw_picker(f, p, area); }
     if let Some(mp) = model_picker { draw_model_picker(f, mp, model_override.as_deref(), area); }
+    if let Some(sp) = strategy_picker { draw_strategy_picker(f, sp, current_strategy.as_deref(), area); }
     if show_help { draw_help_overlay(f, area); }
 }
 
-fn draw_header(f: &mut Frame, area: Rect, state: &Option<StatusResponse>, model_override: &Option<String>) {
+fn draw_header(f: &mut Frame, area: Rect, state: &Option<StatusResponse>, model_override: &Option<String>, current_strategy: &Option<String>, strategy_source: &Option<String>) {
     let uptime_span = state
         .as_ref()
         .and_then(|s| s.started_ms)
@@ -549,6 +619,15 @@ fn draw_header(f: &mut Frame, area: Rect, state: &Option<StatusResponse>, model_
         spans.push(Span::styled("  ·  ", style_dim()));
         spans.push(Span::styled("model ", style_dim()));
         spans.push(Span::styled(shorten_model(m), style_yellow()));
+    }
+    if let Some(ref strat) = current_strategy {
+        let is_override = strategy_source.as_deref() == Some("override");
+        spans.push(Span::styled("  ·  ", style_dim()));
+        spans.push(Span::styled("strategy ", style_dim()));
+        spans.push(Span::styled(
+            strat.clone(),
+            if is_override { style_yellow() } else { style_dim() },
+        ));
     }
 
     let block = Block::default().borders(Borders::BOTTOM).border_style(style_dkgreen());
@@ -577,6 +656,7 @@ fn draw_footer(f: &mut Frame, area: Rect, picker_open: bool, refresh_ms: u64, fo
             Span::styled("r", style_green()), Span::styled(" refresh", style_dim()), sep(),
             Span::styled("u", style_green()), Span::styled(" pin", style_dim()), sep(),
             Span::styled("m", style_green()), Span::styled(" model", style_dim()), sep(),
+            Span::styled("s", style_green()), Span::styled(" strategy", style_dim()), sep(),
             Span::styled("+/-", style_green()), Span::styled(format!(" speed  {rate_str}"), style_dim()), sep(),
             Span::styled("?", style_green()), Span::styled(" help", style_dim()),
         ])
@@ -1089,6 +1169,45 @@ fn draw_model_picker(f: &mut Frame, mp: &ModelPicker, current: Option<&str>, are
     );
 }
 
+fn draw_strategy_picker(f: &mut Frame, sp: &StrategyPicker, current: Option<&str>, area: Rect) {
+    let h = (STRATEGY_PRESETS.len() + 4) as u16;
+    let w = 58u16;
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    let popup_area = Rect { x, y, width: w.min(area.width), height: h.min(area.height) };
+
+    f.render_widget(Clear, popup_area);
+    let block = Block::default()
+        .title(Line::from(Span::styled(" select routing strategy ", style_dim())))
+        .borders(Borders::ALL)
+        .border_style(style_dkgreen());
+    let inner = block.inner(popup_area);
+    f.render_widget(block, popup_area);
+
+    let rows: Vec<Row> = STRATEGY_PRESETS.iter().enumerate().map(|(i, &(name, desc, id))| {
+        let is_sel = i == sp.cursor;
+        let is_current = current == Some(id);
+        let bullet = if is_sel { "◆" } else { " " };
+        let check  = if is_current { " ✓" } else { "  " };
+        let name_style = if is_sel {
+            Style::default().fg(GREEN).add_modifier(Modifier::BOLD)
+        } else {
+            style_white()
+        };
+        Row::new(vec![
+            Cell::from(Span::styled(format!("  {bullet}"), style_dim())),
+            Cell::from(Span::styled(format!("{name}{check}"), name_style)),
+            Cell::from(Span::styled(desc, style_dim())),
+        ])
+    }).collect();
+
+    f.render_widget(
+        Table::new(rows, [Constraint::Length(4), Constraint::Length(14), Constraint::Min(0)])
+            .column_spacing(1),
+        inner,
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Help overlay
 // ---------------------------------------------------------------------------
@@ -1102,6 +1221,7 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
         ("r",        "force refresh"),
         ("u",        "pin account"),
         ("m",        "override model"),
+        ("s",        "switch routing strategy"),
         ("t / ]",   "next time window"),
         ("[",        "prev time window"),
         ("+  / =",  "faster refresh"),
