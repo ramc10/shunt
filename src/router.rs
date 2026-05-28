@@ -74,8 +74,6 @@ fn canonical_tools(v: &serde_json::Value) -> String {
 ///
 /// `effective_utilization` = max(util_5h, util_7d) — the binding constraint is whichever
 /// window is more exhausted.
-///
-/// `binding_reset` = the reset timestamp of the most-utilized (binding) window.
 fn most_urgent_window(
     util_5h: f64, reset_5h: Option<u64>,
     util_7d: f64, reset_7d: Option<u64>,
@@ -83,6 +81,42 @@ fn most_urgent_window(
     let effective = util_5h.max(util_7d);
     let binding_reset = if util_5h >= util_7d { reset_5h } else { reset_7d };
     (effective, binding_reset)
+}
+
+/// Compute the Maximus composite score for an account.
+///
+/// For each window:
+///   time_fraction = secs_to_reset / window_duration  (0.0 = resetting now, 1.0 = just started)
+///   health        = 1.0 - time_fraction × utilization
+///
+/// score = health_5h × health_7d
+///
+/// This rewards accounts where:
+///   - quota is mostly unused (low utilization)
+///   - any depleted window is about to refresh (low time_fraction)
+///
+/// Fresh accounts with no rate-limit data score 1.0 (best possible).
+fn maximus_score(state: &StateStore, name: &str, now_secs: u64) -> f64 {
+    const WINDOW_5H_SECS: f64 = 5.0 * 3600.0;
+    const WINDOW_7D_SECS: f64 = 7.0 * 24.0 * 3600.0;
+
+    let util_5h = state.utilization_5h(name);
+    let util_7d = state.utilization_7d(name);
+
+    // time_fraction = 0.0 means resetting imminently → no penalty even if heavily used.
+    // Unknown reset (fresh account, util already 0.0) → time_frac = 0.0 → health = 1.0.
+    let time_frac_5h = state.reset_5h_secs(name)
+        .map(|r| (r.saturating_sub(now_secs) as f64 / WINDOW_5H_SECS).min(1.0))
+        .unwrap_or(0.0);
+
+    let time_frac_7d = state.reset_7d_secs(name)
+        .map(|r| (r.saturating_sub(now_secs) as f64 / WINDOW_7D_SECS).min(1.0))
+        .unwrap_or(0.0);
+
+    let health_5h = 1.0 - time_frac_5h * util_5h;
+    let health_7d = 1.0 - time_frac_7d * util_7d;
+
+    health_5h * health_7d
 }
 
 // ---------------------------------------------------------------------------
@@ -94,7 +128,7 @@ fn most_urgent_window(
 /// 1. If a pinned account is set and available, use it.
 /// 2. If the conversation fingerprint maps to a sticky account that is still
 ///    available and not exhausted (and not in `tried`), use it.
-/// 3. Otherwise, apply `strategy` to pick from all available, non-exhausted accounts
+/// 3. Otherwise apply `strategy` to pick from all available, non-exhausted candidates
 ///    not already in `tried`, and record the result as sticky.
 ///
 /// Returns `None` when every account is on cooldown, disabled, exhausted, or in `tried`.
@@ -143,24 +177,22 @@ pub fn pick_account<'a>(
     }
 
     let chosen = match strategy {
-        RoutingStrategy::RoundRobin => {
+        // ── Carousel: rotate through accounts in index order ────────────────
+        RoutingStrategy::Carousel => {
             let idx = state.next_rr_index() % candidates.len();
             candidates[idx]
         }
 
-        RoutingStrategy::MostAvailable => {
+        // ── Cushion: most remaining quota (binding window primary, secondary tiebreak) ──
+        RoutingStrategy::Cushion => {
             candidates.iter().copied().min_by(|a, b| {
                 let a5 = state.utilization_5h(&a.name);
                 let a7 = state.utilization_7d(&a.name);
                 let b5 = state.utilization_5h(&b.name);
                 let b7 = state.utilization_7d(&b.name);
 
-                // Primary: the binding window (most-exhausted of 5h/7d).
-                // Prefer lower utilization = more tokens remaining.
-                let a_binding = a5.max(a7);
-                let b_binding = b5.max(b7);
-
-                // Secondary: the non-binding window — breaks ties when binding windows are equal.
+                let a_binding   = a5.max(a7);
+                let b_binding   = b5.max(b7);
                 let a_secondary = a5.min(a7);
                 let b_secondary = b5.min(b7);
 
@@ -170,7 +202,22 @@ pub fn pick_account<'a>(
             })?
         }
 
-        RoutingStrategy::EarliestExpiry => {
+        // ── Maximus: time-weighted dual-window scorer ────────────────────────
+        RoutingStrategy::Maximus => {
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+
+            candidates.iter().copied().max_by(|a, b| {
+                let sa = maximus_score(state, &a.name, now_secs);
+                let sb = maximus_score(state, &b.name, now_secs);
+                sa.partial_cmp(&sb).unwrap_or(Ordering::Equal)
+            })?
+        }
+
+        // ── Reaper: use-it-or-lose-it; drain expiring windows first ─────────
+        RoutingStrategy::Reaper => {
             let now_secs = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -187,24 +234,17 @@ pub fn pick_account<'a>(
                 );
 
                 // "Expiring soon": binding window resets within expiry_soon_secs.
-                // Route to these first — use-it-or-lose-it.
                 let a_expiring = ra.map(|r| r.saturating_sub(now_secs) <= expiry_soon_secs).unwrap_or(false);
                 let b_expiring = rb.map(|r| r.saturating_sub(now_secs) <= expiry_soon_secs).unwrap_or(false);
 
                 match (a_expiring, b_expiring) {
                     (true, false) => Ordering::Less,
                     (false, true) => Ordering::Greater,
-                    // Both expiring soon: prefer the most urgent (soonest reset) first.
-                    (true, true) => ra.cmp(&rb),
-                    // Neither expiring soon:
-                    // - prefer accounts with a known reset time over fresh accounts
-                    //   (fresh accounts have full quota; save them as backup)
-                    // - among those, prefer soonest reset (tokens most at risk of being wasted)
-                    // - tiebreak: prefer lowest utilization (most tokens remaining)
+                    (true, true)  => ra.cmp(&rb), // most urgent first
                     (false, false) => match (ra, rb) {
-                        (None, None) => Ordering::Equal,
-                        (Some(_), None) => Ordering::Less,   // known-expiry before fresh
-                        (None, Some(_)) => Ordering::Greater, // fresh last
+                        (None, None)         => Ordering::Equal,
+                        (Some(_), None)      => Ordering::Less,   // known-expiry before fresh
+                        (None, Some(_))      => Ordering::Greater, // fresh last
                         (Some(ra_t), Some(rb_t)) => {
                             ra_t.cmp(&rb_t)
                                 .then_with(|| ua.partial_cmp(&ub).unwrap_or(Ordering::Equal))
@@ -264,177 +304,195 @@ mod tests {
         });
     }
 
-    fn pick_ee(accounts: &[AccountConfig], state: &StateStore) -> Option<String> {
-        pick_account(accounts, state, None, &HashSet::new(), 600_000, 1800,
-            RoutingStrategy::EarliestExpiry)
-            .map(|a| a.name.clone())
-    }
-
-    #[test]
-    fn test_routing_prefers_expiring_soon() {
-        let accounts = vec![make_account("fresh"), make_account("expiring")];
-        let state = StateStore::new_empty();
-
-        // "expiring" has 30% util and resets in 15 min (within 30-min window) — use-it-or-lose-it
-        // "fresh" has 5% util and resets in 4 hours
-        set_rate_limits(&state, "fresh", 0.05, 4 * 3600);
-        set_rate_limits(&state, "expiring", 0.3, 15 * 60);
-
-        assert_eq!(pick_ee(&accounts, &state).as_deref(), Some("expiring"),
-            "should prefer the account expiring soon (use-it-or-lose-it)");
-    }
-
-    #[test]
-    fn test_routing_equal_utilization_prefers_earlier_reset() {
-        let accounts = vec![make_account("later"), make_account("sooner")];
-        let state = StateStore::new_empty();
-
-        // Both at 50% but different reset times — prefer the one that resets sooner
-        set_rate_limits(&state, "later", 0.5, 5 * 3600);
-        set_rate_limits(&state, "sooner", 0.5, 2 * 3600);
-
-        assert_eq!(pick_ee(&accounts, &state).as_deref(), Some("sooner"),
-            "equal utilization: should prefer the account whose window resets sooner");
-    }
-
-    #[test]
-    fn test_routing_same_reset_prefers_more_remaining() {
-        let accounts = vec![make_account("high"), make_account("low")];
-        let state = StateStore::new_empty();
-
-        // Same reset time; "low" has more remaining (20% used vs 80% used).
-        set_rate_limits(&state, "high", 0.8, 3 * 3600);
-        set_rate_limits(&state, "low",  0.2, 3 * 3600);
-
-        assert_eq!(pick_ee(&accounts, &state).as_deref(), Some("low"),
-            "same reset time: should prefer the account with most remaining quota");
-    }
-
-    #[test]
-    fn test_routing_skips_exhausted() {
-        let accounts = vec![make_account("exhausted"), make_account("fresh")];
-        let state = StateStore::new_empty();
+    fn set_both_windows(state: &StateStore, name: &str,
+        util_5h: f64, reset_5h_offset: u64,
+        util_7d: f64, reset_7d_offset: u64)
+    {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        state.update_rate_limits("exhausted", RateLimitInfo {
-            utilization_5h: Some(1.0),
-            reset_5h: Some(now + 3600),
-            status_5h: Some("exhausted".to_owned()),
-            utilization_7d: None,
-            reset_7d: None,
-            status_7d: None,
+        state.update_rate_limits(name, RateLimitInfo {
+            utilization_5h: Some(util_5h),
+            reset_5h: Some(now + reset_5h_offset),
+            status_5h: Some("allowed".to_owned()),
+            utilization_7d: Some(util_7d),
+            reset_7d: Some(now + reset_7d_offset),
+            status_7d: Some("allowed".to_owned()),
             overage_status: None,
             overage_disabled_reason: None,
             representative_claim: None,
             updated_ms: now * 1000,
         });
-
-        assert_eq!(pick_ee(&accounts, &state).as_deref(), Some("fresh"),
-            "should skip accounts with exhausted quota");
     }
 
+    fn pick(accounts: &[AccountConfig], state: &StateStore, strategy: RoutingStrategy) -> Option<String> {
+        pick_account(accounts, state, None, &HashSet::new(), 600_000, 1800, strategy)
+            .map(|a| a.name.clone())
+    }
+
+    // ── Reaper tests ─────────────────────────────────────────────────────────
+
     #[test]
-    fn test_routing_skips_unavailable() {
-        let accounts = vec![make_account("cooling"), make_account("ready")];
+    fn reaper_prefers_expiring_soon() {
+        let accounts = vec![make_account("fresh"), make_account("expiring")];
         let state = StateStore::new_empty();
-        state.set_cooldown("cooling", 60_000);
+        set_rate_limits(&state, "fresh", 0.05, 4 * 3600);
+        set_rate_limits(&state, "expiring", 0.3, 15 * 60);
 
-        assert_eq!(pick_ee(&accounts, &state).as_deref(), Some("ready"),
-            "should skip accounts on cooldown");
+        assert_eq!(pick(&accounts, &state, RoutingStrategy::Reaper).as_deref(), Some("expiring"),
+            "reaper: should prefer the account expiring soon");
     }
 
     #[test]
-    fn test_routing_pinned_account_wins() {
-        let accounts = vec![make_account("a"), make_account("b")];
+    fn reaper_prefers_earlier_reset_on_equal_util() {
+        let accounts = vec![make_account("later"), make_account("sooner")];
         let state = StateStore::new_empty();
-        set_rate_limits(&state, "a", 0.9, 3600);
-        set_rate_limits(&state, "b", 0.1, 3600);
-        state.set_pinned(Some("b".to_owned()));
+        set_rate_limits(&state, "later", 0.5, 5 * 3600);
+        set_rate_limits(&state, "sooner", 0.5, 2 * 3600);
 
-        assert_eq!(
-            pick_account(&accounts, &state, None, &HashSet::new(), 600_000, 1800,
-                RoutingStrategy::EarliestExpiry)
-                .map(|a| a.name.as_str()),
-            Some("b"),
-            "pinned account should override routing strategy");
+        assert_eq!(pick(&accounts, &state, RoutingStrategy::Reaper).as_deref(), Some("sooner"),
+            "reaper: equal util → prefer sooner reset");
     }
 
     #[test]
-    fn test_round_robin_cycles() {
+    fn reaper_prefers_more_remaining_on_equal_reset() {
+        let accounts = vec![make_account("high"), make_account("low")];
+        let state = StateStore::new_empty();
+        set_rate_limits(&state, "high", 0.8, 3 * 3600);
+        set_rate_limits(&state, "low",  0.2, 3 * 3600);
+
+        assert_eq!(pick(&accounts, &state, RoutingStrategy::Reaper).as_deref(), Some("low"),
+            "reaper: same reset → prefer lowest utilization (most remaining)");
+    }
+
+    // ── Shared availability tests ─────────────────────────────────────────────
+
+    #[test]
+    fn all_strategies_skip_exhausted() {
+        for strategy in [RoutingStrategy::Reaper, RoutingStrategy::Cushion, RoutingStrategy::Maximus] {
+            let accounts = vec![make_account("exhausted"), make_account("fresh")];
+            let state = StateStore::new_empty();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+            state.update_rate_limits("exhausted", RateLimitInfo {
+                utilization_5h: Some(1.0),
+                reset_5h: Some(now + 3600),
+                status_5h: Some("exhausted".to_owned()),
+                utilization_7d: None, reset_7d: None, status_7d: None,
+                overage_status: None, overage_disabled_reason: None,
+                representative_claim: None, updated_ms: now * 1000,
+            });
+            assert_eq!(pick(&accounts, &state, strategy).as_deref(), Some("fresh"),
+                "{strategy:?}: should skip exhausted account");
+        }
+    }
+
+    #[test]
+    fn all_strategies_skip_cooldown() {
+        for strategy in [RoutingStrategy::Reaper, RoutingStrategy::Carousel,
+                         RoutingStrategy::Cushion, RoutingStrategy::Maximus] {
+            let accounts = vec![make_account("cooling"), make_account("ready")];
+            let state = StateStore::new_empty();
+            state.set_cooldown("cooling", 60_000);
+            assert_eq!(pick(&accounts, &state, strategy).as_deref(), Some("ready"),
+                "{strategy:?}: should skip accounts on cooldown");
+        }
+    }
+
+    #[test]
+    fn pinned_account_beats_all_strategies() {
+        for strategy in [RoutingStrategy::Reaper, RoutingStrategy::Carousel,
+                         RoutingStrategy::Cushion, RoutingStrategy::Maximus] {
+            let accounts = vec![make_account("a"), make_account("b")];
+            let state = StateStore::new_empty();
+            set_rate_limits(&state, "a", 0.9, 3600);
+            set_rate_limits(&state, "b", 0.1, 3600);
+            state.set_pinned(Some("b".to_owned()));
+            assert_eq!(pick(&accounts, &state, strategy).as_deref(), Some("b"),
+                "{strategy:?}: pinned account should always win");
+            state.set_pinned(None);
+        }
+    }
+
+    // ── Carousel tests ────────────────────────────────────────────────────────
+
+    #[test]
+    fn carousel_cycles_in_order() {
         let accounts = vec![make_account("a"), make_account("b"), make_account("c")];
         let state = StateStore::new_empty();
-
         let picks: Vec<_> = (0..6)
-            .map(|_| pick_account(&accounts, &state, None, &HashSet::new(), 600_000, 1800,
-                RoutingStrategy::RoundRobin)
-                .map(|a| a.name.clone()))
+            .map(|_| pick(&accounts, &state, RoutingStrategy::Carousel))
             .collect();
-
-        // Should cycle a → b → c → a → b → c
         assert_eq!(picks[0].as_deref(), Some("a"));
         assert_eq!(picks[1].as_deref(), Some("b"));
         assert_eq!(picks[2].as_deref(), Some("c"));
         assert_eq!(picks[3].as_deref(), Some("a"));
     }
 
+    // ── Cushion tests ─────────────────────────────────────────────────────────
+
     #[test]
-    fn test_most_available_picks_lowest_binding() {
+    fn cushion_picks_lowest_binding() {
         let accounts = vec![make_account("heavy"), make_account("light")];
         let state = StateStore::new_empty();
-
         set_rate_limits(&state, "heavy", 0.8, 3600);
         set_rate_limits(&state, "light", 0.1, 3600);
-
-        assert_eq!(
-            pick_account(&accounts, &state, None, &HashSet::new(), 600_000, 1800,
-                RoutingStrategy::MostAvailable)
-                .map(|a| a.name.as_str()),
-            Some("light"),
-            "most-available should pick the account with the lowest binding-window utilization");
+        assert_eq!(pick(&accounts, &state, RoutingStrategy::Cushion).as_deref(), Some("light"),
+            "cushion: should pick the lowest binding-window utilization");
     }
 
     #[test]
-    fn test_most_available_tiebreaks_on_secondary_window() {
+    fn cushion_tiebreaks_on_secondary_window() {
         let accounts = vec![make_account("worse"), make_account("better")];
         let state = StateStore::new_empty();
         let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        // Both have 5h binding at 50%, but "better" has more room in the 7d window.
+            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        // Both 5h at 50%; "better" has more room in 7d.
         state.update_rate_limits("worse", RateLimitInfo {
-            utilization_5h: Some(0.5),
-            reset_5h: Some(now + 3600),
+            utilization_5h: Some(0.5), reset_5h: Some(now + 3600),
             status_5h: Some("allowed".to_owned()),
-            utilization_7d: Some(0.6),
-            reset_7d: Some(now + 86400),
+            utilization_7d: Some(0.6), reset_7d: Some(now + 86400),
             status_7d: Some("allowed".to_owned()),
-            overage_status: None,
-            overage_disabled_reason: None,
-            representative_claim: None,
-            updated_ms: now * 1000,
+            overage_status: None, overage_disabled_reason: None,
+            representative_claim: None, updated_ms: now * 1000,
         });
         state.update_rate_limits("better", RateLimitInfo {
-            utilization_5h: Some(0.5),
-            reset_5h: Some(now + 3600),
+            utilization_5h: Some(0.5), reset_5h: Some(now + 3600),
             status_5h: Some("allowed".to_owned()),
-            utilization_7d: Some(0.2),
-            reset_7d: Some(now + 86400),
+            utilization_7d: Some(0.2), reset_7d: Some(now + 86400),
             status_7d: Some("allowed".to_owned()),
-            overage_status: None,
-            overage_disabled_reason: None,
-            representative_claim: None,
-            updated_ms: now * 1000,
+            overage_status: None, overage_disabled_reason: None,
+            representative_claim: None, updated_ms: now * 1000,
         });
+        assert_eq!(pick(&accounts, &state, RoutingStrategy::Cushion).as_deref(), Some("better"),
+            "cushion: tied binding → prefer lower secondary window");
+    }
 
-        assert_eq!(
-            pick_account(&accounts, &state, None, &HashSet::new(), 600_000, 1800,
-                RoutingStrategy::MostAvailable)
-                .map(|a| a.name.as_str()),
-            Some("better"),
-            "tied binding window: should prefer lower secondary-window utilization");
+    // ── Maximus tests ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn maximus_prefers_imminent_reset_over_raw_utilization() {
+        let accounts = vec![make_account("draining"), make_account("almost_reset")];
+        let state = StateStore::new_empty();
+        // "draining": 5h at 60%, resets in 3h; 7d at 30%, resets in 4 days
+        set_both_windows(&state, "draining",     0.6, 3 * 3600, 0.3, 4 * 24 * 3600);
+        // "almost_reset": 5h at 90%, resets in 10 min; 7d at 20%, resets in 3 days
+        // Despite 90% 5h utilization, it resets very soon — should score well
+        set_both_windows(&state, "almost_reset", 0.9, 10 * 60,  0.2, 3 * 24 * 3600);
+
+        assert_eq!(pick(&accounts, &state, RoutingStrategy::Maximus).as_deref(), Some("almost_reset"),
+            "maximus: nearly-reset window should outscore higher raw remaining");
+    }
+
+    #[test]
+    fn maximus_picks_fresh_over_depleted() {
+        let accounts = vec![make_account("depleted"), make_account("fresh")];
+        let state = StateStore::new_empty();
+        set_both_windows(&state, "depleted", 0.8, 3 * 3600, 0.7, 5 * 24 * 3600);
+        // "fresh" has no rate-limit data → scores 1.0
+
+        assert_eq!(pick(&accounts, &state, RoutingStrategy::Maximus).as_deref(), Some("fresh"),
+            "maximus: fresh account should beat heavily utilised one");
     }
 }

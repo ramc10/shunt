@@ -241,21 +241,27 @@ fn default_plan_type() -> String { "pro".into() }
 /// Account-selection algorithm used when no sticky or pinned account applies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RoutingStrategy {
-    /// Use-it-or-lose-it: drain accounts whose quota windows expire soonest first.
-    /// Among the rest, prefer accounts with the most remaining quota.
-    /// This maximises total token usage across all accounts over time.
+    /// Harvest every token before the window expires — use-it-or-lose-it.
+    /// Drains accounts whose quota windows expire soonest first, then prefers
+    /// the account with the most remaining quota. Maximises total token usage over time.
+    /// Config: `"reaper"`
     #[default]
-    EarliestExpiry,
-    /// Cycle through accounts in round-robin order regardless of quota.
-    RoundRobin,
-    /// Route to the account with the most available capacity across both quota windows.
-    ///
-    /// Selects the account where the binding window (the more-exhausted of 5h and 7d)
-    /// has the most tokens remaining. When two accounts are tied on their binding window,
-    /// the secondary (less-exhausted) window breaks the tie.
-    ///
-    /// Best choice when you want to minimise the chance of hitting a rate limit mid-request.
-    MostAvailable,
+    Reaper,
+    /// Spins through accounts in a fixed round-robin cycle, ignoring quota state.
+    /// Config: `"carousel"`
+    Carousel,
+    /// Always routes to the account with the softest landing — the most remaining
+    /// capacity across both 5h and 7d windows (binding window primary, secondary as tiebreak).
+    /// Config: `"cushion"`
+    Cushion,
+    /// Time-weighted dual-window optimizer. Scores each account as:
+    ///   health_5h = 1 - (time_fraction_5h × util_5h)
+    ///   health_7d = 1 - (time_fraction_7d × util_7d)
+    ///   score     = health_5h × health_7d
+    /// where time_fraction = secs_to_reset / window_duration (0 = resetting now, 1 = just started).
+    /// Accounts for how much quota remains AND how soon each window refreshes.
+    /// Config: `"maximus"`
+    Maximus,
 }
 
 #[derive(Debug, Clone)]
@@ -305,7 +311,7 @@ impl Default for ServerConfig {
             custom_domain: None,
             sticky_ttl_ms: 10 * 60 * 1000,
             expiry_soon_secs: 30 * 60,
-            routing_strategy: RoutingStrategy::EarliestExpiry,
+            routing_strategy: RoutingStrategy::Reaper,
             request_timeout_secs: 600,
             rate_limit_rpm: 0,
             trust_proxy_headers: false,
@@ -417,9 +423,10 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
         sticky_ttl_ms: raw.server.sticky_ttl_minutes.unwrap_or(10) * 60 * 1000,
         expiry_soon_secs: raw.server.expiry_soon_minutes.unwrap_or(30) * 60,
         routing_strategy: match raw.server.routing_strategy.as_deref() {
-            Some("round-robin") | Some("round_robin") => RoutingStrategy::RoundRobin,
-            Some("most-available") | Some("most_available") => RoutingStrategy::MostAvailable,
-            _ => RoutingStrategy::EarliestExpiry,
+            Some("carousel") | Some("round-robin") | Some("round_robin") => RoutingStrategy::Carousel,
+            Some("cushion") | Some("most-available") | Some("most_available") => RoutingStrategy::Cushion,
+            Some("maximus") => RoutingStrategy::Maximus,
+            _ => RoutingStrategy::Reaper,
         },
         request_timeout_secs: raw.server.request_timeout_secs.unwrap_or(600),
         rate_limit_rpm: raw.server.rate_limit_rpm.unwrap_or(0),
