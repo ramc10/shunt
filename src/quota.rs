@@ -24,8 +24,14 @@ pub fn extract_usage_from_json(body: &[u8]) -> (u64, u64) {
         Ok(v) => v,
         Err(_) => return (0, 0),
     };
-    let input  = v["usage"]["input_tokens"].as_u64().unwrap_or(0);
-    let output = v["usage"]["output_tokens"].as_u64().unwrap_or(0);
+    let usage = &v["usage"];
+    // Support both Anthropic (input_tokens/output_tokens) and OpenAI (prompt_tokens/completion_tokens).
+    let input  = usage["input_tokens"].as_u64()
+        .or_else(|| usage["prompt_tokens"].as_u64())
+        .unwrap_or(0);
+    let output = usage["output_tokens"].as_u64()
+        .or_else(|| usage["completion_tokens"].as_u64())
+        .unwrap_or(0);
     (input, output)
 }
 
@@ -106,16 +112,30 @@ impl SseScanner {
                 if let Ok(v) = serde_json::from_slice::<serde_json::Value>(json_bytes) {
                     match self.last_event {
                         LastEvent::MessageStart => {
+                            // Anthropic: message_start carries input token count.
                             self.input_tokens += v["message"]["usage"]["input_tokens"]
                                 .as_u64()
                                 .unwrap_or(0);
                         }
                         LastEvent::MessageDelta => {
+                            // Anthropic: message_delta carries output token count.
                             self.output_tokens += v["usage"]["output_tokens"]
                                 .as_u64()
                                 .unwrap_or(0);
                         }
-                        LastEvent::None => {}
+                        LastEvent::None => {
+                            // OpenAI format: no event: lines. Usage arrives in a
+                            // final chunk when stream_options.include_usage is set.
+                            // Field names: prompt_tokens / completion_tokens.
+                            if let Some(usage) = v.get("usage") {
+                                if let Some(pt) = usage["prompt_tokens"].as_u64() {
+                                    self.input_tokens = self.input_tokens.max(pt);
+                                }
+                                if let Some(ct) = usage["completion_tokens"].as_u64() {
+                                    self.output_tokens = self.output_tokens.max(ct);
+                                }
+                            }
+                        }
                     }
                 }
                 self.last_event = LastEvent::None;

@@ -158,6 +158,10 @@ struct RawServer {
     request_timeout_secs: Option<u64>,
     /// Per-IP rate limit in requests per minute (0 = disabled, default disabled).
     rate_limit_rpm: Option<u32>,
+    /// Trust X-Real-IP / X-Forwarded-For headers for per-IP rate limiting.
+    /// Set to true only when shunt sits behind a trusted reverse proxy (e.g. cloudflared).
+    /// When false (default), all requests share one rate-limit bucket.
+    trust_proxy_headers: Option<bool>,
     /// URL of a shunt relay-server instance for multi-machine history aggregation.
     /// e.g. "http://relay.internal:3001"
     telemetry_url: Option<String>,
@@ -183,6 +187,7 @@ impl Default for RawServer {
             expiry_soon_minutes: None,
             request_timeout_secs: None,
             rate_limit_rpm: None,
+            trust_proxy_headers: None,
             telemetry_url: None,
             telemetry_token: None,
             instance_name: None,
@@ -252,6 +257,8 @@ pub struct ServerConfig {
     pub request_timeout_secs: u64,
     /// Per-IP rate limit in requests per minute (0 = disabled, default disabled).
     pub rate_limit_rpm: u32,
+    /// Trust X-Real-IP for per-IP rate limiting (only when behind a trusted proxy).
+    pub trust_proxy_headers: bool,
     /// Optional relay-server URL for cross-instance history aggregation.
     pub telemetry_url: Option<String>,
     /// Bearer token for the relay-server.
@@ -275,6 +282,7 @@ impl Default for ServerConfig {
             expiry_soon_secs: 30 * 60,
             request_timeout_secs: 600,
             rate_limit_rpm: 0,
+            trust_proxy_headers: false,
             telemetry_url: None,
             telemetry_token: None,
             instance_name: default_instance_name(),
@@ -384,6 +392,7 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
         expiry_soon_secs: raw.server.expiry_soon_minutes.unwrap_or(30) * 60,
         request_timeout_secs: raw.server.request_timeout_secs.unwrap_or(600),
         rate_limit_rpm: raw.server.rate_limit_rpm.unwrap_or(0),
+        trust_proxy_headers: raw.server.trust_proxy_headers.unwrap_or(false),
         telemetry_url,
         telemetry_token,
         instance_name,

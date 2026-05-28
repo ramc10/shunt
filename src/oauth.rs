@@ -127,7 +127,10 @@ pub fn write_codex_auth_file(cred: &OAuthCredential) {
         }
     });
     if let Ok(text) = serde_json::to_string_pretty(&auth) {
-        let _ = std::fs::write(&path, text);
+        let tmp = path.with_extension("tmp");
+        if std::fs::write(&tmp, &text).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
     }
 }
 
@@ -187,42 +190,7 @@ pub(crate) fn jwt_exp_ms(token: &str) -> Option<u64> {
 
 /// Minimal base64url decoder (no padding, URL-safe alphabet).
 fn base64_url_decode(s: &str) -> Option<Vec<u8>> {
-    // Convert base64url to standard base64 with padding
-    let mut standard = s.replace('-', "+").replace('_', "/");
-    match standard.len() % 4 {
-        2 => standard.push_str("=="),
-        3 => standard.push('='),
-        _ => {}
-    }
-    use std::io::Read;
-    // Use the standard library's base64 via a simple approach
-    // Rust std doesn't have base64, implement a small decoder
-    let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut table = [0u8; 256];
-    for (i, &c) in alphabet.iter().enumerate() {
-        table[c as usize] = i as u8;
-    }
-    let bytes = standard.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
-    let mut i = 0;
-    while i + 3 < bytes.len() {
-        let b0 = bytes[i];
-        let b1 = bytes[i + 1];
-        let b2 = bytes[i + 2];
-        let b3 = bytes[i + 3];
-        if b0 == b'=' { break; }
-        let n0 = table[b0 as usize] as u32;
-        let n1 = table[b1 as usize] as u32;
-        let n2 = if b2 == b'=' { 0 } else { table[b2 as usize] as u32 };
-        let n3 = if b3 == b'=' { 0 } else { table[b3 as usize] as u32 };
-        let val = (n0 << 18) | (n1 << 12) | (n2 << 6) | n3;
-        out.push(((val >> 16) & 0xFF) as u8);
-        if b2 != b'=' { out.push(((val >> 8) & 0xFF) as u8); }
-        if b3 != b'=' { out.push((val & 0xFF) as u8); }
-        i += 4;
-    }
-    let _ = Read::read(&mut out.as_slice(), &mut []); // suppress unused import warning
-    Some(out)
+    URL_SAFE_NO_PAD.decode(s).ok()
 }
 
 

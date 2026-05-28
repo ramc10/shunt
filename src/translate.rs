@@ -493,7 +493,9 @@ pub fn translate_chatgpt_stream_to_anthropic(
                     None => continue,
                 };
 
-                let delta = text[prev_len..].to_owned();
+                // Use .get() to avoid panicking if chatgpt sends a shorter
+                // accumulated text than prev_len (defensive — shouldn't happen).
+                let delta = text.get(prev_len..).unwrap_or("").to_owned();
                 if !delta.is_empty() {
                     if !content_block_open {
                         content_block_open = true;

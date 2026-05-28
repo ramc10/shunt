@@ -24,6 +24,9 @@ use crate::router;
 use crate::state::StateStore;
 use crate::telemetry::TelemetryClient;
 
+/// 100 MB limit — sufficient for any LLM request including large context windows.
+const MAX_REQUEST_BODY: usize = 100 * 1024 * 1024;
+
 #[derive(Clone)]
 struct AppState {
     config: Arc<Config>,
@@ -353,13 +356,23 @@ fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
 }
 
-/// Extract client IP from `X-Real-IP` header, falling back to a loopback sentinel.
-fn extract_client_ip(req: &Request) -> IpAddr {
-    req.headers()
-        .get("x-real-ip")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+/// Extract client IP for rate limiting.
+///
+/// `X-Real-IP` is only trusted when `trust_proxy_headers` is explicitly enabled
+/// in config — otherwise any client could spoof the header to rotate its bucket.
+/// When not trusted (the default), all requests share a single loopback bucket,
+/// giving a global RPM cap rather than a per-IP one.
+fn extract_client_ip(req: &Request, trust_proxy_headers: bool) -> IpAddr {
+    if trust_proxy_headers {
+        if let Some(ip) = req.headers()
+            .get("x-real-ip")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse().ok())
+        {
+            return ip;
+        }
+    }
+    IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
 }
 
 async fn proxy_handler(
@@ -379,7 +392,7 @@ async fn proxy_handler(
 
     // #16: per-IP rate limiting (token bucket, configurable via rate_limit_rpm).
     if let Some(ref rl) = s.rate_limiter {
-        let ip = extract_client_ip(&req);
+        let ip = extract_client_ip(&req, s.config.server.trust_proxy_headers);
         let rpm = s.config.server.rate_limit_rpm as f64;
         let allowed = rl.lock().entry(ip).or_insert_with(|| TokenBucket::new(rpm)).check_and_consume(rpm);
         if !allowed {
@@ -391,8 +404,6 @@ async fn proxy_handler(
     let path = req.uri().path().to_owned();
     let headers = req.headers().clone();
 
-    // 100 MB limit — sufficient for any LLM request including large context windows
-    const MAX_REQUEST_BODY: usize = 100 * 1024 * 1024;
     let body_bytes: Bytes = axum::body::to_bytes(req.into_body(), MAX_REQUEST_BODY)
         .await
         .map_err(|_| ProxyError::BodyRead)?;
@@ -409,8 +420,9 @@ async fn proxy_handler(
     let mut tried: HashSet<String> = HashSet::new();
     // Track accounts we've already attempted a token refresh for this request.
     let mut refreshed: HashSet<String> = HashSet::new();
-    // Total wait budget: up to 5 hours (Claude's rate-limit reset window).
-    let wait_deadline_ms = now_ms() + 5 * 60 * 60 * 1_000;
+    // Cap wait to the configured request timeout — the client's TCP connection
+    // won't survive 5 hours anyway; return 503 so the client can retry.
+    let wait_deadline_ms = now_ms() + s.config.server.request_timeout_secs.saturating_mul(1_000);
 
     loop {
         let account = match router::pick_account(
@@ -1474,7 +1486,7 @@ async fn openai_compat_handler(
         return proxy_handler(State(s), req).await;
     };
 
-    let body_bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
+    let body_bytes = axum::body::to_bytes(req.into_body(), MAX_REQUEST_BODY)
         .await
         .map_err(|_| ProxyError::BodyRead)?;
 
@@ -1489,12 +1501,16 @@ async fn openai_compat_handler(
         .build()
         .map_err(|_| ProxyError::Upstream)?;
 
-    let resp = client
+    let mut req_builder = client
         .post(format!("{anthropic_url}/v1/messages"))
         .header("content-type", "application/json")
         .header("anthropic-version", "2023-06-01")
         .header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20")
-        .header("x-shunt-compat", "openai")
+        .header("x-shunt-compat", "openai");
+    if let Some(ref key) = s.config.server.remote_key {
+        req_builder = req_builder.header("x-api-key", key.as_str());
+    }
+    let resp = req_builder
         .json(&anthropic_body)
         .send()
         .await
