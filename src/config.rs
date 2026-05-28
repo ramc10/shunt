@@ -154,6 +154,8 @@ struct RawServer {
     sticky_ttl_minutes: Option<u64>,
     /// "use-it-or-lose-it" expiry window in minutes (default: 30)
     expiry_soon_minutes: Option<u64>,
+    /// Account selection strategy: "earliest-expiry" (default), "round-robin", "least-utilized"
+    routing_strategy: Option<String>,
     /// Upstream request timeout in seconds (default: 600)
     request_timeout_secs: Option<u64>,
     /// Per-IP rate limit in requests per minute (0 = disabled, default disabled).
@@ -185,6 +187,7 @@ impl Default for RawServer {
             custom_domain: None,
             sticky_ttl_minutes: None,
             expiry_soon_minutes: None,
+            routing_strategy: None,
             request_timeout_secs: None,
             rate_limit_rpm: None,
             trust_proxy_headers: None,
@@ -235,6 +238,21 @@ fn default_plan_type() -> String { "pro".into() }
 // Resolved config types
 // ---------------------------------------------------------------------------
 
+/// Account-selection algorithm used when no sticky or pinned account applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RoutingStrategy {
+    /// Use-it-or-lose-it: drain accounts whose quota windows expire soonest first.
+    /// Among the rest, prefer accounts with the most remaining quota.
+    /// This maximises total token usage across all accounts over time.
+    #[default]
+    EarliestExpiry,
+    /// Cycle through accounts in round-robin order regardless of quota.
+    RoundRobin,
+    /// Route to the account with the most remaining quota (lowest utilization).
+    /// Good for latency-sensitive workloads where hitting a rate limit is costly.
+    LeastUtilized,
+}
+
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub host: String,
@@ -253,6 +271,8 @@ pub struct ServerConfig {
     pub sticky_ttl_ms: u64,
     /// Accounts whose 5h window resets within this many seconds are preferred ("use-it-or-lose-it").
     pub expiry_soon_secs: u64,
+    /// Which routing algorithm to use for account selection.
+    pub routing_strategy: RoutingStrategy,
     /// Upstream request timeout in seconds.
     pub request_timeout_secs: u64,
     /// Per-IP rate limit in requests per minute (0 = disabled, default disabled).
@@ -280,6 +300,7 @@ impl Default for ServerConfig {
             custom_domain: None,
             sticky_ttl_ms: 10 * 60 * 1000,
             expiry_soon_secs: 30 * 60,
+            routing_strategy: RoutingStrategy::EarliestExpiry,
             request_timeout_secs: 600,
             rate_limit_rpm: 0,
             trust_proxy_headers: false,
@@ -390,6 +411,11 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
         custom_domain: raw.server.custom_domain,
         sticky_ttl_ms: raw.server.sticky_ttl_minutes.unwrap_or(10) * 60 * 1000,
         expiry_soon_secs: raw.server.expiry_soon_minutes.unwrap_or(30) * 60,
+        routing_strategy: match raw.server.routing_strategy.as_deref() {
+            Some("round-robin") | Some("round_robin") => RoutingStrategy::RoundRobin,
+            Some("least-utilized") | Some("least_utilized") | Some("freshest") => RoutingStrategy::LeastUtilized,
+            _ => RoutingStrategy::EarliestExpiry,
+        },
         request_timeout_secs: raw.server.request_timeout_secs.unwrap_or(600),
         rate_limit_rpm: raw.server.rate_limit_rpm.unwrap_or(0),
         trust_proxy_headers: raw.server.trust_proxy_headers.unwrap_or(false),

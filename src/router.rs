@@ -1,8 +1,9 @@
-/// Account selection: stickiness + earliest-expiry-first scoring + failover.
+/// Account selection: stickiness + configurable routing strategy + failover.
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
+use std::cmp::Ordering;
 
-use crate::config::AccountConfig;
+use crate::config::{AccountConfig, RoutingStrategy};
 use crate::state::StateStore;
 
 
@@ -75,14 +76,11 @@ fn canonical_tools(v: &serde_json::Value) -> String {
 /// window is more exhausted.
 ///
 /// `binding_reset` = the reset timestamp of the most-utilized (binding) window.
-/// This is used for the primary sort key: prefer the account whose binding window
-/// expires soonest — those unused tokens are at greatest risk of being wasted.
 fn most_urgent_window(
     util_5h: f64, reset_5h: Option<u64>,
     util_7d: f64, reset_7d: Option<u64>,
 ) -> (f64, Option<u64>) {
     let effective = util_5h.max(util_7d);
-    // Use the reset time of whichever window is the binding constraint (most utilized).
     let binding_reset = if util_5h >= util_7d { reset_5h } else { reset_7d };
     (effective, binding_reset)
 }
@@ -93,12 +91,13 @@ fn most_urgent_window(
 
 /// Pick the best account for this request.
 ///
-/// 1. If the conversation fingerprint maps to a sticky account that is still
-///    available (and not in `tried`), use it.
-/// 2. Otherwise, pick the first available account not in `tried`, and record
-///    it as sticky for this fingerprint.
+/// 1. If a pinned account is set and available, use it.
+/// 2. If the conversation fingerprint maps to a sticky account that is still
+///    available and not exhausted (and not in `tried`), use it.
+/// 3. Otherwise, apply `strategy` to pick from all available, non-exhausted accounts
+///    not already in `tried`, and record the result as sticky.
 ///
-/// Returns `None` when every account is on cooldown, disabled, or in `tried`.
+/// Returns `None` when every account is on cooldown, disabled, exhausted, or in `tried`.
 pub fn pick_account<'a>(
     accounts: &'a [AccountConfig],
     state: &StateStore,
@@ -106,6 +105,7 @@ pub fn pick_account<'a>(
     tried: &HashSet<String>,
     sticky_ttl_ms: u64,
     expiry_soon_secs: u64,
+    strategy: RoutingStrategy,
 ) -> Option<&'a AccountConfig> {
     // Pinned account overrides everything — user explicitly chose this one
     if let Some(pinned) = state.get_pinned() {
@@ -124,7 +124,7 @@ pub fn pick_account<'a>(
         if let Some(sticky_name) = state.get_sticky(fp) {
             if !tried.contains(&sticky_name) {
                 if let Some(acc) = accounts.iter().find(|a| a.name == sticky_name) {
-                    if state.is_available(&acc.name) {
+                    if state.is_available(&acc.name) && !state.is_exhausted(&acc.name) {
                         return Some(acc);
                     }
                 }
@@ -132,51 +132,77 @@ pub fn pick_account<'a>(
         }
     }
 
-    // Pick the best account:
-    // - "Expiring soon" (binding window resets within 30 min, not exhausted) → use it or lose it;
-    //   among those, prefer the most urgent (soonest reset).
-    // - Otherwise → prefer the account whose binding window expires soonest (to avoid wasting
-    //   tokens); break ties by draining the most-utilized account first.
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
-    let chosen = accounts
+    // Gather candidates: available (not on cooldown/disabled), not exhausted, not already tried.
+    let candidates: Vec<&AccountConfig> = accounts
         .iter()
-        .filter(|a| !tried.contains(&a.name) && state.is_available(&a.name))
-        .min_by(|a, b| {
-            // Use the most-urgent (soonest-resetting) window for each account.
-            // If both windows are active, the one expiring sooner is the binding constraint.
-            let (ua, ra) = most_urgent_window(
-                state.utilization_5h(&a.name), state.reset_5h_secs(&a.name),
-                state.utilization_7d(&a.name), state.reset_7d_secs(&a.name),
-            );
-            let (ub, rb) = most_urgent_window(
-                state.utilization_5h(&b.name), state.reset_5h_secs(&b.name),
-                state.utilization_7d(&b.name), state.reset_7d_secs(&b.name),
-            );
+        .filter(|a| !tried.contains(&a.name) && state.is_available(&a.name) && !state.is_exhausted(&a.name))
+        .collect();
 
-            let a_expiring = ra.map(|r| r.saturating_sub(now_secs) <= expiry_soon_secs).unwrap_or(false) && ua < 1.0;
-            let b_expiring = rb.map(|r| r.saturating_sub(now_secs) <= expiry_soon_secs).unwrap_or(false) && ub < 1.0;
+    if candidates.is_empty() {
+        return None;
+    }
 
-            match (a_expiring, b_expiring) {
-                (true, false) => std::cmp::Ordering::Less,
-                (false, true) => std::cmp::Ordering::Greater,
-                (true, true) => ra.cmp(&rb), // most urgent first
-                (false, false) => {
-                    // Primary: prefer the account whose binding window expires soonest
-                    // (those tokens are at greatest risk of being wasted).
-                    ra.unwrap_or(u64::MAX).cmp(&rb.unwrap_or(u64::MAX))
-                        .then_with(|| {
-                            // Tiebreak: drain most-utilized first (higher utilization = preferred).
-                            ub.partial_cmp(&ua).unwrap_or(std::cmp::Ordering::Equal)
-                        })
+    let chosen = match strategy {
+        RoutingStrategy::RoundRobin => {
+            let idx = state.next_rr_index() % candidates.len();
+            candidates[idx]
+        }
+
+        RoutingStrategy::LeastUtilized => {
+            candidates.iter().copied().min_by(|a, b| {
+                // Prefer the account with the most remaining quota (lowest effective util).
+                let ua = state.utilization_5h(&a.name).max(state.utilization_7d(&a.name));
+                let ub = state.utilization_5h(&b.name).max(state.utilization_7d(&b.name));
+                ua.partial_cmp(&ub).unwrap_or(Ordering::Equal)
+            })?
+        }
+
+        RoutingStrategy::EarliestExpiry => {
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+
+            candidates.iter().copied().min_by(|a, b| {
+                let (ua, ra) = most_urgent_window(
+                    state.utilization_5h(&a.name), state.reset_5h_secs(&a.name),
+                    state.utilization_7d(&a.name), state.reset_7d_secs(&a.name),
+                );
+                let (ub, rb) = most_urgent_window(
+                    state.utilization_5h(&b.name), state.reset_5h_secs(&b.name),
+                    state.utilization_7d(&b.name), state.reset_7d_secs(&b.name),
+                );
+
+                // "Expiring soon": binding window resets within expiry_soon_secs.
+                // Route to these first — use-it-or-lose-it.
+                let a_expiring = ra.map(|r| r.saturating_sub(now_secs) <= expiry_soon_secs).unwrap_or(false);
+                let b_expiring = rb.map(|r| r.saturating_sub(now_secs) <= expiry_soon_secs).unwrap_or(false);
+
+                match (a_expiring, b_expiring) {
+                    (true, false) => Ordering::Less,
+                    (false, true) => Ordering::Greater,
+                    // Both expiring soon: prefer the most urgent (soonest reset) first.
+                    (true, true) => ra.cmp(&rb),
+                    // Neither expiring soon:
+                    // - prefer accounts with a known reset time over fresh accounts
+                    //   (fresh accounts have full quota; save them as backup)
+                    // - among those, prefer soonest reset (tokens most at risk of being wasted)
+                    // - tiebreak: prefer lowest utilization (most tokens remaining)
+                    (false, false) => match (ra, rb) {
+                        (None, None) => Ordering::Equal,
+                        (Some(_), None) => Ordering::Less,   // known-expiry before fresh
+                        (None, Some(_)) => Ordering::Greater, // fresh last
+                        (Some(ra_t), Some(rb_t)) => {
+                            ra_t.cmp(&rb_t)
+                                .then_with(|| ua.partial_cmp(&ub).unwrap_or(Ordering::Equal))
+                        }
+                    },
                 }
-            }
-        })?;
+            })?
+        }
+    };
 
-    tracing::debug!(account = %chosen.name, "routing request to account");
+    tracing::debug!(account = %chosen.name, strategy = ?strategy, "routing request to account");
 
     // Record stickiness for future requests in this conversation
     if let Some(fp) = fp {
@@ -225,18 +251,10 @@ mod tests {
         });
     }
 
-    #[test]
-    fn test_routing_drains_high_utilization_first() {
-        let accounts = vec![make_account("low"), make_account("high")];
-        let state = StateStore::new_empty();
-
-        // Account "low" at 20%, "high" at 80%, both resetting in 3 hours (not expiring soon)
-        set_rate_limits(&state, "low", 0.2, 3 * 3600);
-        set_rate_limits(&state, "high", 0.8, 3 * 3600);
-
-        let chosen = pick_account(&accounts, &state, None, &HashSet::new(), 600_000, 1800);
-        assert_eq!(chosen.map(|a| a.name.as_str()), Some("high"),
-            "should drain the high-utilization account first");
+    fn pick_ee(accounts: &[AccountConfig], state: &StateStore) -> Option<String> {
+        pick_account(accounts, state, None, &HashSet::new(), 600_000, 1800,
+            RoutingStrategy::EarliestExpiry)
+            .map(|a| a.name.clone())
     }
 
     #[test]
@@ -249,8 +267,7 @@ mod tests {
         set_rate_limits(&state, "fresh", 0.05, 4 * 3600);
         set_rate_limits(&state, "expiring", 0.3, 15 * 60);
 
-        let chosen = pick_account(&accounts, &state, None, &HashSet::new(), 600_000, 1800);
-        assert_eq!(chosen.map(|a| a.name.as_str()), Some("expiring"),
+        assert_eq!(pick_ee(&accounts, &state).as_deref(), Some("expiring"),
             "should prefer the account expiring soon (use-it-or-lose-it)");
     }
 
@@ -263,9 +280,46 @@ mod tests {
         set_rate_limits(&state, "later", 0.5, 5 * 3600);
         set_rate_limits(&state, "sooner", 0.5, 2 * 3600);
 
-        let chosen = pick_account(&accounts, &state, None, &HashSet::new(), 600_000, 1800);
-        assert_eq!(chosen.map(|a| a.name.as_str()), Some("sooner"),
+        assert_eq!(pick_ee(&accounts, &state).as_deref(), Some("sooner"),
             "equal utilization: should prefer the account whose window resets sooner");
+    }
+
+    #[test]
+    fn test_routing_same_reset_prefers_more_remaining() {
+        let accounts = vec![make_account("high"), make_account("low")];
+        let state = StateStore::new_empty();
+
+        // Same reset time; "low" has more remaining (20% used vs 80% used).
+        set_rate_limits(&state, "high", 0.8, 3 * 3600);
+        set_rate_limits(&state, "low",  0.2, 3 * 3600);
+
+        assert_eq!(pick_ee(&accounts, &state).as_deref(), Some("low"),
+            "same reset time: should prefer the account with most remaining quota");
+    }
+
+    #[test]
+    fn test_routing_skips_exhausted() {
+        let accounts = vec![make_account("exhausted"), make_account("fresh")];
+        let state = StateStore::new_empty();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        state.update_rate_limits("exhausted", RateLimitInfo {
+            utilization_5h: Some(1.0),
+            reset_5h: Some(now + 3600),
+            status_5h: Some("exhausted".to_owned()),
+            utilization_7d: None,
+            reset_7d: None,
+            status_7d: None,
+            overage_status: None,
+            overage_disabled_reason: None,
+            representative_claim: None,
+            updated_ms: now * 1000,
+        });
+
+        assert_eq!(pick_ee(&accounts, &state).as_deref(), Some("fresh"),
+            "should skip accounts with exhausted quota");
     }
 
     #[test]
@@ -274,8 +328,7 @@ mod tests {
         let state = StateStore::new_empty();
         state.set_cooldown("cooling", 60_000);
 
-        let chosen = pick_account(&accounts, &state, None, &HashSet::new(), 600_000, 1800);
-        assert_eq!(chosen.map(|a| a.name.as_str()), Some("ready"),
+        assert_eq!(pick_ee(&accounts, &state).as_deref(), Some("ready"),
             "should skip accounts on cooldown");
     }
 
@@ -287,8 +340,45 @@ mod tests {
         set_rate_limits(&state, "b", 0.1, 3600);
         state.set_pinned(Some("b".to_owned()));
 
-        let chosen = pick_account(&accounts, &state, None, &HashSet::new(), 600_000, 1800);
-        assert_eq!(chosen.map(|a| a.name.as_str()), Some("b"),
-            "pinned account should override utilization-based routing");
+        assert_eq!(
+            pick_account(&accounts, &state, None, &HashSet::new(), 600_000, 1800,
+                RoutingStrategy::EarliestExpiry)
+                .map(|a| a.name.as_str()),
+            Some("b"),
+            "pinned account should override routing strategy");
+    }
+
+    #[test]
+    fn test_round_robin_cycles() {
+        let accounts = vec![make_account("a"), make_account("b"), make_account("c")];
+        let state = StateStore::new_empty();
+
+        let picks: Vec<_> = (0..6)
+            .map(|_| pick_account(&accounts, &state, None, &HashSet::new(), 600_000, 1800,
+                RoutingStrategy::RoundRobin)
+                .map(|a| a.name.clone()))
+            .collect();
+
+        // Should cycle a → b → c → a → b → c
+        assert_eq!(picks[0].as_deref(), Some("a"));
+        assert_eq!(picks[1].as_deref(), Some("b"));
+        assert_eq!(picks[2].as_deref(), Some("c"));
+        assert_eq!(picks[3].as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn test_least_utilized_picks_freshest() {
+        let accounts = vec![make_account("heavy"), make_account("light")];
+        let state = StateStore::new_empty();
+
+        set_rate_limits(&state, "heavy", 0.8, 3600);
+        set_rate_limits(&state, "light", 0.1, 3600);
+
+        assert_eq!(
+            pick_account(&accounts, &state, None, &HashSet::new(), 600_000, 1800,
+                RoutingStrategy::LeastUtilized)
+                .map(|a| a.name.as_str()),
+            Some("light"),
+            "least-utilized should pick the account with the most remaining quota");
     }
 }

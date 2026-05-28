@@ -6,7 +6,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use parking_lot::Mutex;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -169,6 +169,8 @@ pub struct StateStore {
     inner: Arc<Mutex<StateData>>,
     /// Set to true when a write is needed; the background writer thread clears it.
     pending: Arc<AtomicBool>,
+    /// Monotonically-increasing counter for round-robin account selection.
+    round_robin: Arc<AtomicUsize>,
 }
 
 impl StateStore {
@@ -179,6 +181,7 @@ impl StateStore {
             path: PathBuf::from("/dev/null"),
             inner: Arc::new(Mutex::new(StateData::default())),
             pending: Arc::new(AtomicBool::new(false)),
+            round_robin: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -205,6 +208,7 @@ impl StateStore {
             path: path.to_owned(),
             inner: Arc::new(Mutex::new(data)),
             pending: Arc::new(AtomicBool::new(false)),
+            round_robin: Arc::new(AtomicUsize::new(0)),
         };
         store.start_writer_thread();
         store
@@ -239,6 +243,29 @@ impl StateStore {
             None => true,
             Some(s) => !s.disabled && now_ms() >= s.cooldown_until_ms,
         }
+    }
+
+    /// Returns true if the account's Anthropic quota is currently exhausted in any
+    /// active window (5h or 7d) — i.e. sending another request will get a 429.
+    pub fn is_exhausted(&self, name: &str) -> bool {
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let data = self.inner.lock();
+        let Some(rl) = data.rate_limits.get(name) else { return false };
+        // Only consider a window exhausted if its reset is still in the future
+        // (i.e. the window hasn't rolled over yet).
+        let exhausted_5h = rl.status_5h.as_deref() == Some("exhausted")
+            && rl.reset_5h.map(|t| t > now_secs).unwrap_or(false);
+        let exhausted_7d = rl.status_7d.as_deref() == Some("exhausted")
+            && rl.reset_7d.map(|t| t > now_secs).unwrap_or(false);
+        exhausted_5h || exhausted_7d
+    }
+
+    /// Fetch-and-increment monotonic counter for round-robin account cycling.
+    pub fn next_rr_index(&self) -> usize {
+        self.round_robin.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Returns a snapshot of all account states for the status endpoint.

@@ -432,6 +432,7 @@ async fn proxy_handler(
         let account = match router::pick_account(
             &s.config.accounts, &s.state, fp_ref, &tried,
             s.config.server.sticky_ttl_ms, s.config.server.expiry_soon_secs,
+            s.config.server.routing_strategy,
         ) {
             Some(a) => a,
             None => {
