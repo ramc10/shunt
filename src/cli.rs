@@ -55,9 +55,10 @@ enum Command {
     /// Tail the proxy log file
     ///
     /// Examples:
-    ///   shunt logs           — last 50 lines
+    ///   shunt logs           — last 50 lines (pretty-printed)
     ///   shunt logs -f        — follow in real time
     ///   shunt logs -n 100    — last 100 lines
+    ///   shunt logs --json    — raw JSON output
     Logs {
         #[arg(long)]
         config: Option<PathBuf>,
@@ -67,6 +68,9 @@ enum Command {
         /// Number of lines to show
         #[arg(short = 'n', long, default_value = "50")]
         lines: usize,
+        /// Raw JSON output instead of pretty-printed
+        #[arg(long)]
+        json: bool,
     },
     /// Manage accounts — add, remove, or log out (interactive menu)
     Config {
@@ -202,7 +206,7 @@ pub async fn run() -> Result<()> {
         Command::Stop => cmd_stop().await,
         Command::Restart { config } => cmd_restart(config).await,
         Command::Status { config } => cmd_status(config).await,
-        Command::Logs { config, follow, lines } => cmd_logs(config, follow, lines).await,
+        Command::Logs { config, follow, lines, json } => cmd_logs(config, follow, lines, json).await,
         Command::Config { config } => cmd_config(config).await,
         Command::AddAccount { config, name, provider } => cmd_add_account(config, name, provider.as_deref()).await,
         Command::RemoveAccount { config, name } => cmd_remove_account(config, name).await,
@@ -1307,7 +1311,7 @@ async fn cmd_restart(config_override: Option<PathBuf>) -> Result<()> {
 // logs
 // ---------------------------------------------------------------------------
 
-async fn cmd_logs(_config_override: Option<PathBuf>, follow: bool, lines: usize) -> Result<()> {
+async fn cmd_logs(_config_override: Option<PathBuf>, follow: bool, lines: usize, raw_json: bool) -> Result<()> {
     use std::io::{BufRead, BufReader, Write};
 
     let log = log_path();
@@ -1321,35 +1325,107 @@ async fn cmd_logs(_config_override: Option<PathBuf>, follow: bool, lines: usize)
     let file = std::fs::File::open(&log)?;
     let mut reader = BufReader::new(file);
 
-    // Use a ring buffer so we only keep the last N lines in memory
-    // regardless of how large the log file is.
+    let render = |l: &str| -> String {
+        if raw_json { l.trim_end().to_string() } else { pretty_log_line(l) }
+    };
+
+    // Ring buffer — keep last N lines regardless of file size.
     let mut ring: std::collections::VecDeque<String> = std::collections::VecDeque::with_capacity(lines + 1);
     let mut line = String::new();
     while reader.read_line(&mut line)? > 0 {
-        if ring.len() >= lines {
-            ring.pop_front();
-        }
+        if ring.len() >= lines { ring.pop_front(); }
         ring.push_back(std::mem::take(&mut line));
     }
-    for l in &ring {
-        print!("{l}");
-    }
+    for l in &ring { println!("{}", render(l)); }
     std::io::stdout().flush().ok();
 
-    if !follow {
-        return Ok(());
-    }
+    if !follow { return Ok(()); }
 
-    // Follow mode — poll for new content
     eprintln!("{}", dim("--- following (Ctrl+C to stop) ---"));
     loop {
         line.clear();
         if reader.read_line(&mut line)? > 0 {
-            print!("{line}");
+            println!("{}", render(&line));
             std::io::stdout().flush().ok();
         } else {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
+    }
+}
+
+/// Format a log line into a human-readable string.
+/// Handles both JSON (rotating file appender) and ANSI tracing text
+/// (daemon stderr redirected into proxy.log). Strips ANSI when not JSON.
+fn pretty_log_line(line: &str) -> String {
+    let line = line.trim_end();
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+        // Not JSON (ANSI-formatted tracing stderr) — strip escape codes.
+        return strip_ansi(line);
+    };
+
+    // Timestamp: keep only HH:MM:SS from "2026-05-28T16:28:19.208352Z"
+    let time = v["timestamp"].as_str()
+        .and_then(|t| t.get(11..19))
+        .unwrap_or("??:??:??");
+
+    let level = v["level"].as_str().unwrap_or("????");
+    let level_str = match level {
+        "ERROR" => red("ERROR"),
+        "WARN"  => yellow("WARN "),
+        "INFO"  => dim("INFO "),
+        "DEBUG" => dim("DEBUG"),
+        other   => dim(other),
+    };
+
+    let fields = v["fields"].as_object();
+    let message = fields
+        .and_then(|f| f["message"].as_str())
+        .unwrap_or(line);
+
+    // Message color by level
+    let message_str = match level {
+        "ERROR" => red(message),
+        "WARN"  => yellow(message),
+        _       => message.to_string(),
+    };
+
+    // Build key=value pairs — skip "message", format latency nicely
+    let mut kvs = String::new();
+    if let Some(fields) = fields {
+        // Preferred key order for readability
+        const ORDER: &[&str] = &["account", "model", "status", "latency_ms", "path", "request_id"];
+        let mut seen = std::collections::HashSet::new();
+
+        for &k in ORDER {
+            if let Some(val) = fields.get(k) {
+                seen.insert(k);
+                let v_str = val_to_str(val);
+                if v_str.is_empty() { continue; }
+                let (display_k, display_v) = if k == "latency_ms" {
+                    ("latency", format!("{}ms", v_str))
+                } else {
+                    (k, v_str)
+                };
+                kvs.push_str(&format!("  {}={}", dim(display_k), display_v));
+            }
+        }
+        // Any remaining fields not in ORDER
+        for (k, val) in fields {
+            if k == "message" || seen.contains(k.as_str()) { continue; }
+            let v_str = val_to_str(val);
+            if v_str.is_empty() { continue; }
+            kvs.push_str(&format!("  {}={}", dim(k), v_str));
+        }
+    }
+
+    format!("{}  {}  {}{}", dim(time), level_str, message_str, kvs)
+}
+
+fn val_to_str(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Null      => String::new(),
+        other                        => other.to_string(),
     }
 }
 
@@ -2479,6 +2555,14 @@ async fn serve_all_providers(
     // Save all accounts for the control plane before the provider loop consumes them.
     let all_accounts = config.accounts.clone();
     let control_port = config.server.control_port;
+
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        accounts = all_accounts.len(),
+        port = primary_port,
+        control_port,
+        "shunt proxy started"
+    );
 
     // Group accounts by provider.
     let mut by_provider: HashMap<String, Vec<crate::config::AccountConfig>> = HashMap::new();
