@@ -2830,12 +2830,14 @@ async fn cmd_update() -> Result<()> {
         std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o755))?;
     }
 
-    // macOS: sign the temp file BEFORE replacing the live binary so Gatekeeper
-    // never sees an unsigned binary on disk even if the process is killed mid-update.
+    // macOS: clear ALL extended attributes (quarantine + provenance) then ad-hoc
+    // sign the temp file BEFORE replacing the live binary so Gatekeeper never
+    // sees an unsigned/quarantined binary on disk even if killed mid-update.
     #[cfg(target_os = "macos")]
     {
         let p = tmp_path.display().to_string();
-        std::process::Command::new("xattr").args(["-dr", "com.apple.quarantine", &p])
+        // -c clears all xattrs including com.apple.provenance (not just quarantine)
+        std::process::Command::new("xattr").args(["-c", &p])
             .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().ok();
         std::process::Command::new("codesign").args(["--force", "--deep", "--sign", "-", &p])
             .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().ok();
@@ -2844,6 +2846,17 @@ async fn cmd_update() -> Result<()> {
     // Atomic replace — new binary is already signed, so this is safe.
     std::fs::rename(&tmp_path, &exe_path)
         .context("Failed to replace binary (try running with sudo?)")?;
+
+    // macOS: codesign the final path too — rename can reset Gatekeeper state on
+    // some macOS versions (Sonoma+), so re-sign after the rename to be sure.
+    #[cfg(target_os = "macos")]
+    {
+        let p = exe_path.display().to_string();
+        std::process::Command::new("xattr").args(["-c", &p])
+            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().ok();
+        std::process::Command::new("codesign").args(["--force", "--deep", "--sign", "-", &p])
+            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().ok();
+    }
 
     status!("  {} Updated to {}", green(CHECK), bold_white(&format!("v{latest}")));
     println!();
