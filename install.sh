@@ -123,16 +123,5 @@ WantedBy=default.target
 ENDUNIT
 fi
 
-# ── Start proxy now ───────────────────────────────────────────────────────────
-echo "Starting shunt..."
-"$EXE" start < /dev/null
-
-# ── Write ANTHROPIC_BASE_URL to shell profile (belt-and-suspenders) ───────────
-for PROFILE in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.bash_profile"; do
-  if [ -f "$PROFILE" ]; then
-    if ! grep -q "ANTHROPIC_BASE_URL" "$PROFILE" 2>/dev/null; then
-      printf '\n# Added by shunt\nexport ANTHROPIC_BASE_URL=http://127.0.0.1:8082\n' >> "$PROFILE"
-    fi
-    break
-  fi
-done
+echo ""
+echo "  Run 'shunt setup' to connect your accounts and start the proxy."

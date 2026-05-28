@@ -64,8 +64,10 @@ struct AccountStatus {
     #[serde(default)] auth_failed: bool,
     #[serde(default)] utilization_5h: f64,
     #[serde(default)] reset_5h: Option<u64>,
+    #[serde(default)] status_5h: Option<String>,
     #[serde(default)] utilization_7d: f64,
     #[serde(default)] reset_7d: Option<u64>,
+    #[serde(default)] status_7d: Option<String>,
     #[serde(default)] cooldown_until_ms: u64,
 }
 
@@ -641,8 +643,12 @@ fn draw_accounts(f: &mut Frame, area: Rect, s: &StatusResponse, scroll: usize, f
         }
 
         if acc.provider == "anthropic" || acc.provider.is_empty() {
-            lines.push(util_bar_line("5h", acc.utilization_5h, acc.reset_5h));
-            lines.push(util_bar_line("7d", acc.utilization_7d, acc.reset_7d));
+            if acc.utilization_5h > 0.0 || acc.reset_5h.is_some() {
+                lines.push(util_bar_line("5h", acc.utilization_5h, acc.reset_5h, acc.status_5h.as_deref()));
+            }
+            if acc.utilization_7d > 0.0 || acc.reset_7d.is_some() {
+                lines.push(util_bar_line("7d", acc.utilization_7d, acc.reset_7d, acc.status_7d.as_deref()));
+            }
         }
 
         lines.push(Line::raw(""));
@@ -652,13 +658,21 @@ fn draw_accounts(f: &mut Frame, area: Rect, s: &StatusResponse, scroll: usize, f
     f.render_widget(Paragraph::new(visible), inner);
 }
 
-fn util_bar_line(label: &'static str, util: f64, reset: Option<u64>) -> Line<'static> {
+fn util_bar_line(label: &'static str, util: f64, reset: Option<u64>, wstatus: Option<&str>) -> Line<'static> {
+    let exhausted = wstatus == Some("exhausted");
     let util = util.clamp(0.0, 1.0);
     let bar_w = 20usize;
-    let filled = (util * bar_w as f64).round() as usize;
-    let bar_color = if util >= 0.9 { RED } else if util >= 0.6 { YELLOW } else { GREEN };
-    let bar = format!("{}{}", "█".repeat(filled), "░".repeat(bar_w.saturating_sub(filled)));
-    let pct = format!("{:.0}%", util * 100.0);
+    // Fill shows REMAINING capacity — matches `shunt status` convention.
+    let used  = (util * bar_w as f64).round() as usize;
+    let free  = bar_w.saturating_sub(used);
+    let bar_color = if exhausted || util >= 0.8 { RED } else if util >= 0.5 { YELLOW } else { GREEN };
+    let bar = format!("{}{}", "█".repeat(free), "░".repeat(used));
+    let rem_pct = ((1.0 - util) * 100.0).round() as u64;
+    let pct: String = if exhausted {
+        "exhausted".to_owned()
+    } else {
+        format!("{}% left", rem_pct)
+    };
 
     let reset_str = reset.map(|reset_secs| {
         let now_secs = std::time::SystemTime::now()
