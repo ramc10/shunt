@@ -116,24 +116,7 @@ impl Forwarder {
             .await
             .context("upstream request failed")?;
 
-        let latency_ms = t0.elapsed().as_millis();
         let status = upstream_resp.status();
-
-        // Extract model from request body for the log (best-effort, no failure on parse error).
-        let model = serde_json::from_slice::<serde_json::Value>(&body)
-            .ok()
-            .and_then(|v| v["model"].as_str().map(|s| s.to_owned()))
-            .unwrap_or_default();
-
-        info!(
-            request_id = %request_id,
-            account = %account.name,
-            status = status.as_u16(),
-            latency_ms = %latency_ms,
-            path = %path,
-            model = %model,
-            "request forwarded"
-        );
 
         let mut builder = Response::builder().status(status.as_u16());
 

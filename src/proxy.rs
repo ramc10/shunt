@@ -13,7 +13,7 @@ use axum::Router;
 use bytes::Bytes;
 use serde_json::json;
 use tokio::sync::RwLock;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 use crate::config::{state_path, Config, CredentialsStore};
 use crate::credential::Credential;
@@ -417,6 +417,7 @@ async fn proxy_handler(
         .and_then(|v| v["model"].as_str().map(|s| s.to_owned()))
         .unwrap_or_default();
     let req_start_ms = now_ms();
+    let request_id = uuid::Uuid::new_v4().to_string()[..8].to_owned();
 
     let fp = router::fingerprint(&body_bytes);
     let fp_ref = fp.as_deref();
@@ -615,7 +616,7 @@ async fn proxy_handler(
                     // Got Anthropic response; client expects OpenAI.
                     translate_response_anthropic_to_openai(response).await
                 };
-                return Ok(tap_usage(response, &s.state, s.telemetry.as_ref(), &account_name, &log_model, req_start_ms).await);
+                return Ok(tap_usage(response, &s.state, s.telemetry.as_ref(), &account_name, &log_model, req_start_ms, &request_id, &path, tried.len()).await);
             }
             429 => {
                 let info = account.provider.parse_rate_limits(response.headers());
@@ -786,16 +787,37 @@ async fn tap_usage(
     account: &str,
     model: &str,
     req_start_ms: u64,
+    request_id: &str,
+    path: &str,
+    retries: usize,
 ) -> Response {
     use axum::body::Body;
     use crate::state::RequestLog;
 
-    if quota::is_streaming_response(&resp) {
-        let state    = state.clone();
-        let telem    = telemetry.cloned();
-        let account  = account.to_owned();
-        let model    = model.to_owned();
+    let streaming = quota::is_streaming_response(&resp);
+
+    if streaming {
+        let state      = state.clone();
+        let telem      = telemetry.cloned();
+        let account    = account.to_owned();
+        let model      = model.to_owned();
+        let request_id = request_id.to_owned();
+        let path       = path.to_owned();
         let on_complete = Arc::new(move |input: u64, output: u64| {
+            let duration_ms = now_ms().saturating_sub(req_start_ms);
+            info!(
+                request_id = %request_id,
+                account    = %account,
+                model      = %model,
+                status     = 200,
+                latency_ms = duration_ms,
+                path       = %path,
+                stream     = true,
+                input_tokens  = input,
+                output_tokens = output,
+                retries    = retries,
+                "request complete"
+            );
             let log = RequestLog {
                 ts_ms: req_start_ms,
                 account: account.clone(),
@@ -803,7 +825,7 @@ async fn tap_usage(
                 status: 200,
                 input_tokens: input,
                 output_tokens: output,
-                duration_ms: now_ms().saturating_sub(req_start_ms),
+                duration_ms,
             };
             state.record_usage(&account, input, output);
             state.record_global(&model, input, output);
@@ -822,6 +844,20 @@ async fn tap_usage(
         Err(_) => return Response::from_parts(parts, Body::empty()),
     };
     let (input, output) = quota::extract_usage_from_json(&bytes);
+    let duration_ms = now_ms().saturating_sub(req_start_ms);
+    info!(
+        request_id    = %request_id,
+        account       = %account,
+        model         = %model,
+        status        = 200,
+        latency_ms    = duration_ms,
+        path          = %path,
+        stream        = false,
+        input_tokens  = input,
+        output_tokens = output,
+        retries       = retries,
+        "request complete"
+    );
     let log = RequestLog {
         ts_ms: req_start_ms,
         account: account.to_owned(),
@@ -829,7 +865,7 @@ async fn tap_usage(
         status: 200,
         input_tokens: input,
         output_tokens: output,
-        duration_ms: now_ms().saturating_sub(req_start_ms),
+        duration_ms,
     };
     state.record_usage(account, input, output);
     state.record_global(model, input, output);
