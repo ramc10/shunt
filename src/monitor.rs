@@ -254,11 +254,12 @@ impl Picker {
     fn selected(&self) -> &str { &self.items[self.cursor] }
 }
 
-const MODEL_PRESETS: &[&str] = &[
-    "claude-opus-4-6",
-    "claude-sonnet-4-6",
-    "claude-haiku-4-5-20251001",
-    "client choice",  // sentinel: clears override
+/// (display name, description, model id or "" for "client choice")
+const MODEL_PRESETS: &[(&str, &str, &str)] = &[
+    ("Opus 4",   "Most capable · best for complex tasks",  "claude-opus-4-6"),
+    ("Sonnet 4", "Balanced · fast and smart",               "claude-sonnet-4-6"),
+    ("Haiku 4",  "Fastest · great for simple tasks",        "claude-haiku-4-5-20251001"),
+    ("Auto",     "Let the client choose the model",         ""),
 ];
 
 struct ModelPicker {
@@ -268,13 +269,13 @@ struct ModelPicker {
 impl ModelPicker {
     fn new(current: Option<&str>) -> Self {
         let cursor = current
-            .and_then(|m| MODEL_PRESETS.iter().position(|p| *p == m))
-            .unwrap_or(MODEL_PRESETS.len() - 1); // default to "client choice"
+            .and_then(|m| MODEL_PRESETS.iter().position(|(_, _, id)| *id == m))
+            .unwrap_or(MODEL_PRESETS.len() - 1); // default to "Auto"
         Self { cursor }
     }
     fn up(&mut self)   { self.cursor = if self.cursor == 0 { MODEL_PRESETS.len() - 1 } else { self.cursor - 1 }; }
     fn down(&mut self) { self.cursor = (self.cursor + 1) % MODEL_PRESETS.len(); }
-    fn selected(&self) -> &str { MODEL_PRESETS[self.cursor] }
+    fn selected_id(&self) -> &str { MODEL_PRESETS[self.cursor].2 }
 }
 
 // ---------------------------------------------------------------------------
@@ -379,20 +380,20 @@ pub async fn run_monitor(base_url: &str) -> Result<()> {
                         KeyCode::Up   | KeyCode::Char('k') => mp.up(),
                         KeyCode::Down | KeyCode::Char('j') => mp.down(),
                         KeyCode::Enter => {
-                            let chosen = mp.selected().to_owned();
+                            let chosen_id = mp.selected_id().to_owned();
                             model_picker = None;
                             let client = reqwest::Client::new();
-                            if chosen == "client choice" {
+                            if chosen_id.is_empty() {
                                 let _ = client.delete(&model_url)
                                     .timeout(Duration::from_secs(3))
                                     .send().await;
                                 model_override = None;
                             } else {
                                 let _ = client.post(&model_url)
-                                    .json(&serde_json::json!({ "model": chosen }))
+                                    .json(&serde_json::json!({ "model": chosen_id }))
                                     .timeout(Duration::from_secs(3))
                                     .send().await;
-                                model_override = Some(chosen);
+                                model_override = Some(chosen_id);
                             }
                             last_fetch = Instant::now() - Duration::from_secs(10);
                         }
@@ -1051,39 +1052,41 @@ fn draw_picker(f: &mut Frame, picker: &Picker, area: Rect) {
 
 fn draw_model_picker(f: &mut Frame, mp: &ModelPicker, current: Option<&str>, area: Rect) {
     let h = (MODEL_PRESETS.len() + 4) as u16;
-    let w = 42u16;
+    let w = 52u16;
     let x = area.x + area.width.saturating_sub(w) / 2;
     let y = area.y + area.height.saturating_sub(h) / 2;
     let popup_area = Rect { x, y, width: w.min(area.width), height: h.min(area.height) };
 
     f.render_widget(Clear, popup_area);
     let block = Block::default()
-        .title(Line::from(Span::styled(" override model ", style_dim())))
+        .title(Line::from(Span::styled(" select model ", style_dim())))
         .borders(Borders::ALL)
         .border_style(style_dkgreen());
     let inner = block.inner(popup_area);
     f.render_widget(block, popup_area);
 
-    let rows: Vec<Row> = MODEL_PRESETS.iter().enumerate().map(|(i, &preset)| {
+    let rows: Vec<Row> = MODEL_PRESETS.iter().enumerate().map(|(i, &(name, desc, id))| {
         let is_sel = i == mp.cursor;
-        let is_current = current == Some(preset) || (preset == "client choice" && current.is_none());
-        let label = if preset == "client choice" {
-            format!("  {}  client choice", if is_sel { "◆" } else { " " })
-        } else {
-            format!("  {}  {}", if is_sel { "◆" } else { " " }, shorten_model(preset))
-        };
-        let active_tag = if is_current { Span::styled("  ✓", style_green()) } else { Span::raw("") };
-        let style = if is_sel {
+        let is_current = current == Some(id) || (id.is_empty() && current.is_none());
+        let bullet = if is_sel { "◆" } else { " " };
+        let check  = if is_current { " ✓" } else { "  " };
+        let name_style = if is_sel {
             Style::default().fg(GREEN).add_modifier(Modifier::BOLD)
         } else {
-            style_dim()
+            style_white()
         };
         Row::new(vec![
-            Cell::from(Line::from(vec![Span::styled(label, style), active_tag])),
+            Cell::from(Span::styled(format!("  {bullet}"), style_dim())),
+            Cell::from(Span::styled(format!("{name}{check}"), name_style)),
+            Cell::from(Span::styled(desc, style_dim())),
         ])
     }).collect();
 
-    f.render_widget(Table::new(rows, [Constraint::Min(0)]).column_spacing(0), inner);
+    f.render_widget(
+        Table::new(rows, [Constraint::Length(4), Constraint::Length(12), Constraint::Min(0)])
+            .column_spacing(1),
+        inner,
+    );
 }
 
 // ---------------------------------------------------------------------------
