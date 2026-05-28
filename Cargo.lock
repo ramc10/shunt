@@ -2339,6 +2339,7 @@ dependencies = [
  "libc",
  "parking_lot",
  "ratatui",
+ "regex",
  "reqwest",
  "rpassword",
  "serde",

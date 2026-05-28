@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::{config_path, config_template, credentials_path, log_path, pid_path, CredentialsStore};
 use crate::credential::Credential;
-use crate::oauth::{claude_credentials_path, read_claude_credentials, refresh_token, revoke_token, run_oauth_flow};
+use crate::oauth::{read_claude_credentials, refresh_token, revoke_token, run_oauth_flow};
 use crate::term::{self, bold, bold_white, brand_green, cyan, dark_green, dim, green, green_bold, red, yellow, CHECK, CROSS, DIAMOND, DOT, EMPTY};
 
 #[derive(Parser)]
@@ -177,6 +177,11 @@ enum Command {
         /// Account name to pin to, or "auto". Omit to pick interactively.
         account: Option<String>,
     },
+    /// Print a sanitized debug report for sharing when reporting issues
+    Report {
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -210,6 +215,7 @@ pub async fn run() -> Result<()> {
         Command::Share { config, tunnel, stop } => cmd_share(config, tunnel, stop).await,
         Command::Uninstall => cmd_uninstall().await,
         Command::Use { config, account } => cmd_use(config, account).await,
+        Command::Report { config } => cmd_report(config).await,
         Command::Service { action } => match action {
             ServiceAction::Install   => cmd_service_install().await,
             ServiceAction::Uninstall => cmd_service_uninstall().await,
@@ -254,7 +260,14 @@ pub async fn cmd_setup(config_override: Option<PathBuf>) -> Result<()> {
                 std::io::stdout().flush().ok();
                 match refresh_token(&c).await {
                     Ok(fresh) => { println!("{}", green("done")); c = fresh; }
-                    Err(e) => println!("{} ({})", yellow("failed"), dim(&e.to_string())),
+                    Err(_) => {
+                        // Refresh token is also invalid — run a fresh OAuth flow
+                        // so setup completes with a working credential.
+                        println!("{}", yellow("failed"));
+                        println!("  {} Session fully expired — opening browser for fresh login…", dim("·"));
+                        println!();
+                        c = run_oauth_flow().await?;
+                    }
                 }
             } else {
                 println!("  {} Claude Code session found", green(CHECK));
@@ -262,22 +275,10 @@ pub async fn cmd_setup(config_override: Option<PathBuf>) -> Result<()> {
             c
         }
         None => {
-            println!("  {} No Claude Code session at {}", red(CROSS), dim(&claude_credentials_path().display().to_string()));
-            // Help the user understand what's missing: not installed vs. not logged in.
-            let claude_installed = std::process::Command::new("sh")
-                .args(["-c", "command -v claude"])
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false);
-            if !claude_installed {
-                println!("  {} Claude Code is not installed.", dim("·"));
-                println!("  {} Install it: {}", dim("·"), cyan("npm install -g @anthropic-ai/claude-code"));
-                println!("  {} Then log in with {} and re-run setup.", dim("·"), cyan("claude"));
-            } else {
-                println!("  {} Run {} to log in first, then re-run setup.", dim("·"), cyan("claude"));
-            }
+            // No local Claude Code session — run OAuth directly so setup is self-contained.
+            println!("  {} No existing Claude Code session found — opening browser for login…", dim("·"));
             println!();
-            bail!("No Claude Code credentials found.");
+            run_oauth_flow().await?
         }
     };
 
@@ -1198,9 +1199,9 @@ async fn cmd_start(
 
     let account_names: Vec<&str> = config.accounts.iter().map(|a| a.name.as_str()).collect();
     let status_line = if ready {
-        format!("{}  {}  {}", green(DOT), green_bold("running"), cyan(&format!("http://{host}:{control_port}")))
+        format!("{}  {}  {}", green(DOT), green_bold("running"), cyan(&format!("http://{host}:{port}")))
     } else {
-        format!("{}  {}  {}", yellow(DOT), yellow("starting"), dim(&format!("http://{host}:{control_port}")))
+        format!("{}  {}  {}", yellow(DOT), yellow("starting"), dim(&format!("http://{host}:{port}")))
     };
     print_routing_header(&account_names, &[
         format!("{}  {}", brand_green("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
@@ -1215,12 +1216,19 @@ async fn cmd_start(
 // ---------------------------------------------------------------------------
 
 async fn cmd_stop() -> Result<()> {
+    cmd_stop_impl(false).await
+}
+
+async fn cmd_stop_quiet() -> Result<()> {
+    cmd_stop_impl(true).await
+}
+
+async fn cmd_stop_impl(quiet: bool) -> Result<()> {
     let pid_p = pid_path();
     let content = match std::fs::read_to_string(&pid_p) {
         Ok(c) => c,
         Err(_) => {
-            println!("  {} Proxy is not running.", dim("·"));
-            println!();
+            if !quiet { println!("  {} Proxy is not running.", dim("·")); println!(); }
             return Ok(());
         }
     };
@@ -1228,21 +1236,20 @@ async fn cmd_stop() -> Result<()> {
         Ok(p) => p,
         Err(_) => {
             let _ = std::fs::remove_file(&pid_p);
-            println!("  {} Proxy is not running.", dim("·"));
-            println!();
+            if !quiet { println!("  {} Proxy is not running.", dim("·")); println!(); }
             return Ok(());
         }
     };
     if !is_shunt_pid(pid) {
         let _ = std::fs::remove_file(&pid_p);
-        println!("  {} Proxy is not running.", dim("·"));
+        if !quiet { println!("  {} Proxy is not running.", dim("·")); }
         // Daemon died without cleanup — remove stale routing so Claude Code doesn't
         // keep hitting a dead localhost port.
         if let Some(home) = dirs::home_dir() {
-            remove_from_settings_file(&home.join(".claude").join("settings.json"));
-            remove_from_settings_file(&managed_claude_settings_path(&home));
+            remove_from_settings_file_quiet(&home.join(".claude").join("settings.json"));
+            remove_from_settings_file_quiet(&managed_claude_settings_path(&home));
         }
-        println!();
+        if !quiet { println!(); }
         return Ok(());
     }
 
@@ -1261,17 +1268,17 @@ async fn cmd_stop() -> Result<()> {
     }
 
     let _ = std::fs::remove_file(&pid_p);
-    println!("  {} Proxy stopped.", green(CHECK));
+    if !quiet { println!("  {} Proxy stopped.", green(CHECK)); }
 
     // Remove routing from both settings files so Claude Code hits the API directly
     // while the daemon is down (avoids "connection refused" errors).
     // Routing is re-applied automatically when the daemon starts again.
     if let Some(home) = dirs::home_dir() {
-        remove_from_settings_file(&home.join(".claude").join("settings.json"));
-        remove_from_settings_file(&managed_claude_settings_path(&home));
+        remove_from_settings_file_quiet(&home.join(".claude").join("settings.json"));
+        remove_from_settings_file_quiet(&managed_claude_settings_path(&home));
     }
 
-    println!();
+    if !quiet { println!(); }
     Ok(())
 }
 
@@ -1288,7 +1295,10 @@ fn is_shunt_pid(pid: u32) -> bool {
 // ---------------------------------------------------------------------------
 
 async fn cmd_restart(config_override: Option<PathBuf>) -> Result<()> {
-    cmd_stop().await?;
+    print!("  {} Restarting…  ", dim("↻"));
+    use std::io::Write as _;
+    std::io::stdout().flush().ok();
+    cmd_stop_quiet().await?;
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     cmd_start(config_override, None, None, false, false, false).await
 }
@@ -3555,7 +3565,7 @@ fn local_ip() -> Option<String> {
 async fn offer_restart(config_override: Option<PathBuf>) {
     use std::io::Write;
     let Ok(cfg) = crate::config::load_config(config_override.as_deref()) else { return };
-    let health_url = format!("http://{}:{}/health", cfg.server.host, cfg.server.port);
+    let health_url = format!("http://{}:{}/health", cfg.server.host, cfg.server.control_port);
     let running = reqwest::get(&health_url).await
         .map(|r| r.status().is_success())
         .unwrap_or(false);
@@ -3906,6 +3916,14 @@ fn managed_claude_settings_path(home: &std::path::Path) -> std::path::PathBuf {
 
 /// Remove ANTHROPIC_BASE_URL from a settings JSON file (user or managed).
 fn remove_from_settings_file(path: &std::path::Path) -> bool {
+    remove_from_settings_file_impl(path, false)
+}
+
+fn remove_from_settings_file_quiet(path: &std::path::Path) -> bool {
+    remove_from_settings_file_impl(path, true)
+}
+
+fn remove_from_settings_file_impl(path: &std::path::Path, quiet: bool) -> bool {
     if !path.exists() { return false; }
     let Ok(text) = std::fs::read_to_string(path) else { return false };
     let Ok(mut root) = serde_json::from_str::<serde_json::Value>(&text) else { return false };
@@ -3917,7 +3935,9 @@ fn remove_from_settings_file(path: &std::path::Path) -> bool {
     if removed {
         if let Ok(t) = serde_json::to_string_pretty(&root) {
             let _ = std::fs::write(path, t);
-            println!("  {} Removed from {}", green(CHECK), dim(&path.display().to_string()));
+            if !quiet {
+                println!("  {} Removed from {}", green(CHECK), dim(&path.display().to_string()));
+            }
         }
     }
     removed
@@ -4255,6 +4275,165 @@ async fn cmd_uninstall() -> Result<()> {
     println!();
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// report
+// ---------------------------------------------------------------------------
+
+async fn cmd_report(config_override: Option<PathBuf>) -> Result<()> {
+    use std::io::{BufRead, BufReader};
+
+    let sep = || println!("  {}", dim(&"─".repeat(60)));
+
+    println!();
+    println!("  {}  {}  {}", brand_green(DIAMOND), bold("shunt report"), dim(&format!("v{}", env!("CARGO_PKG_VERSION"))));
+    println!("  {}", dim("Paste this output when reporting an issue."));
+    println!("  {}", dim("Emails and tokens are automatically redacted."));
+    println!();
+
+    // ── environment ─────────────────────────────────────────────────────
+    sep();
+    println!("  {} {}", dim("·"), bold("environment"));
+    sep();
+    println!("  {:<22} {}", dim("version"), env!("CARGO_PKG_VERSION"));
+    println!("  {:<22} {}", dim("os"), std::env::consts::OS);
+    println!("  {:<22} {}", dim("arch"), std::env::consts::ARCH);
+    let config_p = config_override.clone().unwrap_or_else(config_path);
+    println!("  {:<22} {}", dim("config"), config_p.display());
+    println!("  {:<22} {}", dim("log"), log_path().display());
+
+    // ── accounts ────────────────────────────────────────────────────────
+    sep();
+    println!("  {} {}", dim("·"), bold("accounts"));
+    sep();
+    match crate::config::load_config(config_override.as_deref()) {
+        Ok(cfg) => {
+            println!("  {:<22} {}", dim("count"), cfg.accounts.len());
+            for (i, acc) in cfg.accounts.iter().enumerate() {
+                let cred_type = match &acc.credential {
+                    Some(crate::credential::Credential::Apikey { .. }) => "api-key",
+                    Some(_) => "oauth",
+                    None    => "none",
+                };
+                println!("  {}  account-{}   {}   {}", dim("·"), i + 1, acc.provider, cred_type);
+            }
+        }
+        Err(e) => println!("  {} {}", red(CROSS), e),
+    }
+
+    // ── proxy status ─────────────────────────────────────────────────────
+    sep();
+    println!("  {} {}", dim("·"), bold("proxy"));
+    sep();
+    let pid_p = pid_path();
+    let running = if pid_p.exists() {
+        let pid_str = std::fs::read_to_string(&pid_p).unwrap_or_default();
+        let pid: u32 = pid_str.trim().parse().unwrap_or(0);
+        let alive = pid > 0 && unsafe { libc::kill(pid as i32, 0) } == 0;
+        if alive {
+            println!("  {:<22} {} (PID {})", dim("status"), green("running"), pid);
+        } else {
+            println!("  {:<22} {} (stale PID {})", dim("status"), yellow("stale"), pid);
+        }
+        alive
+    } else {
+        println!("  {:<22} {}", dim("status"), red("not running"));
+        false
+    };
+
+    if running {
+        if let Ok(cfg) = crate::config::load_config(config_override.as_deref()) {
+            println!("  {:<22} {}:{}", dim("port"), cfg.server.host, cfg.server.port);
+            // Try fetching live status
+            let url = format!("http://{}:{}/status", cfg.server.host, cfg.server.control_port);
+            match reqwest::Client::new().get(&url).timeout(std::time::Duration::from_secs(2)).send().await {
+                Ok(r) if r.status().is_success() => {
+                    if let Ok(v) = r.json::<serde_json::Value>().await {
+                        if let Some(uptime) = v["uptime_secs"].as_u64() {
+                            let h = uptime / 3600;
+                            let m = (uptime % 3600) / 60;
+                            let s = uptime % 60;
+                            println!("  {:<22} {}h {}m {}s", dim("uptime"), h, m, s);
+                        }
+                        if let Some(total) = v["total_requests"].as_u64() {
+                            println!("  {:<22} {}", dim("total requests"), total);
+                        }
+                    }
+                }
+                Ok(r) => println!("  {:<22} HTTP {}", dim("control port"), r.status()),
+                Err(e) => println!("  {:<22} {}", dim("control port"), e),
+            }
+        }
+    }
+
+    // ── routing injection ────────────────────────────────────────────────
+    sep();
+    println!("  {} {}", dim("·"), bold("routing injection"));
+    sep();
+
+    let home = dirs::home_dir();
+    let paths: Vec<(&str, std::path::PathBuf)> = if let Some(ref h) = home {
+        vec![
+            ("~/.claude/settings.json",    h.join(".claude").join("settings.json")),
+            ("managed_settings.json",      managed_claude_settings_path(h)),
+        ]
+    } else { vec![] };
+
+    for (label, path) in &paths {
+        let url = read_anthropic_base_url_from_file(path);
+        match url.as_deref() {
+            Some(u) => println!("  {:<28} {} = {}", dim(label), green(CHECK), u),
+            None if path.exists() => println!("  {:<28} {} not set", dim(label), dim("·")),
+            None => println!("  {:<28} {} file not found", dim(label), dim("·")),
+        }
+    }
+
+    let shell_val = std::env::var("ANTHROPIC_BASE_URL").ok();
+    match shell_val.as_deref() {
+        Some(v) => println!("  {:<28} {} = {}", dim("shell $ANTHROPIC_BASE_URL"), green(CHECK), v),
+        None    => println!("  {:<28} {} not set", dim("shell $ANTHROPIC_BASE_URL"), dim("·")),
+    }
+
+    // ── last 100 log lines ───────────────────────────────────────────────
+    sep();
+    println!("  {} {}", dim("·"), bold("last 100 log lines  (redacted)"));
+    sep();
+    let log = log_path();
+    if log.exists() {
+        let file = std::fs::File::open(&log)?;
+        let reader = BufReader::new(file);
+        let mut ring: std::collections::VecDeque<String> = std::collections::VecDeque::with_capacity(101);
+        for line in reader.lines().flatten() {
+            if ring.len() >= 100 { ring.pop_front(); }
+            ring.push_back(redact_log_line(&line));
+        }
+        for l in &ring { println!("  {l}"); }
+    } else {
+        println!("  {} no log file found", dim("·"));
+    }
+
+    sep();
+    println!();
+    Ok(())
+}
+
+/// Read ANTHROPIC_BASE_URL from the `env` key in a Claude settings JSON file.
+fn read_anthropic_base_url_from_file(path: &std::path::Path) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&content).ok()?;
+    v["env"]["ANTHROPIC_BASE_URL"].as_str().map(|s| s.to_owned())
+}
+
+/// Redact email addresses and long hex/base64 tokens from a log line.
+fn redact_log_line(line: &str) -> String {
+    // Redact email addresses: anything@anything.anything
+    let re_email = regex::Regex::new(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}").unwrap();
+    let s = re_email.replace_all(line, "[email]");
+    // Redact long hex/base64 strings that look like tokens (≥32 chars of base64/hex)
+    let re_token = regex::Regex::new(r"[A-Za-z0-9+/\-_]{32,}={0,2}").unwrap();
+    let s = re_token.replace_all(&s, "[token]");
+    s.into_owned()
 }
 
 // ---------------------------------------------------------------------------
