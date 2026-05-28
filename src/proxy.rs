@@ -438,14 +438,40 @@ async fn proxy_handler(
         .map_err(|_| ProxyError::BodyRead)?;
 
     // Apply model override: if set, patch the `model` field in the JSON body before forwarding.
-    let body_bytes = if let Some(override_model) = s.state.get_model_override() {
-        if let Ok(mut val) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+    // Also strip unsupported params for models that don't support them (e.g. Haiku).
+    let body_bytes = if let Ok(mut val) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+        let mut changed = false;
+        if let Some(override_model) = s.state.get_model_override() {
             if val.get("model").is_some() {
                 val["model"] = serde_json::Value::String(override_model);
-                Bytes::from(serde_json::to_vec(&val).unwrap_or_else(|_| body_bytes.to_vec()))
-            } else {
-                body_bytes
+                changed = true;
             }
+        }
+        let resolved_model = val["model"].as_str().unwrap_or("").to_owned();
+        if is_simple_model(&resolved_model) {
+            if let Some(obj) = val.as_object_mut() {
+                // Strip features unsupported by simpler models (Haiku).
+                for key in &["thinking", "effort", "reasoning_effort"] {
+                    if obj.remove(*key).is_some() { changed = true; }
+                }
+                // Strip effort from output_config if present
+                if let Some(serde_json::Value::Object(oc)) = obj.get_mut("output_config") {
+                    if oc.remove("effort").is_some() { changed = true; }
+                    // Remove output_config entirely if empty
+                    if oc.is_empty() { obj.remove("output_config"); }
+                }
+                // Strip context_management (thinking-related edit rules)
+                if obj.remove("context_management").is_some() { changed = true; }
+                // Remove extended-thinking beta flag
+                if let Some(serde_json::Value::Array(betas)) = obj.get_mut("betas") {
+                    let before = betas.len();
+                    betas.retain(|b| b.as_str() != Some("interleaved-thinking-2025-05-14"));
+                    if betas.len() != before { changed = true; }
+                }
+            }
+        }
+        if changed {
+            Bytes::from(serde_json::to_vec(&val).unwrap_or_else(|_| body_bytes.to_vec()))
         } else {
             body_bytes
         }
@@ -457,6 +483,24 @@ async fn proxy_handler(
         .ok()
         .and_then(|v| v["model"].as_str().map(|s| s.to_owned()))
         .unwrap_or_default();
+
+    // Strip thinking/effort-related beta flags from the anthropic-beta header for simple models.
+    let mut headers = headers;
+    if is_simple_model(&model) {
+        if let Some(beta_val) = headers.get("anthropic-beta").and_then(|v| v.to_str().ok().map(|s| s.to_owned())) {
+            let filtered: Vec<&str> = beta_val.split(',')
+                .map(|s| s.trim())
+                .filter(|b| !b.contains("thinking") && !b.contains("effort"))
+                .collect();
+            let new_beta = filtered.join(",");
+            if filtered.is_empty() {
+                headers.remove("anthropic-beta");
+            } else if let Ok(v) = axum::http::HeaderValue::from_str(&new_beta) {
+                headers.insert("anthropic-beta", v);
+            }
+        }
+    }
+
     let req_start_ms = now_ms();
     let request_id = uuid::Uuid::new_v4().to_string()[..8].to_owned();
 
@@ -1650,6 +1694,12 @@ async fn fetch_sentinel_token(client: &reqwest::Client, upstream: &str, token: &
     json["token"].as_str().map(ToOwned::to_owned)
 }
 
+
+/// Returns true if the model lacks support for extended thinking / effort.
+/// These params must be stripped before forwarding.
+fn is_simple_model(model: &str) -> bool {
+    model.contains("haiku")
+}
 
 /// Resolve the target model name for a non-Anthropic account.
 ///
