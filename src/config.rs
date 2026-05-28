@@ -245,7 +245,6 @@ pub enum RoutingStrategy {
     /// Drains accounts whose quota windows expire soonest first, then prefers
     /// the account with the most remaining quota. Maximises total token usage over time.
     /// Config: `"reaper"`
-    #[default]
     Reaper,
     /// Spins through accounts in a fixed round-robin cycle, ignoring quota state.
     /// Config: `"carousel"`
@@ -261,6 +260,7 @@ pub enum RoutingStrategy {
     /// where time_fraction = secs_to_reset / window_duration (0 = resetting now, 1 = just started).
     /// Accounts for how much quota remains AND how soon each window refreshes.
     /// Config: `"maximus"`
+    #[default]
     Maximus,
 }
 
@@ -311,7 +311,7 @@ impl Default for ServerConfig {
             custom_domain: None,
             sticky_ttl_ms: 10 * 60 * 1000,
             expiry_soon_secs: 30 * 60,
-            routing_strategy: RoutingStrategy::Reaper,
+            routing_strategy: RoutingStrategy::Maximus,
             request_timeout_secs: 600,
             rate_limit_rpm: 0,
             trust_proxy_headers: false,
@@ -423,10 +423,10 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
         sticky_ttl_ms: raw.server.sticky_ttl_minutes.unwrap_or(10) * 60 * 1000,
         expiry_soon_secs: raw.server.expiry_soon_minutes.unwrap_or(30) * 60,
         routing_strategy: match raw.server.routing_strategy.as_deref() {
+            Some("reaper") | Some("earliest-expiry") | Some("earliest_expiry") => RoutingStrategy::Reaper,
             Some("carousel") | Some("round-robin") | Some("round_robin") => RoutingStrategy::Carousel,
             Some("cushion") | Some("most-available") | Some("most_available") => RoutingStrategy::Cushion,
-            Some("maximus") => RoutingStrategy::Maximus,
-            _ => RoutingStrategy::Reaper,
+            _ => RoutingStrategy::Maximus,
         },
         request_timeout_secs: raw.server.request_timeout_secs.unwrap_or(600),
         rate_limit_rpm: raw.server.rate_limit_rpm.unwrap_or(0),
