@@ -254,13 +254,38 @@ impl Picker {
     fn selected(&self) -> &str { &self.items[self.cursor] }
 }
 
+const MODEL_PRESETS: &[&str] = &[
+    "claude-opus-4-6",
+    "claude-sonnet-4-6",
+    "claude-haiku-4-5-20251001",
+    "client choice",  // sentinel: clears override
+];
+
+struct ModelPicker {
+    cursor: usize,
+}
+
+impl ModelPicker {
+    fn new(current: Option<&str>) -> Self {
+        let cursor = current
+            .and_then(|m| MODEL_PRESETS.iter().position(|p| *p == m))
+            .unwrap_or(MODEL_PRESETS.len() - 1); // default to "client choice"
+        Self { cursor }
+    }
+    fn up(&mut self)   { self.cursor = if self.cursor == 0 { MODEL_PRESETS.len() - 1 } else { self.cursor - 1 }; }
+    fn down(&mut self) { self.cursor = (self.cursor + 1) % MODEL_PRESETS.len(); }
+    fn selected(&self) -> &str { MODEL_PRESETS[self.cursor] }
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
 pub async fn run_monitor(base_url: &str) -> Result<()> {
-    let status_url = format!("{}/status", base_url.trim_end_matches('/'));
-    let use_url    = format!("{}/use",    base_url.trim_end_matches('/'));
+    let base = base_url.trim_end_matches('/');
+    let status_url = format!("{base}/status");
+    let use_url    = format!("{base}/use");
+    let model_url  = format!("{base}/model");
 
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -285,6 +310,8 @@ pub async fn run_monitor(base_url: &str) -> Result<()> {
     let mut accounts_scroll: usize = 0;
     let mut requests_scroll: usize = 0;
     let mut picker: Option<Picker> = None;
+    let mut model_picker: Option<ModelPicker> = None;
+    let mut model_override: Option<String> = None;
     let mut show_help = false;
     let mut refresh_ms: u64 = 1_000;
     let mut focus = Focus::Accounts;
@@ -297,12 +324,23 @@ pub async fn run_monitor(base_url: &str) -> Result<()> {
                 Ok(s)  => { state = Some(s); fetch_err = None; }
                 Err(e) => { fetch_err = Some(e); state = None; }
             }
+            // Fetch model override in parallel (ignore errors — proxy may not support it yet)
+            if let Ok(r) = reqwest::Client::new()
+                .get(&model_url)
+                .timeout(Duration::from_secs(2))
+                .send().await
+            {
+                if let Ok(v) = r.json::<serde_json::Value>().await {
+                    model_override = v["model"].as_str().map(|s| s.to_owned());
+                }
+            }
             last_fetch = Instant::now();
         }
 
         terminal.draw(|f| {
             draw(f, &state, &fetch_err, accounts_scroll, requests_scroll,
-                 base_url, &picker, show_help, refresh_ms, focus, chart_window, start_time)
+                 base_url, &picker, &model_picker, &model_override,
+                 show_help, refresh_ms, focus, chart_window, start_time)
         })?;
 
         if event::poll(Duration::from_millis(200))? {
@@ -312,6 +350,7 @@ pub async fn run_monitor(base_url: &str) -> Result<()> {
                     continue;
                 }
 
+                // Account picker overlay
                 if let Some(ref mut p) = picker {
                     match key.code {
                         KeyCode::Esc | KeyCode::Char('q') => { picker = None; }
@@ -326,6 +365,35 @@ pub async fn run_monitor(base_url: &str) -> Result<()> {
                                 .timeout(Duration::from_secs(3))
                                 .send()
                                 .await;
+                            last_fetch = Instant::now() - Duration::from_secs(10);
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
+                // Model picker overlay
+                if let Some(ref mut mp) = model_picker {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char('q') => { model_picker = None; }
+                        KeyCode::Up   | KeyCode::Char('k') => mp.up(),
+                        KeyCode::Down | KeyCode::Char('j') => mp.down(),
+                        KeyCode::Enter => {
+                            let chosen = mp.selected().to_owned();
+                            model_picker = None;
+                            let client = reqwest::Client::new();
+                            if chosen == "client choice" {
+                                let _ = client.delete(&model_url)
+                                    .timeout(Duration::from_secs(3))
+                                    .send().await;
+                                model_override = None;
+                            } else {
+                                let _ = client.post(&model_url)
+                                    .json(&serde_json::json!({ "model": chosen }))
+                                    .timeout(Duration::from_secs(3))
+                                    .send().await;
+                                model_override = Some(chosen);
+                            }
                             last_fetch = Instant::now() - Duration::from_secs(10);
                         }
                         _ => {}
@@ -369,6 +437,9 @@ pub async fn run_monitor(base_url: &str) -> Result<()> {
                         if let Some(ref s) = state {
                             picker = Some(Picker::new(&s.accounts, s.pinned_account.as_deref()));
                         }
+                    }
+                    (KeyCode::Char('m'), _) => {
+                        model_picker = Some(ModelPicker::new(model_override.as_deref()));
                     }
                     (KeyCode::Char('?'), _) => { show_help = true; }
                     (KeyCode::Char('+'), _) | (KeyCode::Char('='), _) => {
@@ -421,6 +492,8 @@ fn draw(
     requests_scroll: usize,
     base_url: &str,
     picker: &Option<Picker>,
+    model_picker: &Option<ModelPicker>,
+    model_override: &Option<String>,
     show_help: bool,
     refresh_ms: u64,
     focus: Focus,
@@ -438,20 +511,21 @@ fn draw(
         ])
         .split(area);
 
-    draw_header(f, chunks[0], state);
+    draw_header(f, chunks[0], state, model_override);
 
     match state {
         None    => draw_connecting(f, chunks[1], error, base_url, start_time),
         Some(s) => draw_body(f, chunks[1], s, accounts_scroll, requests_scroll, focus, chart_window),
     }
 
-    draw_footer(f, chunks[2], picker.is_some(), refresh_ms, focus);
+    draw_footer(f, chunks[2], picker.is_some() || model_picker.is_some(), refresh_ms, focus);
 
     if let Some(p) = picker { draw_picker(f, p, area); }
+    if let Some(mp) = model_picker { draw_model_picker(f, mp, model_override.as_deref(), area); }
     if show_help { draw_help_overlay(f, area); }
 }
 
-fn draw_header(f: &mut Frame, area: Rect, state: &Option<StatusResponse>) {
+fn draw_header(f: &mut Frame, area: Rect, state: &Option<StatusResponse>, model_override: &Option<String>) {
     let uptime_span = state
         .as_ref()
         .and_then(|s| s.started_ms)
@@ -469,6 +543,11 @@ fn draw_header(f: &mut Frame, area: Rect, state: &Option<StatusResponse>) {
     ];
     if let Some(ref u) = uptime_span {
         spans.push(Span::styled(u.as_str(), style_dim()));
+    }
+    if let Some(ref m) = model_override {
+        spans.push(Span::styled("  ·  ", style_dim()));
+        spans.push(Span::styled("model ", style_dim()));
+        spans.push(Span::styled(shorten_model(m), style_yellow()));
     }
 
     let block = Block::default().borders(Borders::BOTTOM).border_style(style_dkgreen());
@@ -496,6 +575,7 @@ fn draw_footer(f: &mut Frame, area: Rect, picker_open: bool, refresh_ms: u64, fo
             Span::styled("↑↓", style_green()), scroll_hint, sep(),
             Span::styled("r", style_green()), Span::styled(" refresh", style_dim()), sep(),
             Span::styled("u", style_green()), Span::styled(" pin", style_dim()), sep(),
+            Span::styled("m", style_green()), Span::styled(" model", style_dim()), sep(),
             Span::styled("+/-", style_green()), Span::styled(format!(" speed  {rate_str}"), style_dim()), sep(),
             Span::styled("?", style_green()), Span::styled(" help", style_dim()),
         ])
@@ -969,6 +1049,43 @@ fn draw_picker(f: &mut Frame, picker: &Picker, area: Rect) {
     f.render_widget(Table::new(rows, [Constraint::Min(0)]).column_spacing(0), inner);
 }
 
+fn draw_model_picker(f: &mut Frame, mp: &ModelPicker, current: Option<&str>, area: Rect) {
+    let h = (MODEL_PRESETS.len() + 4) as u16;
+    let w = 42u16;
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    let popup_area = Rect { x, y, width: w.min(area.width), height: h.min(area.height) };
+
+    f.render_widget(Clear, popup_area);
+    let block = Block::default()
+        .title(Line::from(Span::styled(" override model ", style_dim())))
+        .borders(Borders::ALL)
+        .border_style(style_dkgreen());
+    let inner = block.inner(popup_area);
+    f.render_widget(block, popup_area);
+
+    let rows: Vec<Row> = MODEL_PRESETS.iter().enumerate().map(|(i, &preset)| {
+        let is_sel = i == mp.cursor;
+        let is_current = current == Some(preset) || (preset == "client choice" && current.is_none());
+        let label = if preset == "client choice" {
+            format!("  {}  client choice", if is_sel { "◆" } else { " " })
+        } else {
+            format!("  {}  {}", if is_sel { "◆" } else { " " }, shorten_model(preset))
+        };
+        let active_tag = if is_current { Span::styled("  ✓", style_green()) } else { Span::raw("") };
+        let style = if is_sel {
+            Style::default().fg(GREEN).add_modifier(Modifier::BOLD)
+        } else {
+            style_dim()
+        };
+        Row::new(vec![
+            Cell::from(Line::from(vec![Span::styled(label, style), active_tag])),
+        ])
+    }).collect();
+
+    f.render_widget(Table::new(rows, [Constraint::Min(0)]).column_spacing(0), inner);
+}
+
 // ---------------------------------------------------------------------------
 // Help overlay
 // ---------------------------------------------------------------------------
@@ -981,6 +1098,7 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
         ("↓ / j",   "scroll down / next time"),
         ("r",        "force refresh"),
         ("u",        "pin account"),
+        ("m",        "override model"),
         ("t / ]",   "next time window"),
         ("[",        "prev time window"),
         ("+  / =",  "faster refresh"),
