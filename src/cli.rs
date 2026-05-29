@@ -271,6 +271,17 @@ enum RelayAction {
 }
 
 pub async fn run() -> Result<()> {
+    // Intercept --version / -V before clap to show branded banner
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() == 2 && (args[1] == "--version" || args[1] == "-V") {
+        print_splash(&[
+            format!("{}  {}", brand_green("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
+            String::new(),
+            String::new(),
+        ]);
+        return Ok(());
+    }
+
     let cli = Cli::parse();
     match cli.command {
         Command::Setup { config } => cmd_setup(config).await,
