@@ -3963,8 +3963,13 @@ async fn cmd_live(config_override: Option<PathBuf>, subdomain: Option<String>, r
         .or_else(|| std::env::var("SHUNT_RELAY_WS_URL").ok())
         .unwrap_or_else(|| "wss://relay.ramcharan.shop/tunnel".to_string());
 
-    let token = std::env::var("SHUNT_TUNNEL_TOKEN")
-        .context("SHUNT_TUNNEL_TOKEN env var required")?;
+    let token = match std::env::var("SHUNT_TUNNEL_TOKEN") {
+        Ok(t) if !t.is_empty() => t,
+        _ => {
+            let config_p = config_override.clone().unwrap_or_else(config_path);
+            setup_live_tunnel(&subdomain, &config_p).await?
+        }
+    };
 
     let local_url = format!("http://{}:{}", config.server.host, config.server.port);
 
@@ -3980,6 +3985,181 @@ async fn cmd_live(config_override: Option<PathBuf>, subdomain: Option<String>, r
     println!();
 
     crate::tunnel::run_live(&relay_ws, &subdomain, &token, &local_url).await
+}
+
+/// First-run wizard for `shunt live`: generates a tunnel token, sets up DNS,
+/// waits for the relay, and saves the token to the shell profile.
+/// Returns the generated token so `cmd_live` can use it immediately.
+async fn setup_live_tunnel(subdomain: &str, config_path: &std::path::Path) -> Result<String> {
+    use std::io::Write as _;
+
+    println!();
+    println!("  {} {}", brand_green("shunt live"), dim("— first-time setup"));
+    println!();
+
+    // Step 1: Generate token
+    println!("  {} Generating tunnel token…", dim("1/5"));
+    let token = hex::encode(crate::oauth::rand_bytes::<32>());
+    println!("  {} Token generated (64 hex chars)", green(CHECK));
+    println!();
+
+    // Step 2: DNS setup — get CF token, VPS IP, create wildcard A record
+    println!("  {} Setting up DNS…", dim("2/5"));
+    let cf_token = cf_api_get_token(config_path)?;
+
+    print!("  Enter your VPS IP address: ");
+    std::io::stdout().flush()?;
+    let mut vps_ip = String::new();
+    std::io::stdin().read_line(&mut vps_ip)?;
+    let vps_ip = vps_ip.trim().to_string();
+    vps_ip.parse::<std::net::IpAddr>()
+        .with_context(|| format!("Invalid IP address: {vps_ip}"))?;
+
+    let zone_id = cf_api_get_zone_id(&cf_token, "ramcharan.shop")?;
+    let dns_name = "*.ramcharan.shop";
+    cf_api_upsert_dns_a(&cf_token, &zone_id, dns_name, &vps_ip)?;
+    println!("  {} DNS: {} → {}", green(CHECK), cyan(dns_name), cyan(&vps_ip));
+    println!();
+
+    // Step 3: Show the relay command
+    println!("  {} Start the relay on your VPS", dim("3/5"));
+    println!("  ┌─────────────────────────────────────────────────────────────┐");
+    println!("  │  SHUNT_RELAY_TOKEN={} shunt relay serve  │", &token[..20]);
+    // Print the full command separately so it's easy to copy
+    println!("  └─────────────────────────────────────────────────────────────┘");
+    println!();
+    println!("  Full command:");
+    println!("    SHUNT_RELAY_TOKEN={token} shunt relay serve --port 8085");
+    println!();
+    println!("  SSH into your VPS and run the command above.");
+    print!("  Press Enter when ready…");
+    std::io::stdout().flush()?;
+    let mut buf = String::new();
+    std::io::stdin().read_line(&mut buf)?;
+    println!();
+
+    // Step 4: Wait for relay
+    println!("  {} Waiting for relay…", dim("4/5"));
+    let relay_url = "wss://relay.ramcharan.shop/tunnel";
+    poll_relay_ws(relay_url, std::time::Duration::from_secs(300)).await?;
+    println!("  {} Relay is online", green(CHECK));
+    println!();
+
+    // Step 5: Save token to shell profile
+    println!("  {} Saving config…", dim("5/5"));
+    write_tunnel_token_to_profile(&token, subdomain)?;
+    println!();
+
+    // Set in current process so the tunnel can start immediately
+    #[allow(unused_unsafe)]
+    unsafe { std::env::set_var("SHUNT_TUNNEL_TOKEN", &token); }
+    if subdomain != "shunt" {
+        #[allow(unused_unsafe)]
+        unsafe { std::env::set_var("SHUNT_TUNNEL_SUBDOMAIN", subdomain); }
+    }
+
+    println!("  Setup complete! Starting tunnel…");
+    println!();
+
+    Ok(token)
+}
+
+/// Create or update an A record in Cloudflare DNS.
+fn cf_api_upsert_dns_a(token: &str, zone_id: &str, hostname: &str, ip: &str) -> Result<()> {
+    // Check if A record already exists
+    let records: serde_json::Value = cf_api(token, "GET",
+        &format!("/zones/{zone_id}/dns_records?type=A&name={hostname}&per_page=1"), None)?;
+
+    if let Some(record) = records.as_array().and_then(|a| a.first()) {
+        let record_id = record["id"].as_str().context("DNS record has no id")?;
+        cf_api::<serde_json::Value>(token, "PATCH",
+            &format!("/zones/{zone_id}/dns_records/{record_id}"),
+            Some(serde_json::json!({"content": ip, "proxied": true})))?;
+    } else {
+        cf_api::<serde_json::Value>(token, "POST",
+            &format!("/zones/{zone_id}/dns_records"),
+            Some(serde_json::json!({"type": "A", "name": hostname, "content": ip, "proxied": true})))?;
+    }
+    Ok(())
+}
+
+/// Poll the relay WebSocket endpoint until it responds or timeout is reached.
+async fn poll_relay_ws(url: &str, timeout: std::time::Duration) -> Result<()> {
+    let start = std::time::Instant::now();
+    let interval = std::time::Duration::from_secs(5);
+
+    loop {
+        match tokio_tungstenite::connect_async(url).await {
+            Ok((_ws, _)) => {
+                // Connected successfully — drop closes the connection
+                return Ok(());
+            }
+            Err(_) => {
+                if start.elapsed() >= timeout {
+                    bail!(
+                        "Relay did not respond after {}s. Check that the relay is running on your VPS \
+                         and that DNS has propagated (*.ramcharan.shop).",
+                        timeout.as_secs()
+                    );
+                }
+                print!(".");
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+                tokio::time::sleep(interval).await;
+            }
+        }
+    }
+}
+
+/// Write SHUNT_TUNNEL_TOKEN (and optionally SHUNT_TUNNEL_SUBDOMAIN) to the
+/// user's shell profile.
+fn write_tunnel_token_to_profile(token: &str, subdomain: &str) -> Result<()> {
+    use std::io::Write as _;
+
+    let profile = detect_shell_profile()
+        .context("Could not detect shell profile. Set SHUNT_TUNNEL_TOKEN manually.")?;
+
+    let token_line = format!("export SHUNT_TUNNEL_TOKEN={token}");
+    let subdomain_line = if subdomain != "shunt" {
+        Some(format!("export SHUNT_TUNNEL_SUBDOMAIN={subdomain}"))
+    } else {
+        None
+    };
+
+    if profile.exists() {
+        let contents = std::fs::read_to_string(&profile)?;
+
+        // Replace existing lines if present
+        if contents.contains("SHUNT_TUNNEL_TOKEN") {
+            let updated: String = contents
+                .lines()
+                .map(|l| {
+                    if l.contains("SHUNT_TUNNEL_TOKEN") && !l.contains("SHUNT_TUNNEL_SUBDOMAIN") {
+                        Some(token_line.as_str())
+                    } else if l.contains("SHUNT_TUNNEL_SUBDOMAIN") {
+                        subdomain_line.as_deref() // None = remove line
+                    } else {
+                        Some(l)
+                    }
+                })
+                .flatten()
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n";
+            std::fs::write(&profile, updated)?;
+            println!("  {} Updated {}", green(CHECK), dim(&profile.display().to_string()));
+            return Ok(());
+        }
+    }
+
+    // Append
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&profile)?;
+    writeln!(f, "\n# Added by shunt live")?;
+    writeln!(f, "{token_line}")?;
+    if let Some(sub_line) = &subdomain_line {
+        writeln!(f, "{sub_line}")?;
+    }
+    println!("  {} Token saved to {}", green(CHECK), dim(&profile.display().to_string()));
+    Ok(())
 }
 
 async fn cmd_relay_serve(port: u16) -> Result<()> {
