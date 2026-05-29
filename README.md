@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="https://shunt-web.vercel.app/assets/shunt_logo-removebg-preview.png" alt="shunt" width="96" style="image-rendering:pixelated"><br>
+<img src="https://shunt.live/assets/shunt_logo-removebg-preview.png" alt="shunt" width="96" style="image-rendering:pixelated"><br>
 
 # shunt
 
@@ -11,7 +11,7 @@
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![platform](https://img.shields.io/badge/macOS%20%7C%20Linux-lightgrey)
 
-<a href="https://shunt-web.vercel.app" target="_blank">shunt-web.vercel.app</a>
+<a href="https://shunt.live" target="_blank">shunt.live</a>
 
 </div>
 
