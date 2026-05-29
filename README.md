@@ -7,7 +7,7 @@
 **Pool your Claude rate limits. Never get throttled mid-session again.**
 
 [![crates.io](https://img.shields.io/crates/v/shunt-proxy.svg)](https://crates.io/crates/shunt-proxy)
-[![downloads](https://img.shields.io/github/downloads/ramc10/shunt/total)](https://github.com/ramc10/shunt/releases)
+[![downloads](https://img.shields.io/crates/d/shunt-proxy)](https://crates.io/crates/shunt-proxy)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![platform](https://img.shields.io/badge/macOS%20%7C%20Linux-lightgrey)
 
