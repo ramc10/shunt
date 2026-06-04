@@ -5,7 +5,7 @@
 use crate::config::RoutingStrategy;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use parking_lot::Mutex;
@@ -23,6 +23,30 @@ fn now_ms() -> u64 {
 /// Public version of `now_ms()` for use from other modules.
 pub fn now_ms_pub() -> u64 {
     now_ms()
+}
+
+// ---------------------------------------------------------------------------
+// Routing snapshot (single-lock data for pick_account)
+// ---------------------------------------------------------------------------
+
+/// Pre-computed per-account data for the router, taken from a single mutex lock.
+#[derive(Debug, Clone)]
+pub struct AccountRoutingData {
+    pub available: bool,
+    pub health_check_failed: bool,
+    pub exhausted: bool,
+    pub cooldown_until_ms: u64,
+    pub util_5h: f64,
+    pub util_7d: f64,
+    pub reset_5h_secs: Option<u64>,
+    pub reset_7d_secs: Option<u64>,
+}
+
+/// Snapshot of all routing-relevant state, taken with a single lock.
+#[derive(Debug, Clone)]
+pub struct RoutingSnapshot {
+    pub accounts: HashMap<String, AccountRoutingData>,
+    pub now_secs: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -192,6 +216,8 @@ pub struct StateStore {
     pending: Arc<AtomicBool>,
     /// Monotonically-increasing counter for round-robin account selection.
     round_robin: Arc<AtomicUsize>,
+    /// When true, all daemon alert notifications are suppressed (ephemeral).
+    alerts_muted: Arc<AtomicBool>,
 }
 
 impl StateStore {
@@ -203,6 +229,7 @@ impl StateStore {
             inner: Arc::new(Mutex::new(StateData::default())),
             pending: Arc::new(AtomicBool::new(false)),
             round_robin: Arc::new(AtomicUsize::new(0)),
+            alerts_muted: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -230,6 +257,7 @@ impl StateStore {
             inner: Arc::new(Mutex::new(data)),
             pending: Arc::new(AtomicBool::new(false)),
             round_robin: Arc::new(AtomicUsize::new(0)),
+            alerts_muted: Arc::new(AtomicBool::new(false)),
         };
         store.start_writer_thread();
         store
@@ -292,6 +320,51 @@ impl StateStore {
     /// Returns a snapshot of all account states for the status endpoint.
     pub fn account_states(&self) -> HashMap<String, AccountState> {
         self.inner.lock().accounts.clone()
+    }
+
+    /// Single-lock snapshot of everything the router needs for account selection.
+    /// Avoids per-account mutex acquisitions (O(N) → O(1) locks per pick_account call).
+    pub fn routing_snapshot(&self) -> RoutingSnapshot {
+        let now_ms  = now_ms();
+        let now_secs = now_ms / 1_000;
+        let data = self.inner.lock();
+
+        // Collect all account names from both accounts and rate_limits maps.
+        let mut all_names: HashSet<&String> = data.accounts.keys().collect();
+        all_names.extend(data.rate_limits.keys());
+
+        let accounts: HashMap<String, AccountRoutingData> = all_names.into_iter().map(|name| {
+            let acc = data.accounts.get(name);
+            let available = acc.map(|a| !a.disabled && !a.auth_failed && now_ms >= a.cooldown_until_ms).unwrap_or(true);
+            let health_check_failed = acc.map(|a| a.health_check_failed).unwrap_or(false);
+            let cooldown_until_ms = acc.map(|a| a.cooldown_until_ms).unwrap_or(0);
+
+            let (util_5h, reset_5h, util_7d, reset_7d, exhausted) =
+                if let Some(rl) = data.rate_limits.get(name) {
+                    let r5 = rl.reset_5h.filter(|&t| t > now_secs);
+                    let r7 = rl.reset_7d.filter(|&t| t > now_secs);
+                    let u5 = if r5.is_some() { rl.utilization_5h.unwrap_or(0.0) } else { 0.0 };
+                    let u7 = if r7.is_some() { rl.utilization_7d.unwrap_or(0.0) } else { 0.0 };
+                    let ex = (rl.status_5h.as_deref() == Some("exhausted") && r5.is_some())
+                          || (rl.status_7d.as_deref() == Some("exhausted") && r7.is_some());
+                    (u5, r5, u7, r7, ex)
+                } else {
+                    (0.0, None, 0.0, None, false)
+                };
+
+            (name.clone(), AccountRoutingData {
+                available,
+                health_check_failed,
+                exhausted,
+                cooldown_until_ms,
+                util_5h,
+                util_7d,
+                reset_5h_secs: reset_5h,
+                reset_7d_secs: reset_7d,
+            })
+        }).collect();
+
+        RoutingSnapshot { accounts, now_secs }
     }
 
     // -----------------------------------------------------------------------
@@ -628,6 +701,18 @@ impl StateStore {
 
     pub fn clear_routing_strategy(&self) {
         self.inner.lock().routing_strategy_override = None;
+    }
+
+    // -----------------------------------------------------------------------
+    // Alerts mute
+    // -----------------------------------------------------------------------
+
+    pub fn get_alerts_muted(&self) -> bool {
+        self.alerts_muted.load(Ordering::Relaxed)
+    }
+
+    pub fn set_alerts_muted(&self, muted: bool) {
+        self.alerts_muted.store(muted, Ordering::Relaxed);
     }
 
     // -----------------------------------------------------------------------

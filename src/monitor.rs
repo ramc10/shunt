@@ -316,6 +316,7 @@ pub async fn run_monitor(base_url: &str) -> Result<()> {
     let use_url    = format!("{base}/use");
     let model_url  = format!("{base}/model");
     let strategy_url = format!("{base}/strategy");
+    let alerts_url = format!("{base}/alerts");
 
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -345,6 +346,7 @@ pub async fn run_monitor(base_url: &str) -> Result<()> {
     let mut strategy_picker: Option<StrategyPicker> = None;
     let mut current_strategy: Option<String> = None;
     let mut strategy_source: Option<String> = None;
+    let mut alerts_muted = false;
     let mut show_help = false;
     let mut refresh_ms: u64 = 1_000;
     let mut focus = Focus::Accounts;
@@ -378,6 +380,16 @@ pub async fn run_monitor(base_url: &str) -> Result<()> {
                     strategy_source = v["source"].as_str().map(|s| s.to_owned());
                 }
             }
+            // Fetch alerts mute state
+            if let Ok(r) = reqwest::Client::new()
+                .get(&alerts_url)
+                .timeout(Duration::from_secs(2))
+                .send().await
+            {
+                if let Ok(v) = r.json::<serde_json::Value>().await {
+                    alerts_muted = v["muted"].as_bool().unwrap_or(false);
+                }
+            }
             last_fetch = Instant::now();
         }
 
@@ -385,7 +397,7 @@ pub async fn run_monitor(base_url: &str) -> Result<()> {
             draw(f, &state, &fetch_err, accounts_scroll, requests_scroll,
                  base_url, &picker, &model_picker, &model_override,
                  &strategy_picker, &current_strategy, &strategy_source,
-                 show_help, refresh_ms, focus, chart_window, start_time)
+                 alerts_muted, show_help, refresh_ms, focus, chart_window, start_time)
         })?;
 
         if event::poll(Duration::from_millis(200))? {
@@ -512,6 +524,15 @@ pub async fn run_monitor(base_url: &str) -> Result<()> {
                     (KeyCode::Char('s'), _) => {
                         strategy_picker = Some(StrategyPicker::new(current_strategy.as_deref()));
                     }
+                    (KeyCode::Char('n'), _) => {
+                        let new_muted = !alerts_muted;
+                        let _ = reqwest::Client::new()
+                            .post(&alerts_url)
+                            .json(&serde_json::json!({ "muted": new_muted }))
+                            .timeout(Duration::from_secs(3))
+                            .send().await;
+                        alerts_muted = new_muted;
+                    }
                     (KeyCode::Char('?'), _) => { show_help = true; }
                     (KeyCode::Char('+'), _) | (KeyCode::Char('='), _) => {
                         refresh_ms = (refresh_ms / 2).max(200);
@@ -568,6 +589,7 @@ fn draw(
     strategy_picker: &Option<StrategyPicker>,
     current_strategy: &Option<String>,
     strategy_source: &Option<String>,
+    alerts_muted: bool,
     show_help: bool,
     refresh_ms: u64,
     focus: Focus,
@@ -585,14 +607,14 @@ fn draw(
         ])
         .split(area);
 
-    draw_header(f, chunks[0], state, model_override, current_strategy, strategy_source);
+    draw_header(f, chunks[0], state, model_override, current_strategy, strategy_source, alerts_muted);
 
     match state {
         None    => draw_connecting(f, chunks[1], error, base_url, start_time),
         Some(s) => draw_body(f, chunks[1], s, accounts_scroll, requests_scroll, focus, chart_window),
     }
 
-    draw_footer(f, chunks[2], picker.is_some() || model_picker.is_some() || strategy_picker.is_some(), refresh_ms, focus);
+    draw_footer(f, chunks[2], picker.is_some() || model_picker.is_some() || strategy_picker.is_some(), alerts_muted, refresh_ms, focus);
 
     if let Some(p) = picker { draw_picker(f, p, current_strategy.as_deref(), area); }
     if let Some(mp) = model_picker { draw_model_picker(f, mp, model_override.as_deref(), area); }
@@ -600,7 +622,7 @@ fn draw(
     if show_help { draw_help_overlay(f, area); }
 }
 
-fn draw_header(f: &mut Frame, area: Rect, state: &Option<StatusResponse>, model_override: &Option<String>, current_strategy: &Option<String>, strategy_source: &Option<String>) {
+fn draw_header(f: &mut Frame, area: Rect, state: &Option<StatusResponse>, model_override: &Option<String>, current_strategy: &Option<String>, strategy_source: &Option<String>, alerts_muted: bool) {
     let uptime_span = state
         .as_ref()
         .and_then(|s| s.started_ms)
@@ -634,6 +656,10 @@ fn draw_header(f: &mut Frame, area: Rect, state: &Option<StatusResponse>, model_
             if is_override { style_yellow() } else { style_dim() },
         ));
     }
+    if alerts_muted {
+        spans.push(Span::styled("  ·  ", style_dim()));
+        spans.push(Span::styled("alerts muted", style_red()));
+    }
 
     let block = Block::default().borders(Borders::BOTTOM).border_style(style_dkgreen());
     f.render_widget(Paragraph::new(Line::from(spans)).block(block).alignment(Alignment::Left), area);
@@ -641,7 +667,7 @@ fn draw_header(f: &mut Frame, area: Rect, state: &Option<StatusResponse>, model_
 
 fn sep() -> Span<'static> { Span::styled("  ·  ", Style::default().fg(DIM)) }
 
-fn draw_footer(f: &mut Frame, area: Rect, picker_open: bool, refresh_ms: u64, focus: Focus) {
+fn draw_footer(f: &mut Frame, area: Rect, picker_open: bool, alerts_muted: bool, refresh_ms: u64, focus: Focus) {
     let hint = if picker_open {
         Line::from(vec![
             Span::styled(" ↑↓ navigate", style_dim()), sep(),
@@ -654,6 +680,7 @@ fn draw_footer(f: &mut Frame, area: Rect, picker_open: bool, refresh_ms: u64, fo
             Focus::Accounts | Focus::Requests => Span::styled(" scroll", style_dim()),
             Focus::History  => Span::styled(" time", style_dim()),
         };
+        let mute_label = if alerts_muted { " unmute alerts" } else { " mute alerts" };
         Line::from(vec![
             Span::styled(" q", style_green()), Span::styled(" quit", style_dim()), sep(),
             Span::styled("tab", style_green()), Span::styled(" focus", style_dim()), sep(),
@@ -662,6 +689,7 @@ fn draw_footer(f: &mut Frame, area: Rect, picker_open: bool, refresh_ms: u64, fo
             Span::styled("u", style_green()), Span::styled(" pin", style_dim()), sep(),
             Span::styled("m", style_green()), Span::styled(" model", style_dim()), sep(),
             Span::styled("s", style_green()), Span::styled(" strategy", style_dim()), sep(),
+            Span::styled("n", style_green()), Span::styled(mute_label, style_dim()), sep(),
             Span::styled("+/-", style_green()), Span::styled(format!(" speed  {rate_str}"), style_dim()), sep(),
             Span::styled("?", style_green()), Span::styled(" help", style_dim()),
         ])
@@ -1230,6 +1258,7 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
         ("u",        "pin account"),
         ("m",        "override model"),
         ("s",        "switch routing strategy"),
+        ("n",        "toggle alert notifications"),
         ("t / ]",   "next time window"),
         ("[",        "prev time window"),
         ("+  / =",  "faster refresh"),
@@ -1268,12 +1297,7 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
+use crate::state::now_ms_pub as now_ms;
 
 fn shorten_model(model: &str) -> String {
     let s = model.trim_start_matches("claude-");

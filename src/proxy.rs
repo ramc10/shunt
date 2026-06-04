@@ -171,6 +171,7 @@ pub fn create_control_app(
         .route("/use", post(use_handler))
         .route("/model", get(model_get_handler).post(model_set_handler).delete(model_clear_handler))
         .route("/strategy", get(strategy_get_handler).post(strategy_set_handler).delete(strategy_clear_handler))
+        .route("/alerts", get(alerts_get_handler).post(alerts_set_handler))
         .with_state(app_state);
 
     Ok(app)
@@ -194,6 +195,7 @@ pub fn create_app_with_state(
         .route("/use", post(use_handler))
         .route("/model", get(model_get_handler).post(model_set_handler).delete(model_clear_handler))
         .route("/strategy", get(strategy_get_handler).post(strategy_set_handler).delete(strategy_clear_handler))
+        .route("/alerts", get(alerts_get_handler).post(alerts_set_handler))
         // Proxy routes
         .route("/v1/messages", post(proxy_handler))
         .route("/v1/messages/count_tokens", post(proxy_handler))
@@ -417,10 +419,24 @@ async fn strategy_clear_handler(State(s): State<AppState>) -> impl IntoResponse 
     axum::Json(json!({ "strategy": strategy_str, "source": "config" }))
 }
 
-fn now_ms() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+async fn alerts_get_handler(State(s): State<AppState>) -> impl IntoResponse {
+    let muted = s.state.get_alerts_muted();
+    axum::Json(json!({ "muted": muted }))
 }
+
+async fn alerts_set_handler(
+    State(s): State<AppState>,
+    axum::Json(body): axum::Json<serde_json::Value>,
+) -> Response {
+    let Some(muted) = body["muted"].as_bool() else {
+        return (StatusCode::BAD_REQUEST, axum::Json(json!({ "error": "missing muted bool field" }))).into_response();
+    };
+    s.state.set_alerts_muted(muted);
+    info!(muted, "alerts mute state changed");
+    axum::Json(json!({ "muted": muted })).into_response()
+}
+
+use crate::state::now_ms_pub as now_ms;
 
 /// Extract client IP for rate limiting.
 ///
@@ -476,7 +492,8 @@ async fn proxy_handler(
 
     // Apply model override: if set, patch the `model` field in the JSON body before forwarding.
     // Also strip unsupported params for models that don't support them (e.g. Haiku).
-    let body_bytes = if let Ok(mut val) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+    // Parse once and reuse the value to extract the model name (avoids double-parse).
+    let (body_bytes, model) = if let Ok(mut val) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
         let mut changed = false;
         if let Some(override_model) = s.state.get_model_override() {
             if val.get("model").is_some() {
@@ -507,19 +524,16 @@ async fn proxy_handler(
                 }
             }
         }
-        if changed {
+        let model = val["model"].as_str().unwrap_or("").to_owned();
+        let bytes = if changed {
             Bytes::from(serde_json::to_vec(&val).unwrap_or_else(|_| body_bytes.to_vec()))
         } else {
             body_bytes
-        }
+        };
+        (bytes, model)
     } else {
-        body_bytes
+        (body_bytes, String::new())
     };
-
-    let model = serde_json::from_slice::<serde_json::Value>(&body_bytes)
-        .ok()
-        .and_then(|v| v["model"].as_str().map(|s| s.to_owned()))
-        .unwrap_or_default();
 
     // Strip thinking/effort-related beta flags from the anthropic-beta header for simple models.
     let mut headers = headers;
@@ -554,8 +568,9 @@ async fn proxy_handler(
     loop {
         let effective_strategy = s.state.get_routing_strategy()
             .unwrap_or(s.config.server.routing_strategy);
+        let snap = s.state.routing_snapshot();
         let account = match router::pick_account(
-            &s.config.accounts, &s.state, fp_ref, &tried,
+            &s.config.accounts, &s.state, &snap, fp_ref, &tried,
             s.config.server.sticky_ttl_ms, s.config.server.expiry_soon_secs,
             effective_strategy,
         ) {
@@ -764,7 +779,7 @@ async fn proxy_handler(
                     s.state.update_rate_limits(&account_name, info);
                 }
                 s.state.set_cooldown(&account_name, cooldown_ms);
-                if cooldown_ms >= 5 * 60_000 {
+                if cooldown_ms >= 5 * 60_000 && !s.state.get_alerts_muted() {
                     let mins = cooldown_ms / 60_000;
                     notify(
                         "shunt: Rate Limited",
@@ -877,11 +892,13 @@ async fn proxy_handler(
                 if acct_is_anthropic {
                     error!(account = %account_name, "403 forbidden — cooling 30min");
                     s.state.set_cooldown(&account_name, 30 * 60_000);
-                    notify(
-                        "shunt: Account Forbidden",
-                        &format!("Account '{account_name}' got 403 — subscription may have lapsed (cooling 30m)."),
-                        "Basso",
-                    );
+                    if !s.state.get_alerts_muted() {
+                        notify(
+                            "shunt: Account Forbidden",
+                            &format!("Account '{account_name}' got 403 — subscription may have lapsed (cooling 30m)."),
+                            "Basso",
+                        );
+                    }
                 } else {
                     warn!(account = %account_name, "403 from chatgpt.com (Cloudflare) — cooling 5min");
                     s.state.set_cooldown(&account_name, 5 * 60_000);
@@ -1012,10 +1029,10 @@ pub async fn prefetch_rate_limits(config: Arc<Config>, state: StateStore, live_c
         .build()
         .unwrap_or_default();
 
+    let existing_rl = state.rate_limit_snapshot();
     for account in &config.accounts {
         // Skip if we already have data for this account.
-        let rl = state.rate_limit_snapshot();
-        if let Some(r) = rl.get(&account.name) {
+        if let Some(r) = existing_rl.get(&account.name) {
             if r.utilization_5h.is_some() || r.utilization_7d.is_some() {
                 continue;
             }
@@ -1419,19 +1436,23 @@ pub async fn recovery_watcher(
                 }
                 Ok(Err(e)) => {
                     tracing::error!(account = %name, error = %e, "recovery: token refresh failed");
-                    notify(
-                        "shunt: Reauth Required",
-                        &format!("Account '{name}' needs re-authorization. Run `shunt add-account`."),
-                        "Basso",
-                    );
+                    if !state.get_alerts_muted() {
+                        notify(
+                            "shunt: Reauth Required",
+                            &format!("Account '{name}' needs re-authorization. Run `shunt add-account`."),
+                            "Basso",
+                        );
+                    }
                 }
                 Err(_) => {
                     tracing::error!(account = %name, "recovery: token refresh timed out");
-                    notify(
-                        "shunt: Reauth Required",
-                        &format!("Account '{name}' token refresh timed out. Run `shunt add-account`."),
-                        "Basso",
-                    );
+                    if !state.get_alerts_muted() {
+                        notify(
+                            "shunt: Reauth Required",
+                            &format!("Account '{name}' token refresh timed out. Run `shunt add-account`."),
+                            "Basso",
+                        );
+                    }
                 }
             }
         }
@@ -1452,11 +1473,13 @@ pub async fn recovery_watcher(
                     "ALL accounts are offline (auth failed). \
                      Run `shunt add-account` to re-authorize."
                 );
-                notify(
-                    "shunt: All Accounts Offline",
-                    "All accounts need re-authorization. Run `shunt add-account`.",
-                    "Basso",
-                );
+                if !state.get_alerts_muted() {
+                    notify(
+                        "shunt: All Accounts Offline",
+                        "All accounts need re-authorization. Run `shunt add-account`.",
+                        "Basso",
+                    );
+                }
                 last_notified = Some(Instant::now());
             }
         }
@@ -1745,7 +1768,7 @@ pub async fn cooldown_watcher(
                             &config.server.upstream_url,
                         ).await;
                     }
-                    if notify_on_resume.remove(&account.name) {
+                    if notify_on_resume.remove(&account.name) && !state.get_alerts_muted() {
                         notify(
                             "shunt: Account Resumed",
                             &format!("Account '{}' is back online.", account.name),

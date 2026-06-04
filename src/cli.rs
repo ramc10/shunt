@@ -202,6 +202,18 @@ enum Command {
         #[command(subcommand)]
         action: Option<StrategyAction>,
     },
+    /// Mute or unmute daemon alert notifications
+    ///
+    /// Examples:
+    ///   shunt alerts           — show current mute state
+    ///   shunt alerts mute      — suppress rate-limit / auth-failure notifications
+    ///   shunt alerts unmute    — re-enable notifications
+    Alerts {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[command(subcommand)]
+        action: Option<AlertsAction>,
+    },
     /// Open a persistent tunnel to the relay (your proxy becomes reachable at subdomain.domain)
     ///
     /// Examples:
@@ -261,6 +273,14 @@ enum StrategyAction {
 }
 
 #[derive(Subcommand)]
+enum AlertsAction {
+    /// Suppress all daemon alert notifications
+    Mute,
+    /// Re-enable daemon alert notifications
+    Unmute,
+}
+
+#[derive(Subcommand)]
 enum RelayAction {
     /// Start the relay server
     Serve {
@@ -310,6 +330,7 @@ pub async fn run() -> Result<()> {
         Command::Report { config } => cmd_report(config).await,
         Command::Model { config, action } => cmd_model(config, action).await,
         Command::Strategy { config, action } => cmd_strategy(config, action).await,
+        Command::Alerts { config, action } => cmd_alerts(config, action).await,
         Command::Live { config, subdomain, relay } => cmd_live(config, subdomain, relay).await,
         Command::Relay { action } => match action {
             RelayAction::Serve { port } => cmd_relay_serve(port).await,
@@ -2282,6 +2303,65 @@ async fn cmd_strategy(config_override: Option<PathBuf>, action: Option<StrategyA
                     let v: serde_json::Value = r.json().await.unwrap_or_default();
                     let strategy = v["strategy"].as_str().unwrap_or("unknown");
                     println!("  {} Strategy override cleared  ·  {}  ·  {}", green(CHECK), bold(strategy), dim("from config"));
+                }
+                Ok(r) => {
+                    let body = r.text().await.unwrap_or_default();
+                    anyhow::bail!("Proxy returned error: {body}");
+                }
+                Err(_) => anyhow::bail!("Proxy is not running. Start with `shunt start`."),
+            }
+        }
+    }
+    println!();
+    Ok(())
+}
+
+async fn cmd_alerts(config_override: Option<PathBuf>, action: Option<AlertsAction>) -> Result<()> {
+    let config = crate::config::load_config(config_override.as_deref())?;
+    let alerts_url = format!("http://{}:{}/alerts", config.server.host, config.server.control_port);
+    let client = reqwest::Client::new();
+
+    match action {
+        None => {
+            let resp = client.get(&alerts_url).send().await;
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    let v: serde_json::Value = r.json().await.unwrap_or_default();
+                    if v["muted"].as_bool().unwrap_or(false) {
+                        println!("  {} Alerts muted  ·  {}", yellow("!"), dim("shunt alerts unmute to re-enable"));
+                    } else {
+                        println!("  {} Alerts active  ·  {}", green(CHECK), dim("shunt alerts mute to suppress"));
+                    }
+                }
+                _ => anyhow::bail!("Proxy is not running. Start with `shunt start`."),
+            }
+        }
+        Some(AlertsAction::Mute) => {
+            let resp = client
+                .post(&alerts_url)
+                .json(&serde_json::json!({ "muted": true }))
+                .send()
+                .await;
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    println!("  {} Alerts muted  ·  {}", yellow("!"), dim("shunt alerts unmute to re-enable"));
+                }
+                Ok(r) => {
+                    let body = r.text().await.unwrap_or_default();
+                    anyhow::bail!("Proxy returned error: {body}");
+                }
+                Err(_) => anyhow::bail!("Proxy is not running. Start with `shunt start`."),
+            }
+        }
+        Some(AlertsAction::Unmute) => {
+            let resp = client
+                .post(&alerts_url)
+                .json(&serde_json::json!({ "muted": false }))
+                .send()
+                .await;
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    println!("  {} Alerts active  ·  {}", green(CHECK), dim("notifications re-enabled"));
                 }
                 Ok(r) => {
                     let body = r.text().await.unwrap_or_default();
