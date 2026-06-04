@@ -104,7 +104,7 @@ shunt status
 ```bash
 shunt share              # LAN sharing — prints a connect code
 shunt share --tunnel     # any network via Cloudflare tunnel
-shunt connect <code>     # on another machine — configures everything
+shunt share <code>       # on another machine — configures everything
 ```
 
 ---
@@ -120,16 +120,20 @@ shunt status             # account utilization
 shunt monitor            # live fullscreen dashboard
 shunt logs               # recent logs
 shunt logs -f            # follow logs
+shunt config             # manage accounts interactively
 shunt add-account <name> # add an account or provider
 shunt remove-account <name>
 shunt logout [name]      # log out of an account
 shunt use [account]      # pin routing to a specific account
 shunt use auto           # restore automatic routing
+shunt model set <name>   # force all requests through a model
+shunt model clear        # restore client-supplied model
+shunt strategy set <name># change routing strategy at runtime
 shunt share              # share on LAN
 shunt share --tunnel     # share via Cloudflare tunnel
-shunt connect <code>     # connect to a shared proxy
-shunt remote             # watch a remote instance (host)
-shunt remote <code>      # watch a remote instance (client)
+shunt share <code>       # connect to a shared proxy
+shunt disconnect         # revert to localhost-only
+shunt live               # persistent tunnel via relay
 shunt update             # update to latest
 ```
 

@@ -4,8 +4,6 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, Response};
 use bytes::Bytes;
 use reqwest::Client;
 use std::str::FromStr;
-use std::time::Instant;
-use tracing::info;
 use uuid::Uuid;
 
 use crate::config::AccountConfig;
@@ -57,7 +55,7 @@ pub struct Forwarder {
 }
 
 impl Forwarder {
-    pub fn new(_base_url: impl Into<String>, timeout_secs: u64) -> Result<Self> {
+    pub fn new(timeout_secs: u64) -> Result<Self> {
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(timeout_secs))
             .redirect(reqwest::redirect::Policy::none())
@@ -83,7 +81,7 @@ impl Forwarder {
         account: &AccountConfig,
         token: &str,
     ) -> Result<Response<Body>> {
-        let request_id = &Uuid::new_v4().to_string()[..8];
+        let _request_id = &Uuid::new_v4().to_string()[..8];
         let url = format!("{}{}", upstream, path);
 
         let mut upstream_headers = reqwest::header::HeaderMap::new();
@@ -103,7 +101,6 @@ impl Forwarder {
         account.provider.inject_auth_headers(&mut upstream_headers, token)
             .context("failed to inject auth headers")?;
 
-        let t0 = Instant::now();
         let upstream_resp = self
             .client
             .request(

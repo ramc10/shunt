@@ -8,6 +8,26 @@ use serde_json::{json, Value};
 
 use crate::quota;
 
+/// Map Anthropic stop_reason → OpenAI finish_reason.
+fn anthropic_stop_to_openai(reason: &str) -> &str {
+    match reason {
+        "end_turn"   => "stop",
+        "tool_use"   => "tool_calls",
+        "max_tokens" => "length",
+        other        => other,
+    }
+}
+
+/// Map OpenAI finish_reason → Anthropic stop_reason.
+fn openai_finish_to_anthropic(reason: &str) -> &str {
+    match reason {
+        "stop"       => "end_turn",
+        "tool_calls" => "tool_use",
+        "length"     => "max_tokens",
+        other        => other,
+    }
+}
+
 /// Map OpenAI model names → Claude model names.
 /// Claude model names are passed through unchanged; only OpenAI aliases are remapped.
 pub fn map_model(openai_model: &str) -> String {
@@ -149,12 +169,7 @@ pub fn translate_from_anthropic(body: Value) -> Value {
     }
 
     let stop_reason = body["stop_reason"].as_str().unwrap_or("end_turn");
-    let finish_reason = match stop_reason {
-        "end_turn"   => "stop",
-        "tool_use"   => "tool_calls",
-        "max_tokens" => "length",
-        other        => other,
-    };
+    let finish_reason = anthropic_stop_to_openai(stop_reason);
 
     let input_tokens = body["usage"]["input_tokens"].as_u64().unwrap_or(0);
     let output_tokens = body["usage"]["output_tokens"].as_u64().unwrap_or(0);
@@ -301,12 +316,7 @@ pub fn translate_anthropic_stream(
                     }
                     "message_delta" => {
                         let stop_reason = event["delta"]["stop_reason"].as_str().unwrap_or("stop");
-                        let finish = match stop_reason {
-                            "end_turn"  => "stop",
-                            "tool_use"  => "tool_calls",
-                            "max_tokens" => "length",
-                            other       => other,
-                        };
+                        let finish = anthropic_stop_to_openai(stop_reason);
                         Some(json!({
                             "id": id,
                             "object": "chat.completion.chunk",
@@ -674,12 +684,7 @@ pub fn translate_openai_resp_to_anthropic(body: Value, model: &str) -> Value {
         }
     }
 
-    let stop_reason = match choice["finish_reason"].as_str().unwrap_or("stop") {
-        "stop"       => "end_turn",
-        "tool_calls" => "tool_use",
-        "length"     => "max_tokens",
-        other        => other,
-    };
+    let stop_reason = openai_finish_to_anthropic(choice["finish_reason"].as_str().unwrap_or("stop"));
 
     json!({
         "id": id,
@@ -863,12 +868,7 @@ pub fn translate_openai_stream_to_anthropic(
 
                 // Finish reason → close blocks + message_delta + message_stop.
                 if let Some(fr) = finish {
-                    let stop_reason = match fr {
-                        "stop"       => "end_turn",
-                        "tool_calls" => "tool_use",
-                        "length"     => "max_tokens",
-                        other        => other,
-                    };
+                    let stop_reason = openai_finish_to_anthropic(fr);
 
                     // Close open content/tool blocks.
                     if content_block_open {
@@ -985,12 +985,7 @@ pub fn translate_body_anthropic_to_openai(
                     }
                     "message_delta" => {
                         let stop_reason = event["delta"]["stop_reason"].as_str().unwrap_or("stop");
-                        let finish = match stop_reason {
-                            "end_turn"   => "stop",
-                            "tool_use"   => "tool_calls",
-                            "max_tokens" => "length",
-                            other        => other,
-                        };
+                        let finish = anthropic_stop_to_openai(stop_reason);
                         Some(json!({
                             "id": id, "object": "chat.completion.chunk",
                             "choices": [{"index": 0, "delta": {}, "finish_reason": finish}]

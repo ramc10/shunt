@@ -188,7 +188,7 @@ async fn setup(streaming: bool, upstream_status: u16) -> (TestServer, TestServer
         config_file: std::path::PathBuf::from("/dev/null"),
         model_mapping: Default::default(),
     };
-    let (app, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
+    let (app, _, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
     let proxy = TestServer::start(app).await;
     (proxy, upstream, caps, Client::new())
 }
@@ -430,7 +430,7 @@ async fn setup_multi() -> (TestServer, TestServer, Captures, Client) {
         config_file: std::path::PathBuf::from("/dev/null"),
         model_mapping: Default::default(),
     };
-    let (app, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
+    let (app, _, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
     let proxy = TestServer::start(app).await;
     (proxy, upstream, caps, Client::new())
 }
@@ -481,7 +481,7 @@ async fn test_stickiness_same_conversation() {
         config_file: std::path::PathBuf::from("/dev/null"),
         model_mapping: Default::default(),
     };
-    let (app, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
+    let (app, _, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
     let proxy = TestServer::start(app).await;
     let client = Client::new();
 
@@ -527,7 +527,7 @@ async fn test_all_accounts_exhausted_returns_503() {
         config_file: std::path::PathBuf::from("/dev/null"),
         model_mapping: Default::default(),
     };
-    let (app, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
+    let (app, _, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
     let proxy = TestServer::start(app).await;
     let client = Client::new();
 
@@ -630,7 +630,7 @@ async fn test_remote_key_auth() {
         config_file: std::path::PathBuf::from("/dev/null"),
         model_mapping: Default::default(),
     };
-    let (app, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
+    let (app, _, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
     let proxy = TestServer::start(app).await;
     let client = Client::new();
     let body = r#"{"model":"claude-opus-4-5","max_tokens":1,"messages":[]}"#;
@@ -808,7 +808,7 @@ async fn test_interop_anthropic_request_to_openai_account() {
         config_file: std::path::PathBuf::from("/dev/null"),
         model_mapping: Default::default(),
     };
-    let (app, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
+    let (app, _, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
     let proxy = TestServer::start(app).await;
     let client = Client::new();
 
@@ -866,7 +866,7 @@ async fn test_interop_anthropic_streaming_to_openai_account() {
         config_file: std::path::PathBuf::from("/dev/null"),
         model_mapping: Default::default(),
     };
-    let (app, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
+    let (app, _, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
     let proxy = TestServer::start(app).await;
     let client = Client::new();
 
@@ -920,7 +920,7 @@ async fn test_interop_openai_request_to_anthropic_account() {
         config_file: std::path::PathBuf::from("/dev/null"),
         model_mapping: Default::default(),
     };
-    let (app, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
+    let (app, _, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
     let proxy = TestServer::start(app).await;
     let client = Client::new();
 
@@ -986,7 +986,7 @@ async fn test_interop_failover_anthropic_to_openai() {
         config_file: std::path::PathBuf::from("/dev/null"),
         model_mapping: Default::default(),
     };
-    let (app, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
+    let (app, _, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
     let proxy = TestServer::start(app).await;
     let client = Client::new();
 
@@ -1051,7 +1051,7 @@ async fn test_live_api() {
         model_mapping: Default::default(),
     };
 
-    let (app, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
+    let (app, _, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
     let proxy = TestServer::start(app).await;
     let client = Client::new();
 
