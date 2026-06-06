@@ -1,7 +1,7 @@
 /// Live fullscreen TUI monitor for shunt.
 ///
 /// Connects to the running proxy's /status endpoint and refreshes every second.
-/// Press 'q' or Esc to exit, 'u' to pick an account to pin, '?' for help.
+/// Press 'q' or Esc to exit, 's' for settings, '?' for help.
 use anyhow::Result;
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers},
@@ -307,6 +307,38 @@ impl StrategyPicker {
 }
 
 // ---------------------------------------------------------------------------
+// Unified settings menu
+// ---------------------------------------------------------------------------
+
+const MENU_ITEMS: usize = 5;
+
+struct Menu {
+    cursor: usize,
+}
+
+impl Menu {
+    fn new() -> Self { Self { cursor: 0 } }
+    fn up(&mut self)   { self.cursor = self.cursor.checked_sub(1).unwrap_or(MENU_ITEMS - 1); }
+    fn down(&mut self) { self.cursor = (self.cursor + 1) % MENU_ITEMS; }
+}
+
+const SPEED_PRESETS: &[u64] = &[200, 500, 1_000, 2_000, 5_000, 10_000];
+
+struct SpeedPicker {
+    cursor: usize,
+}
+
+impl SpeedPicker {
+    fn new(current_ms: u64) -> Self {
+        let cursor = SPEED_PRESETS.iter().position(|&s| s == current_ms).unwrap_or(2);
+        Self { cursor }
+    }
+    fn up(&mut self)   { self.cursor = self.cursor.checked_sub(1).unwrap_or(SPEED_PRESETS.len() - 1); }
+    fn down(&mut self) { self.cursor = (self.cursor + 1) % SPEED_PRESETS.len(); }
+    fn selected(&self) -> u64 { SPEED_PRESETS[self.cursor] }
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -349,6 +381,8 @@ pub async fn run_monitor(base_url: &str) -> Result<()> {
     let mut alerts_muted = false;
     let mut show_help = false;
     let mut refresh_ms: u64 = 1_000;
+    let mut menu: Option<Menu> = None;
+    let mut speed_picker: Option<SpeedPicker> = None;
     let mut focus = Focus::Accounts;
     let mut chart_window = TimeWindow::FifteenMin;
     let start_time = Instant::now();
@@ -397,7 +431,8 @@ pub async fn run_monitor(base_url: &str) -> Result<()> {
             draw(f, &state, &fetch_err, accounts_scroll, requests_scroll,
                  base_url, &picker, &model_picker, &model_override,
                  &strategy_picker, &current_strategy, &strategy_source,
-                 alerts_muted, show_help, refresh_ms, focus, chart_window, start_time)
+                 alerts_muted, show_help, refresh_ms, focus, chart_window, start_time,
+                 &menu, &speed_picker)
         })?;
 
         if event::poll(Duration::from_millis(200))? {
@@ -407,7 +442,23 @@ pub async fn run_monitor(base_url: &str) -> Result<()> {
                     continue;
                 }
 
-                // Account picker overlay
+                // Speed picker (launched from menu)
+                if let Some(ref mut sp) = speed_picker {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char('q') => { speed_picker = None; }
+                        KeyCode::Up   | KeyCode::Char('k') => sp.up(),
+                        KeyCode::Down | KeyCode::Char('j') => sp.down(),
+                        KeyCode::Enter => {
+                            refresh_ms = sp.selected();
+                            speed_picker = None;
+                            menu = None;
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
+                // Account picker overlay (launched from menu)
                 if let Some(ref mut p) = picker {
                     match key.code {
                         KeyCode::Esc | KeyCode::Char('q') => { picker = None; }
@@ -416,6 +467,7 @@ pub async fn run_monitor(base_url: &str) -> Result<()> {
                         KeyCode::Enter => {
                             let chosen = p.selected().to_owned();
                             picker = None;
+                            menu = None;
                             let _ = reqwest::Client::new()
                                 .post(&use_url)
                                 .json(&serde_json::json!({ "account": chosen }))
@@ -429,7 +481,7 @@ pub async fn run_monitor(base_url: &str) -> Result<()> {
                     continue;
                 }
 
-                // Model picker overlay
+                // Model picker overlay (launched from menu)
                 if let Some(ref mut mp) = model_picker {
                     match key.code {
                         KeyCode::Esc | KeyCode::Char('q') => { model_picker = None; }
@@ -438,6 +490,7 @@ pub async fn run_monitor(base_url: &str) -> Result<()> {
                         KeyCode::Enter => {
                             let chosen_id = mp.selected_id().to_owned();
                             model_picker = None;
+                            menu = None;
                             let client = reqwest::Client::new();
                             if chosen_id.is_empty() {
                                 let _ = client.delete(&model_url)
@@ -458,7 +511,7 @@ pub async fn run_monitor(base_url: &str) -> Result<()> {
                     continue;
                 }
 
-                // Strategy picker overlay
+                // Strategy picker overlay (launched from menu)
                 if let Some(ref mut sp) = strategy_picker {
                     match key.code {
                         KeyCode::Esc | KeyCode::Char('q') => { strategy_picker = None; }
@@ -467,6 +520,7 @@ pub async fn run_monitor(base_url: &str) -> Result<()> {
                         KeyCode::Enter => {
                             let chosen_id = sp.selected_id().to_owned();
                             strategy_picker = None;
+                            menu = None;
                             let client = reqwest::Client::new();
                             let _ = client.post(&strategy_url)
                                 .json(&serde_json::json!({ "strategy": chosen_id }))
@@ -475,6 +529,46 @@ pub async fn run_monitor(base_url: &str) -> Result<()> {
                             current_strategy = Some(chosen_id);
                             strategy_source = Some("override".to_owned());
                             last_fetch = Instant::now() - Duration::from_secs(10);
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
+                // Settings menu
+                if let Some(ref mut m) = menu {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char('q') => { menu = None; }
+                        KeyCode::Up   | KeyCode::Char('k') => m.up(),
+                        KeyCode::Down | KeyCode::Char('j') => m.down(),
+                        KeyCode::Enter => {
+                            match m.cursor {
+                                0 => { // pin account
+                                    if let Some(ref s) = state {
+                                        picker = Some(Picker::new(&s.accounts, s.pinned_account.as_deref()));
+                                    }
+                                }
+                                1 => { // set model
+                                    model_picker = Some(ModelPicker::new(model_override.as_deref()));
+                                }
+                                2 => { // strategy
+                                    strategy_picker = Some(StrategyPicker::new(current_strategy.as_deref()));
+                                }
+                                3 => { // toggle mute
+                                    let new_muted = !alerts_muted;
+                                    let _ = reqwest::Client::new()
+                                        .post(&alerts_url)
+                                        .json(&serde_json::json!({ "muted": new_muted }))
+                                        .timeout(Duration::from_secs(3))
+                                        .send().await;
+                                    alerts_muted = new_muted;
+                                    menu = None;
+                                }
+                                4 => { // refresh speed
+                                    speed_picker = Some(SpeedPicker::new(refresh_ms));
+                                }
+                                _ => {}
+                            }
                         }
                         _ => {}
                     }
@@ -513,33 +607,10 @@ pub async fn run_monitor(base_url: &str) -> Result<()> {
                     (KeyCode::Char('r'), _) => {
                         last_fetch = Instant::now() - Duration::from_secs(10);
                     }
-                    (KeyCode::Char('u'), _) => {
-                        if let Some(ref s) = state {
-                            picker = Some(Picker::new(&s.accounts, s.pinned_account.as_deref()));
-                        }
-                    }
-                    (KeyCode::Char('m'), _) => {
-                        model_picker = Some(ModelPicker::new(model_override.as_deref()));
-                    }
                     (KeyCode::Char('s'), _) => {
-                        strategy_picker = Some(StrategyPicker::new(current_strategy.as_deref()));
-                    }
-                    (KeyCode::Char('n'), _) => {
-                        let new_muted = !alerts_muted;
-                        let _ = reqwest::Client::new()
-                            .post(&alerts_url)
-                            .json(&serde_json::json!({ "muted": new_muted }))
-                            .timeout(Duration::from_secs(3))
-                            .send().await;
-                        alerts_muted = new_muted;
+                        menu = Some(Menu::new());
                     }
                     (KeyCode::Char('?'), _) => { show_help = true; }
-                    (KeyCode::Char('+'), _) | (KeyCode::Char('='), _) => {
-                        refresh_ms = (refresh_ms / 2).max(200);
-                    }
-                    (KeyCode::Char('-'), _) => {
-                        refresh_ms = (refresh_ms * 2).min(10_000);
-                    }
                     _ => {}
                 }
             }
@@ -595,6 +666,8 @@ fn draw(
     focus: Focus,
     chart_window: TimeWindow,
     start_time: Instant,
+    menu: &Option<Menu>,
+    speed_picker: &Option<SpeedPicker>,
 ) {
     let area = f.area();
 
@@ -614,11 +687,18 @@ fn draw(
         Some(s) => draw_body(f, chunks[1], s, accounts_scroll, requests_scroll, focus, chart_window),
     }
 
-    draw_footer(f, chunks[2], picker.is_some() || model_picker.is_some() || strategy_picker.is_some(), alerts_muted, refresh_ms, focus);
+    let any_overlay = menu.is_some() || picker.is_some() || model_picker.is_some()
+        || strategy_picker.is_some() || speed_picker.is_some();
+    draw_footer(f, chunks[2], any_overlay, focus);
 
+    // Overlays — draw order: menu first (background), sub-pickers on top
+    if let Some(m) = menu {
+        draw_menu(f, m, state, model_override, current_strategy, alerts_muted, refresh_ms, area);
+    }
     if let Some(p) = picker { draw_picker(f, p, current_strategy.as_deref(), area); }
     if let Some(mp) = model_picker { draw_model_picker(f, mp, model_override.as_deref(), area); }
     if let Some(sp) = strategy_picker { draw_strategy_picker(f, sp, current_strategy.as_deref(), area); }
+    if let Some(sp) = speed_picker { draw_speed_picker(f, sp, refresh_ms, area); }
     if show_help { draw_help_overlay(f, area); }
 }
 
@@ -667,30 +747,24 @@ fn draw_header(f: &mut Frame, area: Rect, state: &Option<StatusResponse>, model_
 
 fn sep() -> Span<'static> { Span::styled("  ·  ", Style::default().fg(DIM)) }
 
-fn draw_footer(f: &mut Frame, area: Rect, picker_open: bool, alerts_muted: bool, refresh_ms: u64, focus: Focus) {
-    let hint = if picker_open {
+fn draw_footer(f: &mut Frame, area: Rect, overlay_open: bool, focus: Focus) {
+    let hint = if overlay_open {
         Line::from(vec![
-            Span::styled(" ↑↓ navigate", style_dim()), sep(),
-            Span::styled("enter", style_green()), Span::styled(" pin", style_dim()), sep(),
-            Span::styled("esc", style_green()), Span::styled(" cancel", style_dim()),
+            Span::styled(" ↑↓", style_green()), Span::styled(" navigate", style_dim()), sep(),
+            Span::styled("enter", style_green()), Span::styled(" select", style_dim()), sep(),
+            Span::styled("esc", style_green()), Span::styled(" back", style_dim()),
         ])
     } else {
-        let rate_str = if refresh_ms < 1_000 { format!("{}ms", refresh_ms) } else { format!("{}s", refresh_ms / 1_000) };
         let scroll_hint = match focus {
             Focus::Accounts | Focus::Requests => Span::styled(" scroll", style_dim()),
             Focus::History  => Span::styled(" time", style_dim()),
         };
-        let mute_label = if alerts_muted { " unmute alerts" } else { " mute alerts" };
         Line::from(vec![
             Span::styled(" q", style_green()), Span::styled(" quit", style_dim()), sep(),
             Span::styled("tab", style_green()), Span::styled(" focus", style_dim()), sep(),
             Span::styled("↑↓", style_green()), scroll_hint, sep(),
             Span::styled("r", style_green()), Span::styled(" refresh", style_dim()), sep(),
-            Span::styled("u", style_green()), Span::styled(" pin", style_dim()), sep(),
-            Span::styled("m", style_green()), Span::styled(" model", style_dim()), sep(),
-            Span::styled("s", style_green()), Span::styled(" strategy", style_dim()), sep(),
-            Span::styled("n", style_green()), Span::styled(mute_label, style_dim()), sep(),
-            Span::styled("+/-", style_green()), Span::styled(format!(" speed  {rate_str}"), style_dim()), sep(),
+            Span::styled("s", style_green()), Span::styled(" settings", style_dim()), sep(),
             Span::styled("?", style_green()), Span::styled(" help", style_dim()),
         ])
     };
@@ -1245,6 +1319,111 @@ fn draw_strategy_picker(f: &mut Frame, sp: &StrategyPicker, current: Option<&str
 }
 
 // ---------------------------------------------------------------------------
+// Settings menu overlay
+// ---------------------------------------------------------------------------
+
+fn fmt_speed(ms: u64) -> String {
+    if ms < 1_000 { format!("{}ms", ms) } else { format!("{}s", ms / 1_000) }
+}
+
+fn draw_menu(
+    f: &mut Frame, m: &Menu,
+    state: &Option<StatusResponse>,
+    model_override: &Option<String>,
+    current_strategy: &Option<String>,
+    alerts_muted: bool,
+    refresh_ms: u64,
+    area: Rect,
+) {
+    let h = (MENU_ITEMS + 4) as u16;
+    let w = 40u16;
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    let popup_area = Rect { x, y, width: w.min(area.width), height: h.min(area.height) };
+
+    f.render_widget(Clear, popup_area);
+    let block = Block::default()
+        .title(Line::from(Span::styled(" settings ", style_dim())))
+        .borders(Borders::ALL)
+        .border_style(style_dkgreen());
+    let inner = block.inner(popup_area);
+    f.render_widget(block, popup_area);
+
+    let pinned = state.as_ref()
+        .and_then(|s| s.pinned_account.as_deref())
+        .unwrap_or("auto");
+    let model = model_override.as_deref()
+        .map(|m| shorten_model(m))
+        .unwrap_or_else(|| "auto".into());
+    let strategy = current_strategy.as_deref().unwrap_or("maximus");
+    let mute_str = if alerts_muted { "muted" } else { "on" };
+    let speed_str = fmt_speed(refresh_ms);
+
+    let items: &[(&str, String)] = &[
+        ("pin account",   pinned.to_owned()),
+        ("set model",     model),
+        ("strategy",      strategy.to_owned()),
+        ("alerts",        mute_str.to_owned()),
+        ("refresh speed", speed_str),
+    ];
+
+    let rows: Vec<Row> = items.iter().enumerate().map(|(i, (label, value))| {
+        let is_sel = i == m.cursor;
+        let bullet = if is_sel { "◆" } else { " " };
+        let style = if is_sel {
+            Style::default().fg(GREEN).add_modifier(Modifier::BOLD)
+        } else {
+            style_dim()
+        };
+        let val_style = if is_sel { style_yellow() } else { style_dim() };
+        Row::new(vec![
+            Cell::from(Span::styled(format!("  {bullet} {label}"), style)),
+            Cell::from(Span::styled(value.as_str(), val_style)),
+        ])
+    }).collect();
+
+    f.render_widget(
+        Table::new(rows, [Constraint::Min(20), Constraint::Length(14)])
+            .column_spacing(2),
+        inner,
+    );
+}
+
+fn draw_speed_picker(f: &mut Frame, sp: &SpeedPicker, current_ms: u64, area: Rect) {
+    let h = (SPEED_PRESETS.len() + 4) as u16;
+    let w = 30u16;
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    let popup_area = Rect { x, y, width: w.min(area.width), height: h.min(area.height) };
+
+    f.render_widget(Clear, popup_area);
+    let block = Block::default()
+        .title(Line::from(Span::styled(" refresh speed ", style_dim())))
+        .borders(Borders::ALL)
+        .border_style(style_dkgreen());
+    let inner = block.inner(popup_area);
+    f.render_widget(block, popup_area);
+
+    let rows: Vec<Row> = SPEED_PRESETS.iter().enumerate().map(|(i, &ms)| {
+        let is_sel = i == sp.cursor;
+        let is_current = ms == current_ms;
+        let bullet = if is_sel { "◆" } else { " " };
+        let check  = if is_current { " ✓" } else { "" };
+        let label = fmt_speed(ms);
+        let style = if is_sel {
+            Style::default().fg(GREEN).add_modifier(Modifier::BOLD)
+        } else {
+            style_dim()
+        };
+        Row::new(vec![
+            Cell::from(Span::styled(format!("  {bullet} {label}{check}"), style)),
+        ])
+    }).collect();
+
+    f.render_widget(Table::new(rows, [Constraint::Min(0)]).column_spacing(0), inner);
+}
+
+// ---------------------------------------------------------------------------
 // Help overlay
 // ---------------------------------------------------------------------------
 
@@ -1255,14 +1434,9 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
         ("↑ / k",   "scroll up / prev time"),
         ("↓ / j",   "scroll down / next time"),
         ("r",        "force refresh"),
-        ("u",        "pin account"),
-        ("m",        "override model"),
-        ("s",        "switch routing strategy"),
-        ("n",        "toggle alert notifications"),
+        ("s",        "open settings"),
         ("t / ]",   "next time window"),
         ("[",        "prev time window"),
-        ("+  / =",  "faster refresh"),
-        ("-",        "slower refresh"),
         ("?",        "close help"),
     ];
 
