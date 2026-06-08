@@ -184,8 +184,8 @@ struct StateData {
     /// The most recent account that successfully handled a proxied request.
     #[serde(default)]
     last_used_account: Option<String>,
-    /// Recent request log (ephemeral — not persisted to disk).
-    #[serde(skip)]
+    /// Recent request log — capped at MAX_RECENT entries, persisted to survive restarts.
+    #[serde(default)]
     recent_requests: VecDeque<RequestLog>,
     /// Runtime model override — all requests use this model if set (ephemeral).
     #[serde(skip)]
@@ -268,6 +268,10 @@ impl StateStore {
         // Prune expired sticky entries so the file doesn't grow unbounded.
         let now = now_ms();
         data.sticky.retain(|_, v| v.expires_at_ms > now);
+        // Trim request log to cap in case the file was written with a higher limit.
+        while data.recent_requests.len() > MAX_RECENT {
+            data.recent_requests.pop_front();
+        }
 
         let store = Self {
             path: path.to_owned(),
@@ -297,6 +301,16 @@ impl StateStore {
                 }
             }
         });
+    }
+
+    /// Force a synchronous write to disk. Called at graceful shutdown to ensure
+    /// the final state (including the last few requests and token counts) is
+    /// persisted before the process exits.
+    pub fn flush_sync(&self) {
+        let data = self.inner.lock().clone();
+        if let Err(e) = write_to_disk(&data, &self.path) {
+            warn!("Final state flush failed: {e}");
+        }
     }
 
     // -----------------------------------------------------------------------

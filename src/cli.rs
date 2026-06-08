@@ -3204,6 +3204,31 @@ async fn serve_all_providers(
         by_provider.entry(account.provider.to_string()).or_default().push(account);
     }
 
+    // Shared shutdown signal — fired on SIGTERM so every axum server drains
+    // in-flight connections, state is flushed, then the process exits cleanly.
+    let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+
+    // SIGTERM handler: flush state then wake all servers.
+    {
+        let state_s = state.clone();
+        let notify  = shutdown.clone();
+        tokio::spawn(async move {
+            #[cfg(unix)]
+            {
+                if let Ok(mut sig) = tokio::signal::unix::signal(
+                    tokio::signal::unix::SignalKind::terminate(),
+                ) {
+                    sig.recv().await;
+                    tracing::info!("SIGTERM received — flushing state before shutdown");
+                    state_s.flush_sync();
+                    notify.notify_waiters();
+                }
+            }
+            #[cfg(not(unix))]
+            std::future::pending::<()>().await
+        });
+    }
+
     let mut handles = Vec::new();
 
     for (provider_str, accounts) in by_provider {
@@ -3250,8 +3275,11 @@ async fn serve_all_providers(
         tokio::spawn(crate::proxy::cooldown_watcher(cfg_arc.clone(), state.clone(), live_creds.clone()));
         tokio::spawn(crate::proxy::recovery_watcher(cfg_arc.clone(), state.clone(), live_creds.clone()));
         tokio::spawn(crate::proxy::health_check_loop(cfg_arc, state.clone(), live_creds));
+        let sd = shutdown.clone();
         handles.push(tokio::spawn(async move {
-            axum::serve(listener, app).await
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move { sd.notified().await })
+                .await
         }));
     }
 
@@ -3271,8 +3299,11 @@ async fn serve_all_providers(
     let control_listener = tokio::net::TcpListener::bind(format!("{host}:{control_port}"))
         .await
         .with_context(|| format!("cannot bind {host}:{control_port} for control plane"))?;
+    let sd = shutdown.clone();
     handles.push(tokio::spawn(async move {
-        axum::serve(control_listener, control_app).await
+        axum::serve(control_listener, control_app)
+            .with_graceful_shutdown(async move { sd.notified().await })
+            .await
     }));
 
     // Spawn settings guardian — re-injects ANTHROPIC_BASE_URL into ~/.claude/settings.json
