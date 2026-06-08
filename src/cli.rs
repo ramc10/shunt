@@ -273,6 +273,17 @@ enum Command {
         #[command(subcommand)]
         action: Option<AlertsAction>,
     },
+    /// Show how much you've saved vs paying for the Claude API
+    ///
+    /// Tracks cumulative token usage and computes what it would have cost
+    /// at public Claude API list prices.
+    ///
+    /// Examples:
+    ///   shunt savings        — show today / this week / all-time savings
+    Savings {
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
     /// Open a persistent tunnel to the relay (your proxy becomes reachable at subdomain.domain)
     ///
     /// Examples:
@@ -440,6 +451,7 @@ pub async fn run() -> Result<()> {
         Command::Effort { config, action } => cmd_effort(config, action).await,
         Command::Thinking { config, action } => cmd_thinking(config, action).await,
         Command::Alerts { config, action } => cmd_alerts(config, action).await,
+        Command::Savings { config } => cmd_savings(config).await,
         Command::Live { config, subdomain, relay } => cmd_live(config, subdomain, relay).await,
         Command::Relay { action } => match action {
             RelayAction::Serve { port } => cmd_relay_serve(port).await,
@@ -2693,6 +2705,51 @@ async fn cmd_alerts(config_override: Option<PathBuf>, action: Option<AlertsActio
             }
         }
     }
+    println!();
+    Ok(())
+}
+
+async fn cmd_savings(config_override: Option<PathBuf>) -> Result<()> {
+    let config = crate::config::load_config(config_override.as_deref())?;
+    let url = format!("http://{}:{}/status", config.server.host, config.server.control_port);
+
+    let v: serde_json::Value = match reqwest::Client::new()
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(2))
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => r.json().await.unwrap_or_default(),
+        _ => anyhow::bail!("Proxy is not running. Start with `shunt start`."),
+    };
+
+    let s = &v["savings"];
+    let today_usd   = s["today_cost_usd"].as_f64().unwrap_or(0.0);
+    let week_usd    = s["week_cost_usd"].as_f64().unwrap_or(0.0);
+    let alltime_usd = s["all_time_cost_usd"].as_f64().unwrap_or(0.0);
+    let today_in    = s["today_input"].as_u64().unwrap_or(0);
+    let today_out   = s["today_output"].as_u64().unwrap_or(0);
+    let week_in     = s["week_input"].as_u64().unwrap_or(0);
+    let week_out    = s["week_output"].as_u64().unwrap_or(0);
+    let all_in      = s["all_time_input"].as_u64().unwrap_or(0);
+    let all_out     = s["all_time_output"].as_u64().unwrap_or(0);
+
+    fn fmt_tok(n: u64) -> String {
+        if n >= 1_000_000 { format!("{:.1}M", n as f64 / 1_000_000.0) }
+        else if n >= 1_000 { format!("{:.1}K", n as f64 / 1_000.0) }
+        else { n.to_string() }
+    }
+
+    println!();
+    if alltime_usd > 0.001 {
+        println!("  {} shunt has saved you {}  ·  {}", green(CHECK), bold(&crate::pricing::fmt_cost(alltime_usd)), dim("vs public Claude API at list prices"));
+    } else {
+        println!("  {} {}  ·  {}", dim(DOT), bold("no savings tracked yet"), dim("make some requests and come back"));
+    }
+    println!();
+    println!("  {:<18} {}  {}", dim("today"), crate::pricing::fmt_cost(today_usd), dim(&format!("{}in · {}out", fmt_tok(today_in), fmt_tok(today_out))));
+    println!("  {:<18} {}  {}", dim("this week"), crate::pricing::fmt_cost(week_usd), dim(&format!("{}in · {}out", fmt_tok(week_in), fmt_tok(week_out))));
+    println!("  {:<18} {}  {}", dim("all time"), bold(&crate::pricing::fmt_cost(alltime_usd)), dim(&format!("{}in · {}out", fmt_tok(all_in), fmt_tok(all_out))));
     println!();
     Ok(())
 }
@@ -5286,6 +5343,12 @@ async fn cmd_report(config_override: Option<PathBuf>) -> Result<()> {
                         }
                         if let Some(reqs) = v["recent_requests"].as_array() {
                             println!("  {:<22} {} (recent)", dim("requests"), reqs.len());
+                        }
+                        let alltime_usd = v["savings"]["all_time_cost_usd"].as_f64().unwrap_or(0.0);
+                        let today_usd   = v["savings"]["today_cost_usd"].as_f64().unwrap_or(0.0);
+                        if alltime_usd > 0.001 {
+                            println!("  {:<22} {}", dim("saved today"), crate::pricing::fmt_cost(today_usd));
+                            println!("  {:<22} {}", dim("saved all time"), crate::pricing::fmt_cost(alltime_usd));
                         }
                     }
                 }

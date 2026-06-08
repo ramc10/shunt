@@ -22,6 +22,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::pricing::fmt_cost;
 use crate::term::fmt_duration_ms;
 
 // ---------------------------------------------------------------------------
@@ -1053,6 +1054,12 @@ fn draw_header(f: &mut Frame, area: Rect, state: &Option<StatusResponse>, model_
             strat.clone(),
             if is_override { style_yellow() } else { style_dim() },
         ));
+    }
+    if let Some(sv) = state.as_ref().and_then(|s| s.savings.as_ref()).filter(|sv| sv.today_cost_usd > 0.001) {
+        spans.push(Span::styled("  ·  ", style_dim()));
+        spans.push(Span::styled("saved ", style_dim()));
+        spans.push(Span::styled(fmt_cost(sv.today_cost_usd), style_green()));
+        spans.push(Span::styled(" today", style_dim()));
     }
     if alerts_muted {
         spans.push(Span::styled("  ·  ", style_dim()));
