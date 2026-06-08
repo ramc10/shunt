@@ -196,6 +196,13 @@ struct StateData {
     /// Per-account burst window: timestamps of recent requests (ephemeral).
     #[serde(skip)]
     burst_windows: HashMap<String, VecDeque<u64>>,
+    /// Runtime burst RPM limit override (ephemeral).
+    #[serde(skip)]
+    burst_rpm_limit_override: Option<u32>,
+    /// Runtime fallback model override (ephemeral).
+    /// `Some(Some("model"))` = explicit override, `Some(None)` = explicitly disabled, `None` = use config/auto.
+    #[serde(skip)]
+    fallback_model_override: Option<Option<String>>,
     /// Daily token + cost buckets keyed by "YYYY-MM-DD" (all accounts combined).
     #[serde(default)]
     global_daily: HashMap<String, DailyBucket>,
@@ -768,6 +775,40 @@ impl StateStore {
 
     pub fn clear_routing_strategy(&self) {
         self.inner.lock().routing_strategy_override = None;
+    }
+
+    // -----------------------------------------------------------------------
+    // Burst RPM limit override
+    // -----------------------------------------------------------------------
+
+    pub fn get_burst_rpm_limit_override(&self) -> Option<u32> {
+        self.inner.lock().burst_rpm_limit_override
+    }
+
+    pub fn set_burst_rpm_limit_override(&self, limit: u32) {
+        self.inner.lock().burst_rpm_limit_override = Some(limit);
+    }
+
+    pub fn clear_burst_rpm_limit_override(&self) {
+        self.inner.lock().burst_rpm_limit_override = None;
+    }
+
+    // -----------------------------------------------------------------------
+    // Fallback model override
+    // -----------------------------------------------------------------------
+
+    /// Returns `Some(Some("model"))` for explicit override, `Some(None)` for explicitly disabled,
+    /// `None` for "use config/auto".
+    pub fn get_fallback_model_override(&self) -> Option<Option<String>> {
+        self.inner.lock().fallback_model_override.clone()
+    }
+
+    pub fn set_fallback_model_override(&self, model: Option<String>) {
+        self.inner.lock().fallback_model_override = Some(model);
+    }
+
+    pub fn clear_fallback_model_override(&self) {
+        self.inner.lock().fallback_model_override = None;
     }
 
     // -----------------------------------------------------------------------

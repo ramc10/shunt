@@ -202,6 +202,32 @@ enum Command {
         #[command(subcommand)]
         action: Option<StrategyAction>,
     },
+    /// Set the per-account burst rate limit, or clear the override
+    ///
+    /// Examples:
+    ///   shunt burst-limit              — show current limit
+    ///   shunt burst-limit set 12       — max 12 requests/min per account
+    ///   shunt burst-limit set 0        — disable burst pacing
+    ///   shunt burst-limit clear        — restore default (10/min)
+    BurstLimit {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[command(subcommand)]
+        action: Option<BurstLimitAction>,
+    },
+    /// Set the fallback model for when all accounts are on cooldown
+    ///
+    /// Examples:
+    ///   shunt fallback                 — show current fallback (auto by default)
+    ///   shunt fallback set sonnet      — always fall back to sonnet
+    ///   shunt fallback off             — disable fallback entirely
+    ///   shunt fallback clear           — restore auto-detection
+    Fallback {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[command(subcommand)]
+        action: Option<FallbackAction>,
+    },
     /// Mute or unmute daemon alert notifications
     ///
     /// Examples:
@@ -273,6 +299,30 @@ enum StrategyAction {
 }
 
 #[derive(Subcommand)]
+enum BurstLimitAction {
+    /// Set per-account burst rate limit (requests per minute)
+    Set {
+        /// Limit value (0 = disable pacing)
+        limit: u32,
+    },
+    /// Clear the override and restore default (10/min)
+    Clear,
+}
+
+#[derive(Subcommand)]
+enum FallbackAction {
+    /// Set an explicit fallback model
+    Set {
+        /// Model name, e.g. claude-sonnet-4-6
+        model: String,
+    },
+    /// Disable fallback entirely (wait for cooldown instead)
+    Off,
+    /// Clear the override and restore auto-detection
+    Clear,
+}
+
+#[derive(Subcommand)]
 enum AlertsAction {
     /// Suppress all daemon alert notifications
     Mute,
@@ -330,6 +380,8 @@ pub async fn run() -> Result<()> {
         Command::Report { config } => cmd_report(config).await,
         Command::Model { config, action } => cmd_model(config, action).await,
         Command::Strategy { config, action } => cmd_strategy(config, action).await,
+        Command::BurstLimit { config, action } => cmd_burst_limit(config, action).await,
+        Command::Fallback { config, action } => cmd_fallback(config, action).await,
         Command::Alerts { config, action } => cmd_alerts(config, action).await,
         Command::Live { config, subdomain, relay } => cmd_live(config, subdomain, relay).await,
         Command::Relay { action } => match action {
@@ -2308,6 +2360,123 @@ async fn cmd_strategy(config_override: Option<PathBuf>, action: Option<StrategyA
                     let body = r.text().await.unwrap_or_default();
                     anyhow::bail!("Proxy returned error: {body}");
                 }
+                Err(_) => anyhow::bail!("Proxy is not running. Start with `shunt start`."),
+            }
+        }
+    }
+    println!();
+    Ok(())
+}
+
+async fn cmd_burst_limit(config_override: Option<PathBuf>, action: Option<BurstLimitAction>) -> Result<()> {
+    let config = crate::config::load_config(config_override.as_deref())?;
+    let url = format!("http://{}:{}/burst-limit", config.server.host, config.server.control_port);
+    let client = reqwest::Client::new();
+
+    match action {
+        None => {
+            let resp = client.get(&url).send().await;
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    let v: serde_json::Value = r.json().await.unwrap_or_default();
+                    let limit = v["burst_rpm_limit"].as_u64().unwrap_or(0);
+                    let source = v["source"].as_str().unwrap_or("unknown");
+                    let display = if limit == 0 { "off".to_owned() } else { format!("{limit}/min") };
+                    if source == "override" {
+                        println!("  {} Burst limit: {}  ·  {}  ·  {}", green(CHECK), bold(&display), dim("runtime override"), dim("shunt burst-limit clear to restore"));
+                    } else {
+                        println!("  {} Burst limit: {}  ·  {}", dim(DOT), bold(&display), dim(&format!("from {source}")));
+                    }
+                }
+                _ => anyhow::bail!("Proxy is not running. Start with `shunt start`."),
+            }
+        }
+        Some(BurstLimitAction::Set { limit }) => {
+            let resp = client.post(&url).json(&serde_json::json!({ "burst_rpm_limit": limit })).send().await;
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    let display = if limit == 0 { "off".to_owned() } else { format!("{limit}/min") };
+                    println!("  {} Burst limit set: {}  ·  {}", green(CHECK), bold(&display), dim("shunt burst-limit clear to restore"));
+                }
+                Ok(r) => { let body = r.text().await.unwrap_or_default(); anyhow::bail!("Proxy returned error: {body}"); }
+                Err(_) => anyhow::bail!("Proxy is not running. Start with `shunt start`."),
+            }
+        }
+        Some(BurstLimitAction::Clear) => {
+            let resp = client.delete(&url).send().await;
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    let v: serde_json::Value = r.json().await.unwrap_or_default();
+                    let limit = v["burst_rpm_limit"].as_u64().unwrap_or(0);
+                    let display = if limit == 0 { "off".to_owned() } else { format!("{limit}/min") };
+                    println!("  {} Burst limit override cleared  ·  {}  ·  {}", green(CHECK), bold(&display), dim("from default"));
+                }
+                Ok(r) => { let body = r.text().await.unwrap_or_default(); anyhow::bail!("Proxy returned error: {body}"); }
+                Err(_) => anyhow::bail!("Proxy is not running. Start with `shunt start`."),
+            }
+        }
+    }
+    println!();
+    Ok(())
+}
+
+async fn cmd_fallback(config_override: Option<PathBuf>, action: Option<FallbackAction>) -> Result<()> {
+    let config = crate::config::load_config(config_override.as_deref())?;
+    let url = format!("http://{}:{}/fallback", config.server.host, config.server.control_port);
+    let client = reqwest::Client::new();
+
+    match action {
+        None => {
+            let resp = client.get(&url).send().await;
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    let v: serde_json::Value = r.json().await.unwrap_or_default();
+                    let source = v["source"].as_str().unwrap_or("unknown");
+                    let disabled = v.get("disabled").and_then(|d| d.as_bool()).unwrap_or(false);
+                    if disabled {
+                        println!("  {} Fallback: {}  ·  {}", dim(DOT), bold("disabled"), dim("shunt fallback clear to restore"));
+                    } else {
+                        let model = v["fallback_model"].as_str().unwrap_or("none");
+                        if source == "override" {
+                            println!("  {} Fallback: {}  ·  {}  ·  {}", green(CHECK), bold(model), dim("runtime override"), dim("shunt fallback clear to restore"));
+                        } else {
+                            println!("  {} Fallback: {}  ·  {}", dim(DOT), bold(model), dim(&format!("from {source}")));
+                        }
+                    }
+                }
+                _ => anyhow::bail!("Proxy is not running. Start with `shunt start`."),
+            }
+        }
+        Some(FallbackAction::Set { model }) => {
+            let resp = client.post(&url).json(&serde_json::json!({ "fallback_model": model })).send().await;
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    println!("  {} Fallback model set: {}  ·  {}", green(CHECK), bold(&model), dim("shunt fallback clear to restore"));
+                }
+                Ok(r) => { let body = r.text().await.unwrap_or_default(); anyhow::bail!("Proxy returned error: {body}"); }
+                Err(_) => anyhow::bail!("Proxy is not running. Start with `shunt start`."),
+            }
+        }
+        Some(FallbackAction::Off) => {
+            let resp = client.post(&url).json(&serde_json::json!({ "fallback_model": null })).send().await;
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    println!("  {} Fallback disabled  ·  {}", green(CHECK), dim("shunt fallback clear to restore"));
+                }
+                Ok(r) => { let body = r.text().await.unwrap_or_default(); anyhow::bail!("Proxy returned error: {body}"); }
+                Err(_) => anyhow::bail!("Proxy is not running. Start with `shunt start`."),
+            }
+        }
+        Some(FallbackAction::Clear) => {
+            let resp = client.delete(&url).send().await;
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    let v: serde_json::Value = r.json().await.unwrap_or_default();
+                    let source = v["source"].as_str().unwrap_or("auto");
+                    let model = v["fallback_model"].as_str().unwrap_or("auto");
+                    println!("  {} Fallback override cleared  ·  {}  ·  {}", green(CHECK), bold(model), dim(&format!("from {source}")));
+                }
+                Ok(r) => { let body = r.text().await.unwrap_or_default(); anyhow::bail!("Proxy returned error: {body}"); }
                 Err(_) => anyhow::bail!("Proxy is not running. Start with `shunt start`."),
             }
         }

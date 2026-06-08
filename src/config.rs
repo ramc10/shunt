@@ -376,7 +376,7 @@ impl Default for ServerConfig {
             telemetry_url: None,
             telemetry_token: None,
             instance_name: default_instance_name(),
-            burst_rpm_limit: 0,
+            burst_rpm_limit: 10,
             fallback_model: None,
         }
     }
@@ -494,7 +494,7 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
         telemetry_url,
         telemetry_token,
         instance_name,
-        burst_rpm_limit: raw.server.burst_rpm_limit.unwrap_or(0),
+        burst_rpm_limit: raw.server.burst_rpm_limit.unwrap_or(10),
         fallback_model: raw.server.fallback_model,
     };
 

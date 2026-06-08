@@ -171,6 +171,8 @@ pub fn create_control_app(
         .route("/use", post(use_handler))
         .route("/model", get(model_get_handler).post(model_set_handler).delete(model_clear_handler))
         .route("/strategy", get(strategy_get_handler).post(strategy_set_handler).delete(strategy_clear_handler))
+        .route("/burst-limit", get(burst_limit_get_handler).post(burst_limit_set_handler).delete(burst_limit_clear_handler))
+        .route("/fallback", get(fallback_get_handler).post(fallback_set_handler).delete(fallback_clear_handler))
         .route("/alerts", get(alerts_get_handler).post(alerts_set_handler))
         .with_state(app_state);
 
@@ -195,6 +197,8 @@ pub fn create_app_with_state(
         .route("/use", post(use_handler))
         .route("/model", get(model_get_handler).post(model_set_handler).delete(model_clear_handler))
         .route("/strategy", get(strategy_get_handler).post(strategy_set_handler).delete(strategy_clear_handler))
+        .route("/burst-limit", get(burst_limit_get_handler).post(burst_limit_set_handler).delete(burst_limit_clear_handler))
+        .route("/fallback", get(fallback_get_handler).post(fallback_set_handler).delete(fallback_clear_handler))
         .route("/alerts", get(alerts_get_handler).post(alerts_set_handler))
         // Proxy routes
         .route("/v1/messages", post(proxy_handler))
@@ -419,6 +423,76 @@ async fn strategy_clear_handler(State(s): State<AppState>) -> impl IntoResponse 
     axum::Json(json!({ "strategy": strategy_str, "source": "config" }))
 }
 
+// ── Burst RPM limit ────────────────────────────────────────────────────────
+
+async fn burst_limit_get_handler(State(s): State<AppState>) -> impl IntoResponse {
+    let (limit, source) = match s.state.get_burst_rpm_limit_override() {
+        Some(l) => (l, "override"),
+        None => (s.config.server.burst_rpm_limit, if s.config.server.burst_rpm_limit == 10 { "default" } else { "config" }),
+    };
+    axum::Json(json!({ "burst_rpm_limit": limit, "source": source }))
+}
+
+async fn burst_limit_set_handler(
+    State(s): State<AppState>,
+    axum::Json(body): axum::Json<serde_json::Value>,
+) -> Response {
+    let Some(limit) = body["burst_rpm_limit"].as_u64() else {
+        return (StatusCode::BAD_REQUEST, axum::Json(json!({ "error": "missing burst_rpm_limit field (integer)" }))).into_response();
+    };
+    let limit = limit as u32;
+    s.state.set_burst_rpm_limit_override(limit);
+    info!(limit, "burst RPM limit override set");
+    axum::Json(json!({ "burst_rpm_limit": limit, "source": "override" })).into_response()
+}
+
+async fn burst_limit_clear_handler(State(s): State<AppState>) -> impl IntoResponse {
+    s.state.clear_burst_rpm_limit_override();
+    info!("burst RPM limit override cleared");
+    let limit = s.config.server.burst_rpm_limit;
+    axum::Json(json!({ "burst_rpm_limit": limit, "source": if limit == 10 { "default" } else { "config" } }))
+}
+
+// ── Fallback model ─────────────────────────────────────────────────────────
+
+async fn fallback_get_handler(State(s): State<AppState>) -> impl IntoResponse {
+    match s.state.get_fallback_model_override() {
+        Some(Some(model)) => axum::Json(json!({ "fallback_model": model, "source": "override" })),
+        Some(None) => axum::Json(json!({ "fallback_model": null, "source": "override", "disabled": true })),
+        None => match &s.config.server.fallback_model {
+            Some(model) => axum::Json(json!({ "fallback_model": model, "source": "config" })),
+            None => axum::Json(json!({ "fallback_model": "auto", "source": "auto" })),
+        },
+    }
+}
+
+async fn fallback_set_handler(
+    State(s): State<AppState>,
+    axum::Json(body): axum::Json<serde_json::Value>,
+) -> Response {
+    if body["fallback_model"].is_null() || body.get("disabled").and_then(|v| v.as_bool()) == Some(true) {
+        s.state.set_fallback_model_override(None);
+        info!("fallback model explicitly disabled");
+        return axum::Json(json!({ "fallback_model": null, "source": "override", "disabled": true })).into_response();
+    }
+    let Some(model) = body["fallback_model"].as_str() else {
+        return (StatusCode::BAD_REQUEST, axum::Json(json!({ "error": "missing fallback_model field" }))).into_response();
+    };
+    let model = model.to_owned();
+    s.state.set_fallback_model_override(Some(model.clone()));
+    info!(model = %model, "fallback model override set");
+    axum::Json(json!({ "fallback_model": model, "source": "override" })).into_response()
+}
+
+async fn fallback_clear_handler(State(s): State<AppState>) -> impl IntoResponse {
+    s.state.clear_fallback_model_override();
+    info!("fallback model override cleared");
+    match &s.config.server.fallback_model {
+        Some(model) => axum::Json(json!({ "fallback_model": model, "source": "config" })),
+        None => axum::Json(json!({ "fallback_model": "auto", "source": "auto" })),
+    }
+}
+
 async fn alerts_get_handler(State(s): State<AppState>) -> impl IntoResponse {
     let muted = s.state.get_alerts_muted();
     axum::Json(json!({ "muted": muted }))
@@ -571,21 +645,30 @@ async fn proxy_handler(
         let effective_strategy = s.state.get_routing_strategy()
             .unwrap_or(s.config.server.routing_strategy);
         let snap = s.state.routing_snapshot();
+        let effective_burst_rpm = s.state.get_burst_rpm_limit_override()
+            .unwrap_or(s.config.server.burst_rpm_limit);
         let account = match router::pick_account(
             &s.config.accounts, &s.state, &snap, fp_ref, &tried,
             s.config.server.sticky_ttl_ms, s.config.server.expiry_soon_secs,
-            effective_strategy, s.config.server.burst_rpm_limit,
+            effective_strategy, effective_burst_rpm,
         ) {
             Some(a) => a,
             None => {
                 // Model fallback: before waiting, try switching to a cheaper model.
                 // Rate limits are often per-model, so the fallback may succeed immediately.
-                if !fell_back {
-                    if let Some(ref fallback) = s.config.server.fallback_model {
-                        if !model.is_empty() && model != *fallback {
+                // Override chain: runtime override → config → auto-detect from model name.
+                if !fell_back && !model.is_empty() {
+                    let fallback: Option<String> = match s.state.get_fallback_model_override() {
+                        Some(Some(m)) => Some(m),              // explicit override
+                        Some(None) => None,                     // explicitly disabled
+                        None => s.config.server.fallback_model.clone()
+                            .or_else(|| auto_fallback_model(&model).map(|s| s.to_owned())),
+                    };
+                    if let Some(ref fb) = fallback {
+                        if model != *fb {
                             if let Ok(mut val) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
-                                warn!(from = %model, to = %fallback, "all accounts cooling — falling back to cheaper model");
-                                val["model"] = serde_json::Value::String(fallback.clone());
+                                warn!(from = %model, to = %fb, "all accounts cooling — falling back to cheaper model");
+                                val["model"] = serde_json::Value::String(fb.clone());
                                 body_bytes = Bytes::from(serde_json::to_vec(&val).unwrap_or_else(|_| body_bytes.to_vec()));
                                 fell_back = true;
                                 tried.clear();
@@ -2001,6 +2084,18 @@ async fn fetch_sentinel_token(client: &reqwest::Client, upstream: &str, token: &
 /// These params must be stripped before forwarding.
 fn is_simple_model(model: &str) -> bool {
     model.contains("haiku")
+}
+
+/// Auto-detect a fallback model based on the current model name.
+/// opus → sonnet, sonnet → haiku, anything else → None.
+fn auto_fallback_model(model: &str) -> Option<&'static str> {
+    if model.contains("opus") {
+        Some("claude-sonnet-4-6")
+    } else if model.contains("sonnet") {
+        Some("claude-haiku-4-5-20251001")
+    } else {
+        None
+    }
 }
 
 /// Resolve the target model name for a non-Anthropic account.

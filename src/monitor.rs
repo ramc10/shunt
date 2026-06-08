@@ -310,7 +310,7 @@ impl StrategyPicker {
 // Unified settings menu
 // ---------------------------------------------------------------------------
 
-const MENU_ITEMS: usize = 5;
+const MENU_ITEMS: usize = 7;
 
 struct Menu {
     cursor: usize,
@@ -338,6 +338,47 @@ impl SpeedPicker {
     fn selected(&self) -> u64 { SPEED_PRESETS[self.cursor] }
 }
 
+const BURST_LIMIT_PRESETS: &[u32] = &[0, 5, 8, 10, 12, 15, 20];
+
+struct BurstLimitPicker {
+    cursor: usize,
+}
+
+impl BurstLimitPicker {
+    fn new(current: u32) -> Self {
+        let cursor = BURST_LIMIT_PRESETS.iter().position(|&v| v == current).unwrap_or(3); // default to 10
+        Self { cursor }
+    }
+    fn up(&mut self)   { self.cursor = self.cursor.checked_sub(1).unwrap_or(BURST_LIMIT_PRESETS.len() - 1); }
+    fn down(&mut self) { self.cursor = (self.cursor + 1) % BURST_LIMIT_PRESETS.len(); }
+    fn selected(&self) -> u32 { BURST_LIMIT_PRESETS[self.cursor] }
+}
+
+const FALLBACK_PRESETS: &[(&str, &str)] = &[
+    ("auto", "Auto-detect from model"),
+    ("off", "Disabled"),
+    ("claude-sonnet-4-6", "Sonnet 4.6"),
+    ("claude-haiku-4-5-20251001", "Haiku 4.5"),
+];
+
+struct FallbackPicker {
+    cursor: usize,
+}
+
+impl FallbackPicker {
+    fn new(current: Option<&str>) -> Self {
+        let cursor = match current {
+            None => 0, // auto
+            Some("off") => 1,
+            Some(m) => FALLBACK_PRESETS.iter().position(|(id, _)| *id == m).unwrap_or(0),
+        };
+        Self { cursor }
+    }
+    fn up(&mut self)   { self.cursor = self.cursor.checked_sub(1).unwrap_or(FALLBACK_PRESETS.len() - 1); }
+    fn down(&mut self) { self.cursor = (self.cursor + 1) % FALLBACK_PRESETS.len(); }
+    fn selected_id(&self) -> &str { FALLBACK_PRESETS[self.cursor].0 }
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -349,6 +390,8 @@ pub async fn run_monitor(base_url: &str) -> Result<()> {
     let model_url  = format!("{base}/model");
     let strategy_url = format!("{base}/strategy");
     let alerts_url = format!("{base}/alerts");
+    let burst_limit_url = format!("{base}/burst-limit");
+    let fallback_url = format!("{base}/fallback");
 
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -383,6 +426,10 @@ pub async fn run_monitor(base_url: &str) -> Result<()> {
     let mut refresh_ms: u64 = 1_000;
     let mut menu: Option<Menu> = None;
     let mut speed_picker: Option<SpeedPicker> = None;
+    let mut burst_limit_picker: Option<BurstLimitPicker> = None;
+    let mut fallback_picker: Option<FallbackPicker> = None;
+    let mut current_burst_limit: u32 = 10;
+    let mut current_fallback: Option<String> = None; // None = auto
     let mut focus = Focus::Accounts;
     let mut chart_window = TimeWindow::FifteenMin;
     let start_time = Instant::now();
@@ -424,6 +471,33 @@ pub async fn run_monitor(base_url: &str) -> Result<()> {
                     alerts_muted = v["muted"].as_bool().unwrap_or(false);
                 }
             }
+            // Fetch burst limit
+            if let Ok(r) = reqwest::Client::new()
+                .get(&burst_limit_url)
+                .timeout(Duration::from_secs(2))
+                .send().await
+            {
+                if let Ok(v) = r.json::<serde_json::Value>().await {
+                    current_burst_limit = v["burst_rpm_limit"].as_u64().unwrap_or(10) as u32;
+                }
+            }
+            // Fetch fallback model
+            if let Ok(r) = reqwest::Client::new()
+                .get(&fallback_url)
+                .timeout(Duration::from_secs(2))
+                .send().await
+            {
+                if let Ok(v) = r.json::<serde_json::Value>().await {
+                    let src = v["source"].as_str().unwrap_or("auto");
+                    if src == "auto" || v["fallback_model"].is_null() {
+                        current_fallback = None;
+                    } else if v["auto_disabled"].as_bool().unwrap_or(false) {
+                        current_fallback = Some("off".to_owned());
+                    } else {
+                        current_fallback = v["fallback_model"].as_str().map(|s| s.to_owned());
+                    }
+                }
+            }
             last_fetch = Instant::now();
         }
 
@@ -432,7 +506,8 @@ pub async fn run_monitor(base_url: &str) -> Result<()> {
                  base_url, &picker, &model_picker, &model_override,
                  &strategy_picker, &current_strategy, &strategy_source,
                  alerts_muted, show_help, refresh_ms, focus, chart_window, start_time,
-                 &menu, &speed_picker)
+                 &menu, &speed_picker, &burst_limit_picker, &fallback_picker,
+                 current_burst_limit, &current_fallback)
         })?;
 
         if event::poll(Duration::from_millis(200))? {
@@ -452,6 +527,76 @@ pub async fn run_monitor(base_url: &str) -> Result<()> {
                             refresh_ms = sp.selected();
                             speed_picker = None;
                             menu = None;
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
+                // Burst limit picker (launched from menu)
+                if let Some(ref mut bp) = burst_limit_picker {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char('q') => { burst_limit_picker = None; }
+                        KeyCode::Up   | KeyCode::Char('k') => bp.up(),
+                        KeyCode::Down | KeyCode::Char('j') => bp.down(),
+                        KeyCode::Enter => {
+                            let chosen = bp.selected();
+                            burst_limit_picker = None;
+                            menu = None;
+                            let client = reqwest::Client::new();
+                            if chosen == 0 {
+                                let _ = client.post(&burst_limit_url)
+                                    .json(&serde_json::json!({ "burst_rpm_limit": 0 }))
+                                    .timeout(Duration::from_secs(3))
+                                    .send().await;
+                            } else {
+                                let _ = client.post(&burst_limit_url)
+                                    .json(&serde_json::json!({ "burst_rpm_limit": chosen }))
+                                    .timeout(Duration::from_secs(3))
+                                    .send().await;
+                            }
+                            current_burst_limit = chosen;
+                            last_fetch = Instant::now() - Duration::from_secs(10);
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
+                // Fallback picker (launched from menu)
+                if let Some(ref mut fp) = fallback_picker {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char('q') => { fallback_picker = None; }
+                        KeyCode::Up   | KeyCode::Char('k') => fp.up(),
+                        KeyCode::Down | KeyCode::Char('j') => fp.down(),
+                        KeyCode::Enter => {
+                            let chosen = fp.selected_id().to_owned();
+                            fallback_picker = None;
+                            menu = None;
+                            let client = reqwest::Client::new();
+                            match chosen.as_str() {
+                                "auto" => {
+                                    let _ = client.delete(&fallback_url)
+                                        .timeout(Duration::from_secs(3))
+                                        .send().await;
+                                    current_fallback = None;
+                                }
+                                "off" => {
+                                    let _ = client.post(&fallback_url)
+                                        .json(&serde_json::json!({ "fallback_model": null }))
+                                        .timeout(Duration::from_secs(3))
+                                        .send().await;
+                                    current_fallback = Some("off".to_owned());
+                                }
+                                model => {
+                                    let _ = client.post(&fallback_url)
+                                        .json(&serde_json::json!({ "fallback_model": model }))
+                                        .timeout(Duration::from_secs(3))
+                                        .send().await;
+                                    current_fallback = Some(model.to_owned());
+                                }
+                            }
+                            last_fetch = Instant::now() - Duration::from_secs(10);
                         }
                         _ => {}
                     }
@@ -567,6 +712,12 @@ pub async fn run_monitor(base_url: &str) -> Result<()> {
                                 4 => { // refresh speed
                                     speed_picker = Some(SpeedPicker::new(refresh_ms));
                                 }
+                                5 => { // burst limit
+                                    burst_limit_picker = Some(BurstLimitPicker::new(current_burst_limit));
+                                }
+                                6 => { // fallback model
+                                    fallback_picker = Some(FallbackPicker::new(current_fallback.as_deref()));
+                                }
                                 _ => {}
                             }
                         }
@@ -668,6 +819,10 @@ fn draw(
     start_time: Instant,
     menu: &Option<Menu>,
     speed_picker: &Option<SpeedPicker>,
+    burst_limit_picker: &Option<BurstLimitPicker>,
+    fallback_picker: &Option<FallbackPicker>,
+    current_burst_limit: u32,
+    current_fallback: &Option<String>,
 ) {
     let area = f.area();
 
@@ -688,17 +843,21 @@ fn draw(
     }
 
     let any_overlay = menu.is_some() || picker.is_some() || model_picker.is_some()
-        || strategy_picker.is_some() || speed_picker.is_some();
+        || strategy_picker.is_some() || speed_picker.is_some()
+        || burst_limit_picker.is_some() || fallback_picker.is_some();
     draw_footer(f, chunks[2], any_overlay, focus);
 
     // Overlays — draw order: menu first (background), sub-pickers on top
     if let Some(m) = menu {
-        draw_menu(f, m, state, model_override, current_strategy, alerts_muted, refresh_ms, area);
+        draw_menu(f, m, state, model_override, current_strategy, alerts_muted, refresh_ms,
+                  current_burst_limit, current_fallback, area);
     }
     if let Some(p) = picker { draw_picker(f, p, current_strategy.as_deref(), area); }
     if let Some(mp) = model_picker { draw_model_picker(f, mp, model_override.as_deref(), area); }
     if let Some(sp) = strategy_picker { draw_strategy_picker(f, sp, current_strategy.as_deref(), area); }
     if let Some(sp) = speed_picker { draw_speed_picker(f, sp, refresh_ms, area); }
+    if let Some(bp) = burst_limit_picker { draw_burst_limit_picker(f, bp, current_burst_limit, area); }
+    if let Some(fp) = fallback_picker { draw_fallback_picker(f, fp, current_fallback, area); }
     if show_help { draw_help_overlay(f, area); }
 }
 
@@ -1333,6 +1492,8 @@ fn draw_menu(
     current_strategy: &Option<String>,
     alerts_muted: bool,
     refresh_ms: u64,
+    current_burst_limit: u32,
+    current_fallback: &Option<String>,
     area: Rect,
 ) {
     let h = (MENU_ITEMS + 4) as u16;
@@ -1365,6 +1526,12 @@ fn draw_menu(
         ("strategy",      strategy.to_owned()),
         ("alerts",        mute_str.to_owned()),
         ("refresh speed", speed_str),
+        ("burst limit",   if current_burst_limit == 0 { "off".to_owned() } else { format!("{}/min", current_burst_limit) }),
+        ("fallback",      match current_fallback.as_deref() {
+            None => "auto".to_owned(),
+            Some("off") => "off".to_owned(),
+            Some(m) => shorten_model(m),
+        }),
     ];
 
     let rows: Vec<Row> = items.iter().enumerate().map(|(i, (label, value))| {
@@ -1423,9 +1590,82 @@ fn draw_speed_picker(f: &mut Frame, sp: &SpeedPicker, current_ms: u64, area: Rec
     f.render_widget(Table::new(rows, [Constraint::Min(0)]).column_spacing(0), inner);
 }
 
-// ---------------------------------------------------------------------------
-// Help overlay
-// ---------------------------------------------------------------------------
+fn draw_burst_limit_picker(f: &mut Frame, bp: &BurstLimitPicker, current: u32, area: Rect) {
+    let h = (BURST_LIMIT_PRESETS.len() + 4) as u16;
+    let w = 30u16;
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    let popup_area = Rect { x, y, width: w.min(area.width), height: h.min(area.height) };
+
+    f.render_widget(Clear, popup_area);
+    let block = Block::default()
+        .title(Line::from(Span::styled(" burst limit ", style_dim())))
+        .borders(Borders::ALL)
+        .border_style(style_dkgreen());
+    let inner = block.inner(popup_area);
+    f.render_widget(block, popup_area);
+
+    let rows: Vec<Row> = BURST_LIMIT_PRESETS.iter().enumerate().map(|(i, &val)| {
+        let is_sel = i == bp.cursor;
+        let is_current = val == current;
+        let bullet = if is_sel { "◆" } else { " " };
+        let check  = if is_current { " ✓" } else { "" };
+        let label = if val == 0 { "off".to_owned() } else { format!("{}/min", val) };
+        let style = if is_sel {
+            Style::default().fg(GREEN).add_modifier(Modifier::BOLD)
+        } else {
+            style_dim()
+        };
+        Row::new(vec![
+            Cell::from(Span::styled(format!("  {bullet} {label}{check}"), style)),
+        ])
+    }).collect();
+
+    f.render_widget(Table::new(rows, [Constraint::Min(0)]).column_spacing(0), inner);
+}
+
+fn draw_fallback_picker(f: &mut Frame, fp: &FallbackPicker, current: &Option<String>, area: Rect) {
+    let h = (FALLBACK_PRESETS.len() + 4) as u16;
+    let w = 42u16;
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    let popup_area = Rect { x, y, width: w.min(area.width), height: h.min(area.height) };
+
+    f.render_widget(Clear, popup_area);
+    let block = Block::default()
+        .title(Line::from(Span::styled(" fallback model ", style_dim())))
+        .borders(Borders::ALL)
+        .border_style(style_dkgreen());
+    let inner = block.inner(popup_area);
+    f.render_widget(block, popup_area);
+
+    let rows: Vec<Row> = FALLBACK_PRESETS.iter().enumerate().map(|(i, &(id, desc))| {
+        let is_sel = i == fp.cursor;
+        let is_current = match (id, current.as_deref()) {
+            ("auto", None) => true,
+            ("off", Some("off")) => true,
+            (m, Some(c)) if m == c => true,
+            _ => false,
+        };
+        let bullet = if is_sel { "◆" } else { " " };
+        let check  = if is_current { " ✓" } else { "  " };
+        let name_style = if is_sel {
+            Style::default().fg(GREEN).add_modifier(Modifier::BOLD)
+        } else {
+            style_white()
+        };
+        Row::new(vec![
+            Cell::from(Span::styled(format!("  {bullet}"), style_dim())),
+            Cell::from(Span::styled(format!("{desc}{check}"), name_style)),
+        ])
+    }).collect();
+
+    f.render_widget(
+        Table::new(rows, [Constraint::Length(4), Constraint::Min(0)])
+            .column_spacing(1),
+        inner,
+    );
+}
 
 fn draw_help_overlay(f: &mut Frame, area: Rect) {
     let lines: &[(&str, &str)] = &[
