@@ -234,10 +234,11 @@ enum Command {
     /// Default is passthrough (don't modify client requests).
     ///
     /// Examples:
-    ///   shunt effort           — show current effort override
-    ///   shunt effort set max   — override to maximum reasoning
-    ///   shunt effort set low   — override to fast & cheap
-    ///   shunt effort clear     — restore passthrough (don't modify)
+    ///   shunt effort              — show current effort override
+    ///   shunt effort set xhigh    — enable multi-agent / ultracode mode
+    ///   shunt effort set max      — override to maximum reasoning
+    ///   shunt effort set low      — override to fast & cheap
+    ///   shunt effort clear        — restore passthrough (don't modify)
     Effort {
         #[arg(long)]
         config: Option<PathBuf>,
@@ -340,9 +341,9 @@ enum FallbackAction {
 
 #[derive(Subcommand)]
 enum EffortAction {
-    /// Set effort level (low, medium, high, max)
+    /// Set effort level (low, medium, high, xhigh, max)
     Set {
-        /// Effort level: low, medium, high, or max
+        /// Effort level: low, medium, high, xhigh (multi-agent/ultracode), or max
         level: String,
     },
     /// Clear the override and restore passthrough

@@ -384,6 +384,7 @@ const EFFORT_PRESETS: &[(&str, &str)] = &[
     ("low", "Low — fast & cheap"),
     ("medium", "Medium — balanced"),
     ("high", "High — default quality"),
+    ("xhigh", "xHigh — multi-agent / ultracode"),
     ("max", "Max — maximum reasoning"),
 ];
 

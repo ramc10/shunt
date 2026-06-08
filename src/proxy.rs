@@ -509,7 +509,7 @@ async fn effort_set_handler(
     let Some(effort) = body["effort"].as_str() else {
         return (StatusCode::BAD_REQUEST, axum::Json(json!({ "error": "missing effort string field" }))).into_response();
     };
-    let valid = ["low", "medium", "high", "max"];
+    let valid = ["low", "medium", "high", "xhigh", "max"];
     if !valid.contains(&effort) {
         return (StatusCode::BAD_REQUEST, axum::Json(json!({ "error": "effort must be one of: low, medium, high, max" }))).into_response();
     }
