@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>shunt telemetry</title>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'SF Mono', 'Fira Code', monospace; background: #0d0d0f; color: #e2e8f0; font-size: 13px; }
+  #setup { display: flex; align-items: center; justify-content: center; height: 100vh; }
+  .setup-box { background: #161618; border: 1px solid #2d2d30; border-radius: 8px; padding: 32px; width: 420px; }
+  .setup-box h2 { color: #a8ff78; margin-bottom: 20px; font-size: 15px; letter-spacing: 0.05em; }
+  .setup-box label { display: block; color: #888; font-size: 11px; margin-bottom: 4px; margin-top: 14px; text-transform: uppercase; letter-spacing: 0.08em; }
+  .setup-box input { width: 100%; background: #0d0d0f; border: 1px solid #2d2d30; border-radius: 4px; color: #e2e8f0; padding: 8px 10px; font-family: inherit; font-size: 12px; outline: none; }
+  .setup-box input:focus { border-color: #a8ff78; }
+  .setup-box button { margin-top: 20px; width: 100%; background: #a8ff78; color: #0d0d0f; border: none; border-radius: 4px; padding: 9px; font-family: inherit; font-size: 13px; font-weight: 600; cursor: pointer; }
+  .setup-box button:hover { background: #7dea4a; }
+
+  #app { display: none; }
+  header { padding: 14px 20px; border-bottom: 1px solid #1e1e22; display: flex; align-items: baseline; gap: 16px; }
+  header h1 { color: #a8ff78; font-size: 14px; letter-spacing: 0.08em; }
+  #live-dot { width: 7px; height: 7px; border-radius: 50%; background: #a8ff78; display: inline-block; margin-right: 5px; animation: pulse 2s infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
+  #summary { color: #888; font-size: 12px; }
+
+  .grid { display: grid; grid-template-columns: 280px 1fr; gap: 0; border-bottom: 1px solid #1e1e22; }
+  .panel { padding: 16px 20px; }
+  .panel + .panel { border-left: 1px solid #1e1e22; }
+  .panel h3 { color: #666; font-size: 10px; text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 12px; }
+
+  .version-row { display: flex; justify-content: space-between; padding: 4px 0; border-bottom: 1px solid #1a1a1d; }
+  .version-row:last-child { border-bottom: none; }
+  .version-tag { color: #a8ff78; }
+  .version-count { color: #888; }
+
+  #event-feed { height: 180px; overflow-y: auto; }
+  .event-row { padding: 3px 0; display: flex; gap: 10px; border-bottom: 1px solid #111113; font-size: 11px; }
+  .event-row:last-child { border-bottom: none; }
+  .event-time { color: #555; white-space: nowrap; }
+  .event-type { min-width: 140px; }
+  .event-type.daemon_start    { color: #a8ff78; }
+  .event-type.daemon_stop     { color: #ff7070; }
+  .event-type.request_complete{ color: #78c8ff; }
+  .event-type.rate_limit_hit  { color: #ffb347; }
+  .event-type.auth_failure    { color: #ff7070; }
+  .event-detail { color: #666; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  .filter-bar { padding: 10px 20px; border-bottom: 1px solid #1e1e22; display: flex; gap: 10px; align-items: center; }
+  .filter-bar select, .filter-bar input { background: #161618; border: 1px solid #2d2d30; border-radius: 4px; color: #e2e8f0; padding: 5px 8px; font-family: inherit; font-size: 12px; outline: none; }
+  .filter-bar select:focus, .filter-bar input:focus { border-color: #a8ff78; }
+  .filter-bar label { color: #666; font-size: 11px; }
+
+  #events-table { width: 100%; border-collapse: collapse; }
+  #events-table th { text-align: left; padding: 8px 20px; color: #555; font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; border-bottom: 1px solid #1e1e22; position: sticky; top: 0; background: #0d0d0f; }
+  #events-table td { padding: 6px 20px; border-bottom: 1px solid #111113; font-size: 12px; }
+  #events-table tr:hover td { background: #111113; }
+  #events-table .payload-cell { color: #555; font-size: 11px; max-width: 400px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
+  #events-table .payload-cell:hover { color: #aaa; }
+
+  #table-wrap { overflow-y: auto; height: calc(100vh - 360px); }
+  .pagination { padding: 10px 20px; display: flex; gap: 10px; align-items: center; border-top: 1px solid #1e1e22; }
+  .pagination button { background: #161618; border: 1px solid #2d2d30; color: #e2e8f0; padding: 4px 12px; border-radius: 4px; cursor: pointer; font-family: inherit; font-size: 12px; }
+  .pagination button:hover { border-color: #a8ff78; color: #a8ff78; }
+  .pagination button:disabled { opacity: 0.3; cursor: default; }
+  .pagination span { color: #666; font-size: 12px; }
+
+  #settings-btn { margin-left: auto; background: none; border: 1px solid #2d2d30; color: #888; padding: 4px 10px; border-radius: 4px; cursor: pointer; font-family: inherit; font-size: 11px; }
+  #settings-btn:hover { border-color: #555; color: #ccc; }
+</style>
+</head>
+<body>
+
+<!-- Setup screen -->
+<div id="setup">
+  <div class="setup-box">
+    <h2>shunt telemetry dashboard</h2>
+    <label>Supabase Project URL</label>
+    <input id="sb-url" type="text" placeholder="https://xxxx.supabase.co">
+    <label>Service Role Key (admin)</label>
+    <input id="sb-key" type="password" placeholder="eyJ...">
+    <button onclick="saveSetup()">Connect</button>
+  </div>
+</div>
+
+<!-- Main app -->
+<div id="app">
+  <header>
+    <h1>shunt telemetry</h1>
+    <span><span id="live-dot"></span>live</span>
+    <span id="summary" style="margin-left:8px">loading…</span>
+    <button id="settings-btn" onclick="clearSetup()">disconnect</button>
+  </header>
+
+  <div class="grid">
+    <div class="panel">
+      <h3>Version breakdown</h3>
+      <div id="version-list"><span style="color:#555">loading…</span></div>
+    </div>
+    <div class="panel">
+      <h3>Recent events <span style="color:#333;font-weight:normal">(live)</span></h3>
+      <div id="event-feed"></div>
+    </div>
+  </div>
+
+  <div class="filter-bar">
+    <label>type</label>
+    <select id="filter-type" onchange="loadPage(0)">
+      <option value="">all</option>
+      <option value="request_complete">request_complete</option>
+      <option value="rate_limit_hit">rate_limit_hit</option>
+      <option value="auth_failure">auth_failure</option>
+      <option value="daemon_start">daemon_start</option>
+      <option value="daemon_stop">daemon_stop</option>
+    </select>
+    <label style="margin-left:10px">version</label>
+    <input id="filter-version" type="text" placeholder="e.g. 0.1.140" style="width:120px" oninput="loadPage(0)">
+  </div>
+
+  <div id="table-wrap">
+    <table id="events-table">
+      <thead>
+        <tr>
+          <th>time</th>
+          <th>event</th>
+          <th>install</th>
+          <th>payload</th>
+        </tr>
+      </thead>
+      <tbody id="events-body"></tbody>
+    </table>
+  </div>
+  <div class="pagination">
+    <button id="prev-btn" onclick="loadPage(currentPage-1)" disabled>← prev</button>
+    <span id="page-info">page 1</span>
+    <button id="next-btn" onclick="loadPage(currentPage+1)">next →</button>
+  </div>
+</div>
+
+<script>
+const PAGE_SIZE = 50;
+let sb = null;
+let currentPage = 0;
+let realtimeChannel = null;
+
+// ── Setup / teardown ──────────────────────────────────────────────────────
+
+function saveSetup() {
+  const url = document.getElementById('sb-url').value.trim();
+  const key = document.getElementById('sb-key').value.trim();
+  if (!url || !key) { alert('Enter both URL and key.'); return; }
+  localStorage.setItem('sb_url', url);
+  localStorage.setItem('sb_key', key);
+  initDashboard(url, key);
+}
+
+function clearSetup() {
+  localStorage.removeItem('sb_url');
+  localStorage.removeItem('sb_key');
+  if (realtimeChannel) sb.removeChannel(realtimeChannel);
+  document.getElementById('setup').style.display = 'flex';
+  document.getElementById('app').style.display = 'none';
+}
+
+function initDashboard(url, key) {
+  sb = supabase.createClient(url, key);
+  document.getElementById('setup').style.display = 'none';
+  document.getElementById('app').style.display = 'block';
+  loadSummary();
+  loadVersions();
+  loadPage(0);
+  subscribeRealtime();
+}
+
+window.addEventListener('load', () => {
+  const url = localStorage.getItem('sb_url');
+  const key = localStorage.getItem('sb_key');
+  if (url && key) initDashboard(url, key);
+});
+
+// ── Summary ───────────────────────────────────────────────────────────────
+
+async function loadSummary() {
+  const since = new Date(Date.now() - 86400000).toISOString();
+  const [{ count: totalReq }, { count: rlCount }, { data: installs }] = await Promise.all([
+    sb.from('events').select('*', { count: 'exact', head: true })
+      .eq('event_type', 'request_complete').gte('created_at', since),
+    sb.from('events').select('*', { count: 'exact', head: true })
+      .eq('event_type', 'rate_limit_hit').gte('created_at', since),
+    sb.from('installs').select('id').gte('last_seen', since),
+  ]);
+  const users = installs ? installs.length : '?';
+  const req = totalReq ?? 0;
+  const rlRate = req > 0 ? ((rlCount / req) * 100).toFixed(1) : '0.0';
+  document.getElementById('summary').textContent =
+    `24h: ${users} installs · ${req.toLocaleString()} requests · ${rlRate}% 429 rate`;
+}
+
+// ── Version breakdown ─────────────────────────────────────────────────────
+
+async function loadVersions() {
+  const { data } = await sb.from('installs').select('version');
+  if (!data) return;
+  const counts = {};
+  for (const row of data) {
+    const v = row.version || 'unknown';
+    counts[v] = (counts[v] || 0) + 1;
+  }
+  const sorted = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+  const el = document.getElementById('version-list');
+  el.innerHTML = sorted.map(([v, n]) =>
+    `<div class="version-row"><span class="version-tag">v${v}</span><span class="version-count">${n} install${n > 1 ? 's' : ''}</span></div>`
+  ).join('') || '<span style="color:#555">no data</span>';
+}
+
+// ── Events table ──────────────────────────────────────────────────────────
+
+async function loadPage(page) {
+  if (page < 0) return;
+  const type = document.getElementById('filter-type').value;
+  const ver  = document.getElementById('filter-version').value.trim();
+
+  let q = sb.from('events')
+    .select('id,created_at,install_id,event_type,payload', { count: 'exact' })
+    .order('created_at', { ascending: false })
+    .range(page * PAGE_SIZE, (page + 1) * PAGE_SIZE - 1);
+  if (type)  q = q.eq('event_type', type);
+
+  const { data, count } = await q;
+  if (!data) return;
+
+  // Filter by version client-side (payload is jsonb)
+  const rows = ver
+    ? data.filter(r => r.payload && r.payload.version && r.payload.version.includes(ver))
+    : data;
+
+  const tbody = document.getElementById('events-body');
+  tbody.innerHTML = rows.map(r => {
+    const t = new Date(r.created_at).toLocaleTimeString();
+    const install = r.install_id ? r.install_id.slice(0, 8) : '?';
+    const payload = JSON.stringify(r.payload);
+    return `<tr>
+      <td style="color:#555;white-space:nowrap">${t}</td>
+      <td><span class="event-type ${r.event_type}">${r.event_type}</span></td>
+      <td style="color:#555;font-size:11px">${install}</td>
+      <td class="payload-cell" title="${payload.replace(/"/g,'&quot;')}" onclick="alert(JSON.stringify(JSON.parse(this.title),null,2))">${payload}</td>
+    </tr>`;
+  }).join('');
+
+  currentPage = page;
+  const total = count ?? 0;
+  const pages = Math.ceil(total / PAGE_SIZE);
+  document.getElementById('page-info').textContent = `page ${page + 1} / ${pages || 1}`;
+  document.getElementById('prev-btn').disabled = page === 0;
+  document.getElementById('next-btn').disabled = page >= pages - 1;
+}
+
+// ── Live feed ─────────────────────────────────────────────────────────────
+
+function prependFeedRow(r) {
+  const feed = document.getElementById('event-feed');
+  const t = new Date(r.created_at || Date.now()).toLocaleTimeString();
+  const detail = r.payload ? Object.entries(r.payload).slice(0, 2).map(([k,v]) => `${k}=${v}`).join(' ') : '';
+  const div = document.createElement('div');
+  div.className = 'event-row';
+  div.innerHTML = `<span class="event-time">${t}</span><span class="event-type ${r.event_type}">${r.event_type}</span><span class="event-detail">${detail}</span>`;
+  feed.insertBefore(div, feed.firstChild);
+  // Keep at most 50 rows
+  while (feed.children.length > 50) feed.removeChild(feed.lastChild);
+}
+
+function subscribeRealtime() {
+  realtimeChannel = sb.channel('shunt-events')
+    .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'events' },
+      payload => {
+        prependFeedRow(payload.new);
+        // Refresh summary every 20 new events (lightweight)
+        if (Math.random() < 0.05) loadSummary();
+      }
+    )
+    .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'installs' },
+      () => loadVersions()
+    )
+    .subscribe();
+}
+
+// Load initial feed rows
+async function loadInitialFeed() {
+  const { data } = await sb.from('events')
+    .select('created_at,event_type,payload')
+    .order('created_at', { ascending: false })
+    .limit(30);
+  if (!data) return;
+  for (const r of [...data].reverse()) prependFeedRow(r);
+}
+
+// Patch initDashboard to also load the feed
+const _origInit = initDashboard;
+// (re-defined inline — loadInitialFeed called after subscribeRealtime sets up)
+</script>
+<script>
+// Run loadInitialFeed after the rest of the page settles
+document.addEventListener('DOMContentLoaded', () => {
+  const url = localStorage.getItem('sb_url');
+  const key = localStorage.getItem('sb_key');
+  if (url && key) setTimeout(loadInitialFeed, 500);
+});
+</script>
+</body>
+</html>

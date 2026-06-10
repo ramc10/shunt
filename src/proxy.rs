@@ -22,7 +22,7 @@ use crate::provider::Provider;
 use crate::quota;
 use crate::router;
 use crate::state::StateStore;
-use crate::telemetry::TelemetryClient;
+use crate::telemetry::{SupabaseTelemetry, TelemetryClient};
 
 /// 100 MB limit — sufficient for any LLM request including large context windows.
 const MAX_REQUEST_BODY: usize = 100 * 1024 * 1024;
@@ -49,6 +49,8 @@ struct AppState {
     anthropic_base_url: Option<String>,
     /// Optional relay-server telemetry client.
     telemetry: Option<TelemetryClient>,
+    /// Optional Supabase telemetry client.
+    supabase: Option<Arc<SupabaseTelemetry>>,
     /// Per-IP token-bucket rate limiter (#16). None when rate_limit_rpm == 0.
     rate_limiter: Option<Arc<ParkingMutex<HashMap<IpAddr, TokenBucket>>>>,
 }
@@ -96,6 +98,7 @@ fn build_app_state(
     config: Config,
     state: StateStore,
     anthropic_base_url: Option<String>,
+    supabase: Option<Arc<SupabaseTelemetry>>,
 ) -> anyhow::Result<(AppState, LiveCredentials)> {
     let forwarder = Forwarder::new(config.server.request_timeout_secs)?;
 
@@ -133,6 +136,7 @@ fn build_app_state(
         started_ms: now_ms(),
         anthropic_base_url,
         telemetry,
+        supabase,
         rate_limiter,
     };
 
@@ -143,8 +147,9 @@ pub fn create_proxy_app(
     config: Config,
     state: StateStore,
     anthropic_base_url: Option<String>,
+    supabase: Option<Arc<SupabaseTelemetry>>,
 ) -> anyhow::Result<(Router, LiveCredentials)> {
-    let (app_state, credentials) = build_app_state(config, state, anthropic_base_url)?;
+    let (app_state, credentials) = build_app_state(config, state, anthropic_base_url, supabase)?;
 
     let app = Router::new()
         .route("/v1/messages", post(proxy_handler))
@@ -163,7 +168,7 @@ pub fn create_control_app(
     config: Config,
     state: StateStore,
 ) -> anyhow::Result<Router> {
-    let (app_state, _) = build_app_state(config, state, None)?;
+    let (app_state, _) = build_app_state(config, state, None, None)?;
 
     let app = Router::new()
         .route("/health", get(health))
@@ -189,7 +194,7 @@ pub fn create_app_with_state(
     state: StateStore,
     anthropic_base_url: Option<String>,
 ) -> anyhow::Result<(Router, LiveCredentials, Option<TelemetryClient>)> {
-    let (app_state, credentials) = build_app_state(config, state, anthropic_base_url)?;
+    let (app_state, credentials) = build_app_state(config, state, anthropic_base_url, None)?;
     let telemetry = app_state.telemetry.clone();
 
     let app = Router::new()
@@ -933,7 +938,7 @@ async fn proxy_handler(
                     // Got Anthropic response; client expects OpenAI.
                     translate_response_anthropic_to_openai(response).await
                 };
-                return Ok(tap_usage(response, &s.state, s.telemetry.as_ref(), &account_name, &log_model, req_start_ms, &request_id, &path, tried.len()).await);
+                return Ok(tap_usage(response, &s.state, s.telemetry.as_ref(), s.supabase.as_ref(), &account_name, &account.provider.to_string(), &log_model, req_start_ms, &request_id, &path, tried.len()).await);
             }
             429 => {
                 let info = account.provider.parse_rate_limits(response.headers());
@@ -964,6 +969,12 @@ async fn proxy_handler(
                 warn!(account = %account_name, cooldown_ms, "429 rate-limited — cooling");
                 if let Some(info) = info {
                     s.state.update_rate_limits(&account_name, info);
+                }
+                if let Some(ref sb) = s.supabase {
+                    let available = s.config.accounts.iter()
+                        .filter(|a| s.state.is_available(&a.name))
+                        .count();
+                    sb.emit_rate_limit_hit(&account.provider.to_string(), cooldown_ms, available);
                 }
                 s.state.set_cooldown_staggered(&account_name, cooldown_ms);
                 if cooldown_ms >= 5 * 60_000 && !s.state.get_alerts_muted() {
@@ -1056,6 +1067,9 @@ async fn proxy_handler(
                                 // Refresh failed/timed out — cool down, don't permanently disable.
                                 error!(account = %account_name, "401 — token refresh failed, cooling 5min");
                                 s.state.set_cooldown(&account_name, 5 * 60_000);
+                                if let Some(ref sb) = s.supabase {
+                                    sb.emit_auth_failure(&account.provider.to_string());
+                                }
                                 tried.insert(account_name);
                             }
                         }
@@ -1063,12 +1077,18 @@ async fn proxy_handler(
                         // API-key account — 401 means the key is invalid; no refresh possible.
                         error!(account = %account_name, "401 — API key rejected, cooling 5min");
                         s.state.set_cooldown(&account_name, 5 * 60_000);
+                        if let Some(ref sb) = s.supabase {
+                            sb.emit_auth_failure(&account.provider.to_string());
+                        }
                         tried.insert(account_name);
                     }
                 } else {
                     // Already refreshed once and still 401 — cool down this account.
                     error!(account = %account_name, "401 after refresh — cooling 5min");
                     s.state.set_cooldown(&account_name, 5 * 60_000);
+                    if let Some(ref sb) = s.supabase {
+                        sb.emit_auth_failure(&account.provider.to_string());
+                    }
                     tried.insert(account_name);
                 }
             }
@@ -1112,7 +1132,9 @@ async fn tap_usage(
     resp: Response,
     state: &StateStore,
     telemetry: Option<&TelemetryClient>,
+    supabase: Option<&Arc<SupabaseTelemetry>>,
     account: &str,
+    provider: &str,
     model: &str,
     req_start_ms: u64,
     request_id: &str,
@@ -1127,7 +1149,9 @@ async fn tap_usage(
     if streaming {
         let state      = state.clone();
         let telem      = telemetry.cloned();
+        let sb         = supabase.cloned();
         let account    = account.to_owned();
+        let provider   = provider.to_owned();
         let model      = model.to_owned();
         let request_id = request_id.to_owned();
         let path       = path.to_owned();
@@ -1158,6 +1182,9 @@ async fn tap_usage(
             state.record_usage(&account, input, output);
             state.record_global(&model, input, output);
             if let Some(ref t) = telem { t.push_event(&log); }
+            if let Some(ref sb) = sb {
+                sb.emit_request_complete(&model, &provider, duration_ms, input, output);
+            }
             state.record_request(log);
         });
         let (parts, body) = resp.into_parts();
@@ -1198,6 +1225,9 @@ async fn tap_usage(
     state.record_usage(account, input, output);
     state.record_global(model, input, output);
     if let Some(t) = telemetry { t.push_event(&log); }
+    if let Some(sb) = supabase {
+        sb.emit_request_complete(model, provider, duration_ms, input, output);
+    }
     state.record_request(log);
     Response::from_parts(parts, Body::from(bytes))
 }

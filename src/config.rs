@@ -66,6 +66,13 @@ pub fn notify_log_path() -> PathBuf {
         .join("notify.log")
 }
 
+pub fn install_id_path() -> PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(APP_NAME)
+        .join("install_id")
+}
+
 pub fn pid_path() -> PathBuf {
     dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -191,6 +198,9 @@ struct RawServer {
     /// Fallback model to use when all accounts are on cooldown.
     /// If set, requests are retried with this model before waiting.
     fallback_model: Option<String>,
+    /// Send anonymous usage telemetry to Supabase (default: true).
+    /// Also disabled by SHUNT_NO_TELEMETRY=1 env var.
+    telemetry: Option<bool>,
 }
 
 impl Default for RawServer {
@@ -218,6 +228,7 @@ impl Default for RawServer {
             instance_name: None,
             burst_rpm_limit: None,
             fallback_model: None,
+            telemetry: None,
         }
     }
 }
@@ -351,6 +362,8 @@ pub struct ServerConfig {
     pub burst_rpm_limit: u32,
     /// Fallback model when all accounts are on cooldown.
     pub fallback_model: Option<String>,
+    /// Send anonymous usage telemetry to Supabase (default: true).
+    pub telemetry: bool,
 }
 
 impl Default for ServerConfig {
@@ -378,6 +391,7 @@ impl Default for ServerConfig {
             instance_name: default_instance_name(),
             burst_rpm_limit: 10,
             fallback_model: None,
+            telemetry: true,
         }
     }
 }
@@ -496,6 +510,8 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
         instance_name,
         burst_rpm_limit: raw.server.burst_rpm_limit.unwrap_or(10),
         fallback_model: raw.server.fallback_model,
+        telemetry: raw.server.telemetry.unwrap_or(true)
+            && std::env::var("SHUNT_NO_TELEMETRY").map(|v| v == "1").unwrap_or(false) == false,
     };
 
     if raw.accounts.is_empty() {

@@ -1703,6 +1703,9 @@ async fn cmd_setup_auto(config_override: Option<PathBuf>) -> Result<()> {
     store.accounts.insert("main".into(), Credential::Oauth(cred));
     store.save()?;
 
+    // Track new installs — fire-and-forget, don't block setup completion.
+    tokio::spawn(crate::telemetry::track_cli_feature("setup"));
+
     Ok(())
 }
 
@@ -2711,6 +2714,7 @@ async fn cmd_alerts(config_override: Option<PathBuf>, action: Option<AlertsActio
 
 async fn cmd_savings(config_override: Option<PathBuf>) -> Result<()> {
     let config = crate::config::load_config(config_override.as_deref())?;
+    if config.server.telemetry { tokio::spawn(crate::telemetry::track_cli_feature("savings")); }
     let url = format!("http://{}:{}/status", config.server.host, config.server.control_port);
 
     let v: serde_json::Value = match reqwest::Client::new()
@@ -3208,10 +3212,35 @@ async fn serve_all_providers(
     // in-flight connections, state is flushed, then the process exits cleanly.
     let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
 
+    // Create Supabase telemetry client if enabled.
+    let supabase: Option<std::sync::Arc<crate::telemetry::SupabaseTelemetry>> =
+        if config.server.telemetry {
+            let sb = std::sync::Arc::new(crate::telemetry::SupabaseTelemetry::new());
+            let providers: Vec<String> = {
+                let mut seen = std::collections::HashSet::new();
+                all_accounts.iter()
+                    .map(|a| a.provider.to_string())
+                    .filter(|p| seen.insert(p.clone()))
+                    .collect()
+            };
+            sb.emit_daemon_start(
+                env!("CARGO_PKG_VERSION"),
+                all_accounts.len(),
+                config.server.routing_strategy.as_str(),
+                &providers,
+                config.server.custom_domain.is_some(),
+            );
+            sb.start_flush_loop();
+            Some(sb)
+        } else {
+            None
+        };
+
     // SIGTERM handler: flush state then wake all servers.
     {
-        let state_s = state.clone();
-        let notify  = shutdown.clone();
+        let state_s   = state.clone();
+        let notify    = shutdown.clone();
+        let sb_stop   = supabase.clone();
         tokio::spawn(async move {
             #[cfg(unix)]
             {
@@ -3221,6 +3250,10 @@ async fn serve_all_providers(
                     sig.recv().await;
                     tracing::info!("SIGTERM received — flushing state before shutdown");
                     state_s.flush_sync();
+                    if let Some(sb) = sb_stop {
+                        let savings = state_s.savings_snapshot();
+                        sb.emit_daemon_stop(savings.all_time_cost_usd).await;
+                    }
                     notify.notify_waiters();
                 }
             }
@@ -3264,7 +3297,7 @@ async fn serve_all_providers(
         } else {
             None
         };
-        let (app, live_creds) = crate::proxy::create_proxy_app(provider_config.clone(), state.clone(), anthropic_url)?;
+        let (app, live_creds) = crate::proxy::create_proxy_app(provider_config.clone(), state.clone(), anthropic_url, supabase.clone())?;
         let listener = tokio::net::TcpListener::bind(format!("{host}:{port}"))
             .await
             .with_context(|| format!("cannot bind {host}:{port} for {provider_str} proxy"))?;
@@ -3409,6 +3442,7 @@ fn strip_ansi(s: &str) -> String {
 
 async fn cmd_monitor(config_override: Option<PathBuf>) -> Result<()> {
     let client = reqwest::Client::new();
+    tokio::spawn(crate::telemetry::track_cli_feature("monitor"));
 
     // If ANTHROPIC_BASE_URL points to a remote shunt (written by `shunt connect`),
     // always use that — the user intends to monitor the host machine, not local.
@@ -3446,6 +3480,7 @@ async fn cmd_monitor(config_override: Option<PathBuf>) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 async fn cmd_update() -> Result<()> {
+    tokio::spawn(crate::telemetry::track_cli_feature("update"));
     const REPO: &str = "ramc10/shunt";
     let current = env!("CARGO_PKG_VERSION");
 
@@ -3677,6 +3712,7 @@ fn extract_binary_from_tarball(data: &[u8], dest: &std::path::Path) -> Result<()
 // ---------------------------------------------------------------------------
 
 async fn cmd_share(config_override: Option<PathBuf>, tunnel: bool, stop: bool) -> Result<()> {
+    tokio::spawn(crate::telemetry::track_cli_feature("share"));
     let config_p = config_override.unwrap_or_else(config_path);
     if !config_p.exists() {
         bail!("No config found. Run `shunt setup` first.");
@@ -4450,6 +4486,7 @@ async fn cmd_connect(code: String) -> Result<()> {
 async fn cmd_live(config_override: Option<PathBuf>, subdomain: Option<String>, relay_override: Option<String>) -> Result<()> {
     let config = crate::config::load_config(config_override.as_deref())
         .context("No config found. Run `shunt setup` first.")?;
+    if config.server.telemetry { tokio::spawn(crate::telemetry::track_cli_feature("live")); }
 
     let subdomain = subdomain
         .or_else(|| std::env::var("SHUNT_TUNNEL_SUBDOMAIN").ok())
@@ -5294,6 +5331,7 @@ async fn cmd_uninstall() -> Result<()> {
 
 async fn cmd_report(config_override: Option<PathBuf>) -> Result<()> {
     use std::io::{BufRead, BufReader};
+    tokio::spawn(crate::telemetry::track_cli_feature("report"));
 
     let sep = || println!("  {}", dim(&"─".repeat(60)));
 
