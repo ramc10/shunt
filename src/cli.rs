@@ -3594,6 +3594,16 @@ async fn cmd_update() -> Result<()> {
 
     // Extract binary from tarball into a temp file next to the current exe
     let exe_path = std::env::current_exe().context("Cannot locate current executable")?;
+    // On Linux, /proc/self/exe may return "…/shunt (deleted)" after a prior
+    // rename-based update.  Strip the suffix to get the real on-disk path.
+    let exe_path = {
+        let s = exe_path.to_string_lossy();
+        if let Some(stripped) = s.strip_suffix(" (deleted)") {
+            std::path::PathBuf::from(stripped)
+        } else {
+            exe_path
+        }
+    };
     let tmp_path = exe_path.with_extension("tmp");
 
     // #13 TOCTOU: remove any pre-existing file or symlink before writing,
@@ -3665,7 +3675,21 @@ async fn cmd_update() -> Result<()> {
                     let input = input.trim().to_lowercase();
                     if input.is_empty() || input == "y" || input == "yes" {
                         println!();
-                        cmd_restart(None).await?;
+                        // Exec the *new* binary for the restart instead of calling
+                        // cmd_restart() in-process.  On Linux the current process's
+                        // /proc/self/exe still points at the deleted old binary, so
+                        // spawning via current_exe() would fail.  Using exe_path
+                        // (the on-disk path we just wrote to) avoids that entirely.
+                        let st = std::process::Command::new(&exe_path)
+                            .arg("restart")
+                            .stdin(std::process::Stdio::inherit())
+                            .stdout(std::process::Stdio::inherit())
+                            .stderr(std::process::Stdio::inherit())
+                            .status()
+                            .context("failed to exec new binary for restart")?;
+                        if !st.success() {
+                            bail!("restart exited with {}", st);
+                        }
                     }
                 }
             }
