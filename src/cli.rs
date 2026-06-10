@@ -1418,6 +1418,17 @@ async fn cmd_start(
 
     // ── Background mode (default) ─────────────────────────────────────────────
     let exe = std::env::current_exe().context("cannot locate current executable")?;
+    // On Linux, after a binary self-update via rename(), current_exe() may return
+    // a path suffixed with " (deleted)" (e.g. "/usr/local/bin/shunt (deleted)").
+    // Strip the suffix so the spawn finds the newly-written binary.
+    let exe = {
+        let s = exe.to_string_lossy();
+        if let Some(stripped) = s.strip_suffix(" (deleted)") {
+            std::path::PathBuf::from(stripped)
+        } else {
+            exe
+        }
+    };
     let mut cmd = std::process::Command::new(&exe);
     cmd.arg("start").arg("--daemon");
     if let Some(ref p) = config_override { cmd.args(["--config", &p.display().to_string()]); }
