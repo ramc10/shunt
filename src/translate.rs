@@ -36,7 +36,7 @@ pub fn map_model(openai_model: &str) -> String {
     }
     match openai_model {
         "gpt-4o" | "gpt-4.5" | "o1" | "o1-pro" | "o3" | "o3-pro" | "gpt-5" | "gpt-5.5" => {
-            "claude-opus-4-6"
+            "claude-opus-4-8"
         }
         "gpt-4o-mini" | "gpt-4o-mini-2024-07-18" | "o1-mini" | "o3-mini" => {
             "claude-haiku-4-5-20251001"

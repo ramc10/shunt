@@ -1,7 +1,7 @@
 /// Anthropic / OpenAI API pricing table and cost helpers.
 ///
 /// Prices are charged per million tokens. We use the public list prices as
-/// of 2025 — close enough for "what would this have cost on the API?" display.
+/// of June 2026 — close enough for "what would this have cost on the API?" display.
 
 /// Cost in USD if the given tokens had been sent through the public API.
 pub fn api_cost_usd(model: &str, input_tokens: u64, output_tokens: u64) -> f64 {
@@ -12,14 +12,19 @@ pub fn api_cost_usd(model: &str, input_tokens: u64, output_tokens: u64) -> f64 {
 
 /// (input_price_per_mtok, output_price_per_mtok) in USD.
 fn model_prices(model: &str) -> (f64, f64) {
-    if model.contains("opus-4-5") || model.contains("opus-4-6") {
-        // Opus 4.5 / 4.6 — new pricing tier (much cheaper than 4.0/4.1)
+    if model.contains("fable") || model.contains("mythos") {
+        // Fable 5 / Mythos 5
+        (10.0, 50.0)
+    } else if model.contains("opus-4-5") || model.contains("opus-4-6")
+           || model.contains("opus-4-7") || model.contains("opus-4-8") {
+        // Opus 4.5–4.8
         (5.0, 25.0)
     } else if model.contains("opus") {
         // Opus 4.0 / 4.1 and older
         (15.0, 75.0)
     } else if model.contains("haiku") {
-        (0.80, 4.0)
+        // Haiku 4.5
+        (1.0, 5.0)
     } else if model.contains("sonnet") || model.is_empty() {
         (3.0, 15.0)
     } else if model.starts_with("gpt-4") || model.starts_with("o1") || model.starts_with("o3") || model.starts_with("gpt-5") {
