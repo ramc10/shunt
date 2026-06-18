@@ -2086,7 +2086,9 @@ async fn openai_models_handler() -> impl IntoResponse {
         "object": "list",
         "data": [
             { "id": "claude-fable-5",              "object": "model", "owned_by": "anthropic" },
+            { "id": "claude-mythos-5",             "object": "model", "owned_by": "anthropic" },
             { "id": "claude-opus-4-8",             "object": "model", "owned_by": "anthropic" },
+            { "id": "claude-opus-4-7",             "object": "model", "owned_by": "anthropic" },
             { "id": "claude-opus-4-6",             "object": "model", "owned_by": "anthropic" },
             { "id": "claude-sonnet-4-6",           "object": "model", "owned_by": "anthropic" },
             { "id": "claude-haiku-4-5-20251001",   "object": "model", "owned_by": "anthropic" },

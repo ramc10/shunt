@@ -52,3 +52,27 @@ pub fn fmt_cost(usd: f64) -> String {
         "$0".to_owned()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_prices_current_lineup() {
+        // Pinned to public list prices as of June 2026 (Claude Code v2.1.181).
+        assert_eq!(model_prices("claude-fable-5"), (10.0, 50.0));
+        assert_eq!(model_prices("claude-mythos-5"), (10.0, 50.0));
+        assert_eq!(model_prices("claude-opus-4-8"), (5.0, 25.0));
+        assert_eq!(model_prices("claude-opus-4-7"), (5.0, 25.0));
+        assert_eq!(model_prices("claude-opus-4-6"), (5.0, 25.0));
+        assert_eq!(model_prices("claude-opus-4-1"), (15.0, 75.0));
+        assert_eq!(model_prices("claude-sonnet-4-6"), (3.0, 15.0));
+        assert_eq!(model_prices("claude-haiku-4-5-20251001"), (1.0, 5.0));
+    }
+
+    #[test]
+    fn api_cost_matches_rate() {
+        // 1M in + 1M out on opus-4-8 = $5 + $25.
+        assert!((api_cost_usd("claude-opus-4-8", 1_000_000, 1_000_000) - 30.0).abs() < 1e-9);
+    }
+}
