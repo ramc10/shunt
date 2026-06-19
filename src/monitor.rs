@@ -262,7 +262,6 @@ impl Picker {
 /// (display name, description, model id or "" for auto/clear)
 const MODEL_PRESETS: &[(&str, &str, &str)] = &[
     ("Auto",     "Let the client choose the model",            ""),
-    ("Fable 5",  "Most capable · highest reasoning",           "claude-fable-5"),
     ("Opus 4.8", "Flagship Opus · complex agentic tasks",      "claude-opus-4-8"),
     ("Sonnet 4", "Balanced · fast and smart",                  "claude-sonnet-4-6"),
     ("Haiku 4",  "Fastest · great for simple tasks",           "claude-haiku-4-5-20251001"),
